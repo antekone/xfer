@@ -1,4 +1,3 @@
-#![allow(dead_code, unused_imports)] // Legacy inline UI is retained while IPC rendering is migrated.
 use std::{
     fs, io,
     io::{BufRead, BufReader, Write},
@@ -20,268 +19,9 @@ use crossterm::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
-use xfer::core::{
-    Backend, JobId, JobManager, JobState, Progress, SettingValue, Settings, Sftp, Smb, S3,
+use xfer::commands::{
+    self, ClientApp, CommandContext, CommandResult, Completion, ExecutionSite, ParserContext,
 };
-
-#[derive(Clone)]
-enum UiMode {
-    Command,
-    Foreground(JobId),
-    Pager { lines: Vec<String>, offset: usize },
-    Jobs,
-}
-struct App {
-    mode: UiMode,
-    command: String,
-    history: Vec<String>,
-    history_cursor: Option<usize>,
-    history_enabled: bool,
-    history_path: Option<PathBuf>,
-    messages: Vec<String>,
-    settings: Settings,
-    jobs: JobManager,
-    running: bool,
-    pager_display: PagerDisplay,
-}
-
-fn default_history_path() -> PathBuf {
-    if let Some(path) = std::env::var_os("XDG_STATE_HOME") {
-        return PathBuf::from(path).join("xfer/history");
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".local/state/xfer/history");
-    }
-    PathBuf::from(".xfer-history")
-}
-
-fn history_path(settings: &Settings) -> Option<PathBuf> {
-    match settings.text("ui:history-file").unwrap_or("session") {
-        "/dev/null" | "session" => None,
-        value => Some(PathBuf::from(value)),
-    }
-}
-
-fn history_enabled(settings: &Settings) -> bool {
-    settings.text("ui:history-file") != Some("/dev/null")
-}
-
-impl App {
-    fn new(settings: Settings) -> Result<Self> {
-        let history_enabled = history_enabled(&settings);
-        let history_path = history_path(&settings);
-        let history = if !history_enabled {
-            Vec::new()
-        } else {
-            match &history_path {
-                Some(path) => match fs::read_to_string(path) {
-                    Ok(contents) => contents.lines().map(str::to_owned).collect(),
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
-                    Err(error) => return Err(error.into()),
-                },
-                None => Vec::new(),
-            }
-        };
-        Ok(Self {
-            mode: UiMode::Command,
-            command: String::new(),
-            history,
-            history_cursor: None,
-            history_enabled,
-            history_path,
-            messages: vec!["xfer ready; type help".into()],
-            settings,
-            jobs: JobManager::new(),
-            running: true,
-            pager_display: PagerDisplay::default(),
-        })
-    }
-    fn record_history(&mut self, input: &str) {
-        if !self.history_enabled {
-            return;
-        }
-        self.history.push(input.to_owned());
-        if let Some(path) = &self.history_path {
-            if let Some(parent) = path.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            // History is line-oriented; command input cannot contain a newline.
-            let _ = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .and_then(|mut file| writeln!(file, "{input}"));
-        }
-    }
-    fn execute(&mut self) {
-        let input = std::mem::take(&mut self.command);
-        self.history_cursor = None;
-        if !input.trim().is_empty() {
-            self.record_history(&input);
-        }
-        if let Some(source) = input.strip_prefix('!') {
-            execute_local_shell(source);
-            return;
-        }
-        let mut words = input.split_whitespace();
-        let cmd = match words.next() {
-            Some(v) => v,
-            None => return,
-        };
-        match cmd {
-            "help" => self.messages.extend(
-                [
-                    "Commands:",
-                    "  connect <url>       connect (demo job)",
-                    "  get <path>          transfer (demo job)",
-                    "  mirror <path>       mirror (demo job)",
-                    "  jobs                list jobs",
-                    "  fg [id]             foreground a job",
-                    "  set <name> <value>  update a setting",
-                    "  show <name>         display setting",
-                    "  !<command>          run local Bash command",
-                    "  quit                exit",
-                    "Keys while foreground: Ctrl-C cancel; Ctrl-Z background.",
-                ]
-                .into_iter()
-                .map(str::to_owned),
-            ),
-            "connect" | "get" | "mirror" => {
-                let known = cmd != "connect";
-                let id = self.jobs.start_demo(
-                    format!("{cmd} {}", words.collect::<Vec<_>>().join(" ")),
-                    known,
-                );
-                self.mode = UiMode::Foreground(id);
-            }
-            "jobs" => self.mode = UiMode::Jobs,
-            "fg" => {
-                let id = words.next().and_then(|s| s.parse().ok()).or_else(|| {
-                    self.jobs
-                        .jobs
-                        .iter()
-                        .filter(|(_, j)| j.state == JobState::Running)
-                        .map(|(id, _)| *id)
-                        .max()
-                });
-                match id.and_then(|id| self.jobs.jobs.get(&id).map(|job| (id, job.state.clone()))) {
-                    Some((id, JobState::Running)) => self.mode = UiMode::Foreground(id),
-                    Some((id, state)) => self.messages.push(format!(
-                        "job {id} is {state:?}; completed jobs cannot be foregrounded"
-                    )),
-                    None => self.messages.push("no such job".into()),
-                }
-            }
-            "set" => match (words.next(), words.next()) {
-                (Some(name), Some(value)) => match self.settings.set(name, value) {
-                    Ok(()) => self.messages.push(format!("{name} set to {value}")),
-                    Err(e) => self.messages.push(e.to_string()),
-                },
-                _ => self.messages.push("usage: set <name> <value>".into()),
-            },
-            "show" => match words.next() {
-                Some(name) => match self.settings.values.get(name) {
-                    Some(setting) => self.messages.push(format!(
-                        "{name}: {} — {}",
-                        setting.value.display(),
-                        setting.doc
-                    )),
-                    None => self.messages.push(format!("unknown setting: {name}")),
-                },
-                None => {
-                    let mut names = self.settings.values.keys().collect::<Vec<_>>();
-                    names.sort_unstable();
-                    self.messages.extend(names.into_iter().map(|name| {
-                        let setting = &self.settings.values[name];
-                        format!("{name}: {} — {}", setting.value.display(), setting.doc)
-                    }));
-                }
-            },
-            "quit" | "exit" => self.running = false,
-            _ => self.messages.push(format!("unknown command: {cmd}")),
-        }
-    }
-}
-
-fn stdout() -> io::Stdout {
-    io::stdout()
-}
-
-fn prompt(app: &App) {
-    let mut out = stdout();
-    let _ = write!(out, "xfer> {}", app.command);
-    let _ = io::Write::flush(&mut out);
-}
-
-fn print_line(line: &str) {
-    let mut out = stdout();
-    let _ = write!(out, "\r\x1b[2K{line}\r\n");
-    let _ = io::Write::flush(&mut out);
-}
-
-fn show_jobs(app: &App) {
-    for job in app.jobs.jobs.values() {
-        print_line(&format!("[{}] {:?}  {}", job.id, job.state, job.title));
-    }
-    prompt(app);
-}
-
-fn draw_pager(lines: &[String], offset: usize, notice: Option<&str>, display: &mut PagerDisplay) {
-    let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
-    let visible = lines
-        .iter()
-        .skip(offset)
-        .take(pager_page_size(height))
-        .cloned()
-        .collect::<Vec<_>>();
-    let label = notice
-        .map(str::to_owned)
-        .unwrap_or_else(|| pager_label(offset, lines.len()));
-    let _ = display.draw(&mut stdout(), width, height, &visible, &label);
-}
-
-fn enter_pager(app: &mut App, lines: Vec<String>) {
-    let mut out = stdout();
-    let _ = execute!(out, EnterAlternateScreen, cursor::Hide);
-    app.pager_display.invalidate();
-    app.mode = UiMode::Pager { lines, offset: 0 };
-    if let UiMode::Pager { lines, offset } = &app.mode {
-        draw_pager(lines, *offset, None, &mut app.pager_display);
-    }
-}
-
-fn leave_pager(app: &mut App) {
-    let mut out = stdout();
-    let _ = execute!(out, LeaveAlternateScreen, cursor::Show);
-    app.mode = UiMode::Command;
-    prompt(app);
-}
-
-fn render_foreground(app: &App, id: JobId) {
-    let Some(job) = app.jobs.jobs.get(&id) else {
-        return;
-    };
-    let status = match job.progress.borrow().clone() {
-        Progress::Transfer(stats) => format!("{}/{} bytes", stats.done, stats.total),
-        Progress::Determinate {
-            done,
-            total,
-            message,
-        } => {
-            let percent = done * 100 / total.max(1);
-            format!(
-                "[{}] {:3}% {message}  (^C cancel, ^Z background)",
-                job.title, percent
-            )
-        }
-        Progress::Indeterminate { message } => {
-            format!("[{}] {message}  (^C cancel, ^Z background)", job.title)
-        }
-    };
-    let mut out = stdout();
-    let _ = write!(out, "\r\x1b[2K{status}");
-    let _ = io::Write::flush(&mut out);
-}
 
 fn load_history(path: Option<&str>) -> Vec<String> {
     match path {
@@ -291,6 +31,7 @@ fn load_history(path: Option<&str>) -> Vec<String> {
         _ => Vec::new(),
     }
 }
+
 fn append_history(path: Option<&str>, command: &str) {
     let Some(path) = path.filter(|path| *path != "session" && *path != "/dev/null") else {
         return;
@@ -346,20 +87,16 @@ fn common_completion_prefix(choices: &[String]) -> &str {
     &first[..length]
 }
 
-fn completion_path(argument: &str) -> Option<String> {
-    // Accept a single argument, including a quote still being typed.
-    let tokens = shlex::split(argument)
-        .or_else(|| shlex::split(&format!("{argument}'")))
-        .or_else(|| shlex::split(&format!("{argument}\"")))?;
-    match tokens.len() {
-        0 => Some(String::new()),
-        1 => tokens.into_iter().next(),
-        _ => None,
-    }
-}
-
 fn path_completion_context(command: &str) -> Option<(String, String, String)> {
+    let command = command.trim_start();
     let verb = command.split_whitespace().next()?;
+    let Completion::RemotePath {
+        request,
+        multiple_arguments,
+    } = commands::completion_for(verb)
+    else {
+        return None;
+    };
     let argument = command.strip_prefix(verb)?.trim_start();
     let mut tokens = shlex::split(argument)
         .or_else(|| shlex::split(&format!("{argument}'")))
@@ -404,7 +141,7 @@ fn path_completion_context(command: &str) -> Option<(String, String, String)> {
     } else {
         tokens.pop().unwrap_or_default()
     };
-    if verb != "get" && !tokens.is_empty() {
+    if !multiple_arguments && !tokens.is_empty() {
         return None;
     }
     let mut head = verb.to_owned();
@@ -412,13 +149,7 @@ fn path_completion_context(command: &str) -> Option<(String, String, String)> {
         head.push(' ');
         head.push_str(&shlex::try_quote(&token).ok()?);
     }
-    let method = match verb {
-        "cd" => "COMPLETE_CD",
-        "ls" => "COMPLETE_LS",
-        "get" => "COMPLETE_GET",
-        _ => return None,
-    };
-    Some((head, path, method.to_owned()))
+    Some((head, path, request.to_owned()))
 }
 
 fn complete_path_command(
@@ -609,43 +340,21 @@ fn read_attached_command(
                 }
             }
             KeyCode::Tab => {
-                if command.starts_with("cd ")
-                    || command.starts_with("cd\t")
-                    || command.starts_with("ls ")
-                    || command.starts_with("ls\t")
-                    || command.starts_with("get ")
-                    || command.starts_with("get\t")
+                let verb = command.split_whitespace().next().unwrap_or("");
+                let completion = commands::completion_for(verb);
+                if matches!(completion, Completion::RemotePath { .. })
+                    && command.contains(char::is_whitespace)
                 {
                     history_cursor = None;
                     complete_path_command(stream, reader, &mut command, prompt)?;
                     continue;
                 }
                 let matches = if !command.contains(char::is_whitespace) {
-                    [
-                        "connect",
-                        "open",
-                        "disconnect",
-                        "close",
-                        "bookmark",
-                        "ls",
-                        "cd",
-                        "pwd",
-                        "get",
-                        "mirror",
-                        "jobs",
-                        "status",
-                        "cancel",
-                        "show",
-                        "set",
-                        "help",
-                        "detach",
-                        "exit",
-                    ]
-                    .into_iter()
-                    .filter(|name| name.starts_with(&command))
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>()
-                } else if command.starts_with("show ") || command.starts_with("set ") {
+                    commands::visible_names()
+                        .filter(|name| name.starts_with(&command))
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                } else if completion == Completion::Settings {
                     stream.write_all(
                         b"COMMAND show
 ",
@@ -665,7 +374,7 @@ fn read_attached_command(
                             choices.push(name.to_owned());
                         }
                     }
-                    let prefix = command.split_once(' ').unwrap().1.trim();
+                    let prefix = command.trim_start().strip_prefix(verb).unwrap_or("").trim();
                     choices
                         .into_iter()
                         .filter(|name| name.starts_with(prefix))
@@ -675,7 +384,9 @@ fn read_attached_command(
                 };
                 if !matches.is_empty() {
                     let common = common_completion_prefix(&matches);
-                    if let Some((verb, prefix)) = command.split_once(' ') {
+                    if let Some((verb, prefix)) =
+                        command.trim_start().split_once(char::is_whitespace)
+                    {
                         if common.len() > prefix.trim().len() {
                             command = format!("{verb} {common}");
                         }
@@ -1419,15 +1130,18 @@ fn send_connection_password(
     Ok(())
 }
 
-fn execute_local_shell(source: &str) {
-    if source.trim().is_empty() {
-        eprintln!("usage: !<bash command>");
-        return;
+struct AttachedCommandContext<'a> {
+    stream: &'a mut UnixStream,
+    reader: &'a mut BufReader<UnixStream>,
+    typeahead: &'a mut Typeahead,
+}
+impl ClientApp for AttachedCommandContext<'_> {
+    fn detach(&mut self) -> Result<()> {
+        self.stream.write_all(b"DETACH\n")?;
+        Ok(())
     }
-    match xfer::local_shell::run(source) {
-        Ok(status) if status.success() => {}
-        Ok(status) => eprintln!("bash exited with {status}"),
-        Err(error) => eprintln!("cannot run local command: {error:#}"),
+    fn foreground(&mut self, id: u64) -> Result<()> {
+        foreground_job(self.stream, self.reader, id, self.typeahead)
     }
 }
 
@@ -1442,35 +1156,36 @@ fn dispatch_attached_command(
     if command.trim().is_empty() {
         return Ok(true);
     }
-    if let Some(source) = command.strip_prefix('!') {
+    let parser = match ParserContext::parse(command) {
+        Ok(parser) => parser,
+        Err(error) => {
+            append_history(history_file, command);
+            eprintln!("{error}");
+            return Ok(true);
+        }
+    };
+    let definition = commands::find(&parser);
+    if definition.is_none_or(|command| command.record_history()) {
         append_history(history_file, command);
-        execute_local_shell(source);
+    }
+    if let Some(definition) = definition.filter(|command| command.site() == ExecutionSite::Client) {
+        let mut app = AttachedCommandContext {
+            stream,
+            reader,
+            typeahead,
+        };
+        match definition.execute(&mut CommandContext::Client { app: &mut app }, &parser) {
+            Ok(CommandResult::Detach) => return Ok(false),
+            Ok(CommandResult::Output(lines)) => {
+                for line in lines {
+                    println!("{line}");
+                }
+            }
+            Err(error) => eprintln!("{error:#}"),
+        }
         return Ok(true);
     }
     let mut line = String::new();
-    if matches!(command.trim(), "detach" | "exit") {
-        stream.write_all(b"DETACH\n")?;
-        return Ok(false);
-    }
-    if command.trim() == "bg" {
-        println!("all jobs are already in the background");
-        return Ok(true);
-    }
-    if let Some(id) = command
-        .trim()
-        .strip_prefix("fg ")
-        .and_then(|value| value.trim().parse().ok())
-    {
-        foreground_job(stream, reader, id, typeahead)?;
-        return Ok(true);
-    }
-    if command.trim() == "fg" {
-        println!("usage: fg <job-id>");
-        return Ok(true);
-    }
-    if !command.trim().is_empty() {
-        append_history(history_file, command);
-    }
     stream.write_all(format!("COMMAND {command}\n").as_bytes())?;
     let mut foreground = None;
     let mut edit_bookmarks = None;
@@ -1763,223 +1478,6 @@ async fn main() -> Result<()> {
         return attach(&args);
     }
     start_daemon_and_attach()
-}
-
-async fn run(mut app: App) -> Result<()> {
-    prompt(&app);
-    while app.running {
-        for id in app.jobs.poll() {
-            if matches!(app.mode, UiMode::Foreground(active) if active == id) {
-                let output = app
-                    .jobs
-                    .jobs
-                    .get(&id)
-                    .map(|j| j.output.read_all())
-                    .unwrap_or_default();
-                print_line("");
-                let (_, terminal_height) = crossterm::terminal::size().unwrap_or((80, 24));
-                if app.settings.bool("ui:auto-pager") && output.len() > terminal_height as usize {
-                    enter_pager(&mut app, output);
-                } else {
-                    for line in output {
-                        print_line(&line);
-                    }
-                    app.mode = UiMode::Command;
-                    prompt(&app);
-                }
-            }
-        }
-        if let UiMode::Foreground(id) = app.mode {
-            render_foreground(&app, id);
-        }
-        if event::poll(Duration::from_millis(80))? {
-            if let Event::Key(key) = event::read()? {
-                handle_key(&mut app, key);
-            }
-        }
-    }
-    print_line("");
-    Ok(())
-}
-
-fn execute_command(app: &mut App) {
-    let before = app.messages.len();
-    app.execute();
-    match app.mode.clone() {
-        UiMode::Pager { lines, .. } => enter_pager(app, lines),
-        UiMode::Jobs => {
-            app.mode = UiMode::Command;
-            show_jobs(app);
-        }
-        UiMode::Foreground(_) => {}
-        UiMode::Command => {
-            for line in &app.messages[before..] {
-                print_line(line);
-            }
-            prompt(app);
-        }
-    }
-}
-
-fn redraw_prompt(app: &App) {
-    let mut out = stdout();
-    let _ = write!(out, "\r\x1b[2K");
-    let _ = io::Write::flush(&mut out);
-    prompt(app);
-}
-
-fn complete_show_setting(app: &mut App) {
-    let Some(rest) = app.command.strip_prefix("show") else {
-        return;
-    };
-    // Only complete the first/only argument; this simple prompt editor has no mid-line cursor yet.
-    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
-        return;
-    }
-    let prefix = rest.trim();
-    let mut candidates = app
-        .settings
-        .values
-        .keys()
-        .filter(|name| name.starts_with(prefix))
-        .cloned()
-        .collect::<Vec<_>>();
-    candidates.sort_unstable();
-    match candidates.len() {
-        0 => {}
-        1 => {
-            app.command = format!("show {}", candidates[0]);
-            redraw_prompt(app);
-        }
-        _ => {
-            // Display candidates without leaving the ordinary prompt buffer, like readline/lftp.
-            print_line("");
-            print_line(&candidates.join("  "));
-            prompt(app);
-        }
-    }
-}
-
-fn history_up(app: &mut App) {
-    let Some(last) = app.history.len().checked_sub(1) else {
-        return;
-    };
-    let next = app
-        .history_cursor
-        .map(|index| index.saturating_sub(1))
-        .unwrap_or(last);
-    app.history_cursor = Some(next);
-    app.command = app.history[next].clone();
-    redraw_prompt(app);
-}
-
-fn history_down(app: &mut App) {
-    let Some(index) = app.history_cursor else {
-        return;
-    };
-    if index + 1 < app.history.len() {
-        app.history_cursor = Some(index + 1);
-        app.command = app.history[index + 1].clone();
-    } else {
-        app.history_cursor = None;
-        app.command.clear();
-    }
-    redraw_prompt(app);
-}
-
-fn handle_key(app: &mut App, key: KeyEvent) {
-    match app.mode.clone() {
-        UiMode::Foreground(id) => match (key.code, key.modifiers) {
-            (KeyCode::Char('c'), KeyModifiers::CONTROL) => app.jobs.cancel(id),
-            (KeyCode::Char('z'), KeyModifiers::CONTROL) => {
-                print_line("");
-                app.messages.push(format!("job {id} moved to background"));
-                app.mode = UiMode::Command;
-                print_line(&format!("job {id} moved to background"));
-                prompt(app);
-            }
-            _ => {}
-        },
-        UiMode::Pager { lines, mut offset } => {
-            let (_, height) = crossterm::terminal::size().unwrap_or((80, 24));
-            let Some(action) = pager_action(key) else {
-                return;
-            };
-            if action == PagerAction::Quit {
-                leave_pager(app);
-                return;
-            }
-            let notice = if action == PagerAction::Visual {
-                open_pager_visual(|copy| {
-                    for line in &lines {
-                        writeln!(copy, "{line}")?;
-                    }
-                    Ok(())
-                })
-                .err()
-                .map(|error| error.to_string())
-            } else {
-                offset = pager_offset(action, offset, lines.len(), pager_page_size(height));
-                None
-            };
-            if action == PagerAction::Visual {
-                app.pager_display.invalidate();
-            }
-            draw_pager(&lines, offset, notice.as_deref(), &mut app.pager_display);
-            app.mode = UiMode::Pager { lines, offset };
-        }
-        UiMode::Jobs => {}
-        UiMode::Command => match key.code {
-            KeyCode::Tab => complete_show_setting(app),
-            KeyCode::Up => history_up(app),
-            KeyCode::Down => history_down(app),
-            KeyCode::Enter => {
-                print_line("");
-                execute_command(app);
-            }
-            KeyCode::Backspace => {
-                app.history_cursor = None;
-                if app.command.pop().is_some() {
-                    let mut out = stdout();
-                    let _ = write!(out, "\x08 \x08");
-                    let _ = io::Write::flush(&mut out);
-                }
-            }
-            // Readline-like word erase: remove trailing whitespace, then the preceding word.
-            KeyCode::Char('w') if key.modifiers == KeyModifiers::CONTROL => {
-                app.history_cursor = None;
-                erase_previous_word(&mut app.command);
-                redraw_prompt(app);
-            }
-            KeyCode::Char(c)
-                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
-            {
-                app.command.push(c);
-                let mut out = stdout();
-                let _ = write!(out, "{c}");
-                let _ = io::Write::flush(&mut out);
-            }
-            // Ctrl-C is never an application exit. In command mode it abandons the current input;
-            // in foreground-job mode it is handled above and cancels that job.
-            KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => {
-                if !app.command.is_empty() {
-                    app.command.clear();
-                    app.history_cursor = None;
-                    let mut out = stdout();
-                    let _ = write!(out, "\r\x1b[2K");
-                    let _ = io::Write::flush(&mut out);
-                    prompt(app);
-                }
-            }
-            // Match shell/readline EOF semantics: only an empty prompt accepts Ctrl-D as exit.
-            KeyCode::Char('d')
-                if key.modifiers == KeyModifiers::CONTROL && app.command.is_empty() =>
-            {
-                app.running = false
-            }
-            _ => {}
-        },
-    }
 }
 
 #[cfg(test)]
@@ -2483,11 +1981,15 @@ mod startup_tests {
 
     #[test]
     fn directory_completion_handles_quoted_and_unfinished_arguments() {
-        assert_eq!(completion_path(""), Some(String::new()));
-        assert_eq!(completion_path("../pho"), Some("../pho".into()));
-        assert_eq!(completion_path("'photo alb"), Some("photo alb".into()));
-        assert_eq!(completion_path("\"photo alb"), Some("photo alb".into()));
-        assert!(completion_path("two arguments").is_none());
+        for (input, expected) in [
+            ("cd ", ""),
+            ("cd ../pho", "../pho"),
+            ("cd 'photo alb", "photo alb"),
+            ("cd \"photo alb", "photo alb"),
+        ] {
+            assert_eq!(path_completion_context(input).unwrap().1, expected);
+        }
+        assert!(path_completion_context("cd two arguments").is_none());
     }
 
     #[test]

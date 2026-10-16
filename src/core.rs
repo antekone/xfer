@@ -158,7 +158,7 @@ pub struct Job {
     cancel: CancellationToken,
     pub progress: watch::Receiver<Progress>,
     pub output: OutputStore,
-    started: time::Instant,
+    pub(crate) started: time::Instant,
     _handle: JoinHandle<()>,
 }
 
@@ -241,7 +241,7 @@ impl JobManager {
         })
     }
 
-    fn start_task<F, Fut>(&mut self, title: String, operation: F) -> JobId
+    pub(crate) fn start_task<F, Fut>(&mut self, title: String, operation: F) -> JobId
     where
         F: FnOnce(OutputStore, watch::Sender<Progress>) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<String>> + Send + 'static,
@@ -480,30 +480,6 @@ impl Settings {
 }
 pub use crate::backend::{Backend, Sftp, Smb, S3};
 
-fn snapshot_directory(
-    connection: &dyn crate::backend::Connection,
-    path: Option<&str>,
-    snapshot: &std::sync::Mutex<Option<String>>,
-) -> Result<String> {
-    let mut saved = snapshot.lock().expect("directory snapshot poisoned");
-    if saved.is_none() {
-        *saved = Some(connection.resolve_directory(path)?);
-    }
-    Ok(saved.as_ref().unwrap().clone())
-}
-
-fn snapshot_listing_path(
-    connection: &dyn crate::backend::Connection,
-    path: &str,
-    snapshot: &std::sync::Mutex<Option<String>>,
-) -> Result<String> {
-    let mut saved = snapshot.lock().expect("listing snapshot poisoned");
-    if saved.is_none() {
-        *saved = Some(connection.resolve_listing_path(path)?);
-    }
-    Ok(saved.as_ref().unwrap().clone())
-}
-
 /// Lightweight committed session state: safe to query while a job owns the
 /// backend connection lock. It never contains credentials or endpoint secrets.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -513,14 +489,14 @@ pub struct SessionInfo {
     pub cwd: Option<String>,
 }
 impl SessionInfo {
-    fn disconnected() -> Self {
+    pub(crate) fn disconnected() -> Self {
         Self {
             daemon_pid: std::process::id(),
             protocol: None,
             cwd: None,
         }
     }
-    fn connected(connection: &dyn crate::backend::Connection) -> Self {
+    pub(crate) fn connected(connection: &dyn crate::backend::Connection) -> Self {
         Self {
             daemon_pid: std::process::id(),
             protocol: Some(connection.protocol().to_owned()),
@@ -529,7 +505,7 @@ impl SessionInfo {
     }
 }
 
-struct ConfigFile {
+pub(crate) struct ConfigFile {
     path: PathBuf,
     loaded: bool,
 }
@@ -541,7 +517,7 @@ impl ConfigFile {
         Ok(Self { path, loaded })
     }
 
-    fn status(&self, label: &str) -> String {
+    pub(crate) fn status(&self, label: &str) -> String {
         format!(
             "{label}: {}{}",
             self.path.display(),
@@ -559,13 +535,14 @@ impl ConfigFile {
 pub struct Daemon {
     pub settings: Settings,
     pub jobs: JobManager,
-    backends: HashMap<String, std::sync::Arc<dyn Backend>>,
-    connection: std::sync::Arc<tokio::sync::Mutex<Option<Box<dyn crate::backend::Connection>>>>,
-    session: std::sync::Arc<std::sync::Mutex<SessionInfo>>,
-    local_directory: PathBuf,
-    config_file: ConfigFile,
-    config_override: Option<ConfigFile>,
-    startup_file: Option<PathBuf>,
+    pub(crate) backends: HashMap<String, std::sync::Arc<dyn Backend>>,
+    pub(crate) connection:
+        std::sync::Arc<tokio::sync::Mutex<Option<Box<dyn crate::backend::Connection>>>>,
+    pub(crate) session: std::sync::Arc<std::sync::Mutex<SessionInfo>>,
+    pub(crate) local_directory: PathBuf,
+    pub(crate) config_file: ConfigFile,
+    pub(crate) config_override: Option<ConfigFile>,
+    pub(crate) startup_file: Option<PathBuf>,
 }
 
 impl Daemon {
@@ -638,90 +615,12 @@ impl Daemon {
             .any(|job| job.state == JobState::Running)
     }
 
-    fn connect(
-        &mut self,
-        target: &str,
-        password: Option<crate::credentials::Password>,
-    ) -> Result<JobId> {
-        let bookmark = if target.contains("://") {
-            None
-        } else {
-            Some(
-                crate::bookmarks::load(std::path::Path::new(
-                    self.settings.text("bookmarks:file").unwrap(),
-                ))?
-                .remove(target)
-                .ok_or_else(|| anyhow::anyhow!("unknown bookmark: {target}"))?,
-            )
-        };
-        let token = bookmark
-            .as_ref()
-            .map(|value| value.protocol.as_str())
-            .or_else(|| target.split_once("://").map(|(token, _)| token))
-            .unwrap_or("");
-        if password.is_some() && token != "sftp" {
-            anyhow::bail!("interactive passwords are only supported for sftp");
-        }
-        let backend = self
-            .backends
-            .get(token)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("no backend for protocol: {token}"))?;
-        if bookmark
-            .as_ref()
-            .is_some_and(|bookmark| bookmark.password_interactive)
-            && password.is_none()
-        {
-            return Err(crate::credentials::PasswordRequired.into());
-        }
-        let cache_options = crate::cache::CacheOptions::from_settings(&self.settings)?;
-        let options = crate::backend::ConnectOptions {
-            target: target.to_owned(),
-            bookmark,
-            settings: self.settings.clone(),
-            password,
-        };
-        let connection = self.connection.clone();
-        let session = self.session.clone();
-        Ok(self
-            .jobs
-            .start_retrying_operation(format!("connect {target}"), move |_| {
-                let connection = connection.clone();
-                let backend = backend.clone();
-                let options = options.clone();
-                let cache_options = cache_options.clone();
-                let session = session.clone();
-                async move {
-                    // Serialize changes per attempt; the lock is released during backoff.
-                    let mut active = connection.lock().await;
-                    let new = backend.connect(options).await?;
-                    let message = format!("connected {}", new.protocol());
-                    let info = SessionInfo::connected(new.as_ref());
-                    *active = Some(Box::new(crate::cache::CachedConnection::new(
-                        new,
-                        cache_options,
-                    )));
-                    *session.lock().expect("session state poisoned") = info;
-                    Ok(message)
-                }
-            }))
-    }
-
     pub fn connect_command(
         &mut self,
         target: &str,
         password: Option<crate::credentials::Password>,
     ) -> Vec<String> {
-        match self.connect(target, password) {
-            Ok(id) => vec![format!("JOB {id}")],
-            Err(error) if error.is::<crate::credentials::PasswordRequired>() => {
-                vec![format!(
-                    "PASSWORD_REQUIRED {}",
-                    serde_json::to_string(target).unwrap()
-                )]
-            }
-            Err(error) => vec![error.to_string()],
-        }
+        crate::commands::dispatch_connect(self, target, password)
     }
 
     pub fn set_local_directory(&mut self, path: PathBuf) -> Result<()> {
@@ -771,279 +670,7 @@ impl Daemon {
 
     pub fn command(&mut self, line: &str) -> Vec<String> {
         self.jobs.poll();
-        let tokens = match shlex::split(line) {
-            Some(tokens) => tokens,
-            None => return vec!["invalid command quoting".into()],
-        };
-        let mut words = tokens.iter().map(String::as_str);
-        match words.next() {
-            Some("help") => vec![
-                "Commands:".into(),
-                "  connect <url|name>  connect using a protocol or bookmark".into(),
-                "  open <url|name>     alias for connect".into(),
-                "  disconnect          release active backend connection".into(),
-                "  close               alias for disconnect".into(),
-                "  ls [path]           list buckets, a directory, or a file".into(),
-                "  get [-c] <files...> download files to the client's local directory (-c resumes)".into(),
-                "  cd [directory]      change backend working directory (default: initial directory)".into(),
-                "  pwd                 print backend working directory".into(),
-                "  bookmark            list bookmark aliases, URLs and buckets".into(),
-                "  bookmark edit       edit TOML bookmarks using VISUAL/EDITOR".into(),
-                "  status              show daemon, connection and configuration details".into(),
-                "  jobs                list daemon jobs".into(),
-                "  cancel <job-id>     cancel a job".into(),
-                "  show [setting]      show daemon settings".into(),
-                "  set <name> <value>  update a daemon setting".into(),
-                "  !<command>          run local Bash command (client-side)".into(),
-                "  detach              detach this client".into(),
-                "  exit                detach; daemon remains only while jobs run".into(),
-            ],
-            Some("bookmark") => match words.next() {
-                None => match crate::bookmarks::load(std::path::Path::new(
-                    self.settings.text("bookmarks:file").unwrap(),
-                )) {
-                    Ok(entries) if entries.is_empty() => vec!["no bookmarks".into()],
-                    Ok(entries) => entries
-                        .into_iter()
-                        .map(|(alias, bookmark)| bookmark.summary(&alias))
-                        .collect(),
-                    Err(error) => vec![error.to_string()],
-                },
-                Some("edit") => {
-                    let path = std::path::Path::new(self.settings.text("bookmarks:file").unwrap());
-                    match crate::bookmarks::prepare_for_editor(path) {
-                        Ok(()) => vec![format!("BOOKMARK_EDIT {}", path.display())],
-                        Err(error) => vec![format!("cannot prepare bookmarks: {error}")],
-                    }
-                }
-                Some("reload") => match crate::bookmarks::load(std::path::Path::new(
-                    self.settings.text("bookmarks:file").unwrap(),
-                )) {
-                    Ok(_) => vec!["bookmarks validated; connections use the latest file".into()],
-                    Err(error) => vec![error.to_string()],
-                },
-                _ => vec!["usage: bookmark [edit | reload]".into()],
-            },
-            Some("connect" | "open") => match words.next() {
-                Some(target) => self.connect_command(target, None),
-                None => vec!["usage: connect <protocol://target | bookmark>".into()],
-            },
-            Some("cd") => {
-                let path = words.next().map(str::to_owned);
-                if words.next().is_some() { return vec!["usage: cd [directory]".into()]; }
-                let connection = self.connection.clone();
-                let session = self.session.clone();
-                let snapshot = std::sync::Arc::new(std::sync::Mutex::new(None));
-                let id = self.jobs.start_retrying_operation(format!("cd {}", path.as_deref().unwrap_or("")), move |_| {
-                    let connection = connection.clone();
-                    let session = session.clone();
-                    let path = path.clone();
-                    let snapshot = snapshot.clone();
-                    async move {
-                        let mut active = connection.lock().await;
-                        let active = active.as_mut().ok_or_else(|| crate::error::NonRetryableError("not connected; use connect first".into()))?;
-                        let target = snapshot_directory(active.as_ref(), path.as_deref(), &snapshot)?;
-                        active.change_directory(&target).await?;
-                        let cwd = active.pwd()?;
-                        *session.lock().expect("session state poisoned") = SessionInfo::connected(active.as_ref());
-                        Ok(cwd)
-                    }
-                });
-                vec![format!("JOB {id}")]
-            },
-            Some("pwd") => {
-                if words.next().is_some() { return vec!["usage: pwd".into()]; }
-                let connection = self.connection.clone();
-                let id = self.jobs.start_operation("pwd".into(), async move {
-                    let active = connection.lock().await;
-                    active.as_ref().ok_or_else(|| anyhow::anyhow!("not connected; use connect first"))?.pwd()
-                });
-                vec![format!("JOB {id}")]
-            },
-            Some("ls") => {
-                let path = words.next().unwrap_or("").to_owned();
-                if words.next().is_some() { return vec!["usage: ls [path]".into()]; }
-                let connection = self.connection.clone();
-                let snapshot = std::sync::Arc::new(std::sync::Mutex::new(None));
-                let id = self.jobs.start_retrying_operation(format!("ls {path}"), move |mut output| {
-                    let connection = connection.clone();
-                    let path = path.clone();
-                    let snapshot = snapshot.clone();
-                    async move {
-                        let active = connection.lock().await;
-                        let active = active.as_ref().ok_or_else(|| crate::error::NonRetryableError("not connected; use connect first".into()))?;
-                        let target = snapshot_listing_path(active.as_ref(), &path, &snapshot)?;
-                        let count = active.list(&target, &mut output).await?;
-                        Ok(format!("listed {count} entries"))
-                    }
-                });
-                vec![format!("JOB {id}")]
-            },
-            Some("disconnect" | "close") => {
-                let connection = self.connection.clone();
-                let session = self.session.clone();
-                let id = self.jobs.start_operation("disconnect".into(), async move {
-                    let previous = {
-                        let mut active = connection.lock().await;
-                        let previous = active.take();
-                        *session.lock().expect("session state poisoned") = SessionInfo::disconnected();
-                        previous
-                    };
-                    match previous {
-                        Some(value) => {
-                            let token = value.protocol();
-                            value.disconnect().await?;
-                            Ok(format!("disconnected {token}"))
-                        }
-                        None => Ok("not connected".into()),
-                    }
-                });
-                vec![format!("JOB {id}")]
-            }
-            Some("get") => {
-                let args = match crate::transfer::GetArgs::parse(words) { Ok(args) => args, Err(error) => return vec![error.to_string()] };
-                let connection = self.connection.clone();
-                let directory = self.local_directory.clone();
-                let clobber = self.settings.bool("xfer:clobber");
-                let id = self.jobs.start_task(line.to_owned(), move |output, progress| async move {
-                    let active = connection.lock().await;
-                    let active = active.as_ref().ok_or_else(|| crate::error::NonRetryableError("not connected; use connect first".into()))?;
-                    crate::transfer::get(active.as_ref(), args, directory, clobber, progress, output).await
-                });
-                vec![format!("JOB {id}")]
-            },
-            Some("mirror") => vec!["mirror is not implemented yet".into()],
-            Some("read-output") => {
-                let id = words.next().and_then(|value| value.parse().ok());
-                let offset = words
-                    .next()
-                    .and_then(|value| value.parse().ok())
-                    .unwrap_or(0);
-                match id.and_then(|id| self.jobs.jobs.get(&id)) {
-                    Some(job) => match job.output.read_bytes(offset) {
-                        Ok(bytes) => vec![format!(
-                            "CHUNK {} {}",
-                            offset + bytes.len() as u64,
-                            serde_json::to_string(&bytes).unwrap()
-                        )],
-                        Err(error) => vec![format!("cannot read job output: {error}")],
-                    },
-                    None => vec!["no such job".into()],
-                }
-            }
-            Some("output") => {
-                let id = words.next().and_then(|value| value.parse().ok());
-                let offset = words
-                    .next()
-                    .and_then(|value| value.parse().ok())
-                    .unwrap_or(0);
-                match id.and_then(|id| self.jobs.jobs.get(&id)) {
-                    Some(job) => {
-                        let (next, data) = job.output.read_chunk(offset, 64 * 1024);
-                        let mut lines = vec![format!("OFFSET {next}")];
-                        lines.extend(data.lines().map(str::to_owned));
-                        lines
-                    }
-                    None => vec!["no such job".into()],
-                }
-            }
-            Some("ack-output") => match words.next().and_then(|value| value.parse().ok()) {
-                Some(id) => match self.jobs.jobs.get(&id) {
-                    Some(job) if job.state == JobState::Running => {
-                        vec!["cannot acknowledge output of a running job".into()]
-                    }
-                    Some(job) => match fs::remove_file(job.output.path()) {
-                        Ok(()) => {
-                            self.jobs.jobs.remove(&id);
-                            vec!["output acknowledged".into()]
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                            self.jobs.jobs.remove(&id);
-                            vec!["output acknowledged".into()]
-                        }
-                        Err(error) => vec![format!("cannot remove output spool: {error}")],
-                    },
-                    None => vec!["no such job".into()],
-                },
-                None => vec!["usage: ack-output <job-id>".into()],
-            },
-            Some("status") => match words.next() {
-                None => {
-                    let info = self.session_info();
-                    let mut lines = vec![
-                        format!("Daemon PID: {}", info.daemon_pid),
-                        format!("Backend: {}", info.protocol.as_deref().unwrap_or("disconnected")),
-                        format!("CWD: {}", info.cwd.as_deref().unwrap_or("-")),
-                        format!("Local CWD: {}", self.local_directory.display()),
-                        format!("Running jobs: {}", self.jobs.jobs.values().filter(|job| job.state == JobState::Running).count()),
-                        self.config_file.status("Config file"),
-                    ];
-                    if let Some(config) = &self.config_override {
-                        lines.push(config.status("Config override (XFER_CONFIG)"));
-                    }
-                    if let Some(path) = &self.startup_file {
-                        lines.push(format!("RC file: {}", path.display()));
-                    }
-                    let bookmarks = std::path::Path::new(self.settings.text("bookmarks:file").unwrap());
-                    let bookmarks = std::path::absolute(bookmarks).unwrap_or_else(|_| bookmarks.to_owned());
-                    lines.push(format!("Bookmarks file: {}", bookmarks.display()));
-                    lines
-                },
-                Some(id) => match id.parse().ok().and_then(|id| self.jobs.jobs.get(&id)) {
-                    Some(job) => match job.progress.borrow().clone() {
-                        Progress::Transfer(mut stats) => {
-                            stats.elapsed_ms = job.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-                            vec![format!("[{}] {:?} TRANSFER {}", job.id, job.state, serde_json::to_string(&stats).unwrap())]
-                        },
-                        Progress::Determinate { done, total, message } => vec![format!("[{}] {:?} {done}/{total} {message}", job.id, job.state)],
-                        Progress::Indeterminate { message } => vec![format!("[{}] {:?} {message}", job.id, job.state)],
-                    },
-                    None => vec!["no such job".into()],
-                },
-            },
-            Some("jobs") => self
-                .jobs
-                .jobs
-                .values()
-                .map(|job| format!("[{}] {:?} {}", job.id, job.state, job.title))
-                .collect(),
-            Some("cancel") => match words.next().and_then(|value| value.parse().ok()) {
-                Some(id) => {
-                    self.jobs.cancel(id);
-                    vec![format!("cancel requested for job {id}")]
-                }
-                None => vec!["usage: cancel <job-id>".into()],
-            },
-            Some("show") => match words.next() {
-                Some(name) => match self.settings.values.get(name) {
-                    Some(setting) => vec![format!(
-                        "{name}: {} — {}",
-                        setting.value.display(),
-                        setting.doc
-                    )],
-                    None => vec![format!("unknown setting: {name}")],
-                },
-                None => {
-                    let mut names = self.settings.values.keys().collect::<Vec<_>>();
-                    names.sort_unstable();
-                    names
-                        .into_iter()
-                        .map(|name| {
-                            let setting = &self.settings.values[name];
-                            format!("{name}: {} — {}", setting.value.display(), setting.doc)
-                        })
-                        .collect()
-                }
-            },
-            Some("set") => match (words.next(), words.next()) {
-                (Some(name), Some(value)) => match self.settings.set(name, value) {
-                    Ok(()) => vec![format!("{name} set to {value}")],
-                    Err(error) => vec![error.to_string()],
-                },
-                _ => vec!["usage: set <name> <value>".into()],
-            },
-            _ => vec!["unknown daemon command".into()],
-        }
+        crate::commands::dispatch_daemon(self, line)
     }
 }
 
@@ -1051,6 +678,7 @@ impl Daemon {
 mod backend_tests {
     use super::*;
     use crate::backend::{ConnectOptions, Connection};
+    use crate::commands::cd::snapshot_directory;
     use async_trait::async_trait;
 
     struct FakeBackend;

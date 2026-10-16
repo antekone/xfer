@@ -75,6 +75,7 @@ pub fn instances() -> std::io::Result<Vec<Instance>> {
 pub mod backend;
 pub mod bookmarks;
 pub mod cache;
+pub mod commands;
 pub mod credentials;
 pub mod daemon_server;
 pub mod error;

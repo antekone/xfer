@@ -473,3 +473,37 @@ the intended remote object: length alone cannot prove that existing local bytes
 match. The ETag guard protects requests/retries within this job, not the provenance
 of a pre-existing local partial file. Enabling clobber intentionally truncates the
 old file; partial downloads are not atomically renamed into place.
+
+## Command implementation
+
+`src/commands.rs` defines the `Command` trait and the global immutable `COMMANDS`
+table. Both the attached client's dispatcher and the daemon walk this table to
+match parsed input. Help, aliases, command-name completion, argument-completion
+policy, and history policy come from the same entries rather than separate lists.
+
+Small commands (`help`, `pwd`, `show`, `set`, jobs, and client session controls) are
+grouped in `commands.rs` using `SmallCommand`, which implements `Command`. Larger
+handlers live in dedicated modules under `src/commands/`: `connect.rs`, `get.rs`,
+`ls.rs`, `cd.rs`, `bookmark.rs`, `status.rs`, `output.rs`, and `shell.rs`.
+
+Each implementation provides `names()` (canonical name and aliases) and
+`handler()`, returning a function with this signature:
+
+```rust,ignore
+fn execute(
+    context: &mut CommandContext<'_>,
+    parser: &ParserContext<'_>,
+) -> anyhow::Result<CommandResult>
+```
+
+`CommandContext` contains either the authoritative daemon app or a `ClientApp`
+adapter for terminal/session services. Execution-site checks prevent client-local
+commands from running in the daemon. Passwords are supplied out of band in the
+context, never in parser text. `ParserContext` provides the original source,
+command name, decoded arguments, and unmodified Bash source for `!` escapes.
+
+To add a large command, create its module, implement `Command`, and add a single
+entry to `COMMANDS`. Optional `help()`, `completion()`, `site()`, and
+`record_history()` methods customize its behavior. Internal spool commands remain
+registered but are hidden from help and command-name completion. Interactive and
+startup commands use the same registry and handlers.
