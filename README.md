@@ -120,10 +120,14 @@ connection job**, without echoing it. Escape/Ctrl-C cancels; Backspace edits and
 Ctrl-U clears it. The password is sent over the private daemon socket, then supplied
 only when OpenSSH requests it using a short-lived private askpass socket. It is
 not stored in bookmarks/history/job output, process arguments or environment
-variables. Credentials are retained only for that connection job, including any
-transient connection retries, not in the established session. A wrong password
-fails the job; run `open server` again to enter a new one. Startup rc commands use
-the same prompting path and require an attached terminal.
+variables. The daemon retains the password **in memory for the lifetime of the
+logical SFTP connection**, including across client detach/reattach, so transport
+recovery can authenticate without another prompt. Closing or replacing the
+connection releases it; the secret buffer is zeroized when its final reference is
+dropped. Askpass sockets exist only during authentication and are removed afterward.
+A wrong password fails the job, including during recovery; run `open server` again
+to enter a new one. Startup rc commands use the same prompting path and require an
+attached terminal.
 
 Host-key verification is always strict, independent of `ssl:skip-validation`.
 Connect using normal `ssh` first to verify/trust a new host key. xfer never supplies
@@ -131,10 +135,18 @@ a password as a host-key confirmation or private-key passphrase. Keyboard-intera
 MFA/challenge-response authentication is not supported by this single-password flow.
 `sftp:connect-timeout` bounds SSH connection/authentication (default 30 seconds).
 Authentication, host-key and remote filesystem errors fail immediately; transient
-SSH connection failures use the normal retry backoff. If an established transport
-fails or an operation times out, reconnect explicitly with `open`. Connection errors
-include the target, failed setup step, underlying cause, SSH exit status (when available),
-and captured SSH stderr; supplied passwords are redacted.
+SSH connection failures use the normal retry backoff. An established transport
+failure or operation timeout discards the dead session. On the next retry, xfer
+starts a fresh SSH/SFTP session using the retained connection settings and password
+(or keys/agent), without resetting the remote CWD or initial home directory.
+`get`, `ls`, and `cd` use the existing 3, 6, 12, 24, then 30-second backoff; there is
+no separate nested retry loop inside SFTP. Interrupted downloads reopen the file
+and resume from the last locally written byte after checking its original size and
+mtime. Cancellation also drops an in-flight session, leaving the next operation
+able to reconnect. Filesystem, changed-file, authentication, and host-key errors
+remain non-retryable. Connection errors include the target, failed setup step,
+underlying cause, SSH exit status (when available), and captured SSH stderr;
+supplied passwords are redacted.
 
 SFTP downloads compare the opened file's size and modification time before/after
 reading and on retries. Unlike S3's `If-Match` conditional reads, these checks are
@@ -261,7 +273,7 @@ currently apply to S3 bookmarks and affect neither the URL path nor TLS name.
 ## Retry policy
 
 Retryable backend errors from `connect` and `ls` are retried indefinitely; SFTP
-transport/authentication limits are described above. Delays are
+non-retryable errors are described above. Delays are
 3, 6, 12, 24, then 30 seconds between attempts, staying at 30 seconds until the
 operation succeeds or is cancelled. Foreground progress includes the last error
 and the next delay. Ctrl-C cancels either an active request or a backoff wait;

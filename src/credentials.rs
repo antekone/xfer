@@ -1,4 +1,5 @@
-//! Ephemeral connection secrets. Never put these in command text or job titles.
+//! In-memory connection secrets, retained for reconnects until the connection is
+//! dropped. Never put these in command text or job titles.
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::sync::Arc;
 use zeroize::Zeroizing;

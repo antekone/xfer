@@ -67,6 +67,7 @@ impl Daemon {
 # No credentials in process arguments or environment.
 case "$*" in *test-secret*) exit 91;; esac
 if env | grep -q test-secret; then exit 92; fi
+printf '%s\n' "$$" >> "$TEST_SSH_PIDS"
 case "$*" in
     *silent.invalid*) exit 42;;
     *stderr.invalid*) echo 'subsystem request failed on channel 0' >&2; exit 255;;
@@ -114,6 +115,7 @@ exec {server} -d "$TEST_REMOTE_ROOT"
             .env_remove(xfer::ssh_askpass::SOCKET_ENV)
             .env("TEST_REMOTE_ROOT", &remote)
             .env("TEST_ASKPASS_PATHS", root.path().join("askpass-paths"))
+            .env("TEST_SSH_PIDS", root.path().join("ssh-pids"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -190,6 +192,30 @@ exec {server} -d "$TEST_REMOTE_ROOT"
         let payload = serde_json::json!({"target": "test", "password": password});
         let response = self.request(&format!("CONNECT_PASSWORD {payload}"));
         self.finish(response, succeeds);
+    }
+    fn reattach(&mut self) {
+        let socket = self
+            .root
+            .path()
+            .join(format!("run/xfer/instances/{}.sock", self.child.id()));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut stream = UnixStream::connect(&socket).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream.write_all(b"ATTACH\n").unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut response = String::new();
+            reader.read_line(&mut response).unwrap();
+            if response.trim() == "ATTACHED" {
+                self.stream = stream;
+                self.reader = reader;
+                return;
+            }
+            assert!(Instant::now() < deadline, "cannot reattach: {response}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
     fn remote(&self) -> PathBuf {
         self.root.path().join("remote")
@@ -376,4 +402,62 @@ fn tilde_urls_expand_remotely_and_fall_back_without_the_extension() {
     assert!(daemon
         .command("status")
         .contains(&format!("CWD: {}/photos/", daemon.remote().display())));
+}
+
+#[test]
+fn password_is_reused_for_transport_recovery_even_without_an_attached_client() {
+    let Some(mut daemon) = Daemon::start() else {
+        return;
+    };
+    daemon.connect("test-secret", true);
+    let response = daemon.command("cd photos");
+    daemon.finish(response, true);
+    let cwd = format!("CWD: {}/photos/", daemon.remote().display());
+    let downloads = daemon.root.path().join("downloads");
+    fs::create_dir(&downloads).unwrap();
+    writeln!(
+        daemon.stream,
+        "LOCAL_CWD {}",
+        serde_json::to_string(&downloads).unwrap()
+    )
+    .unwrap();
+    assert_eq!(daemon.line(), "LOCAL_CWD_OK");
+    let pids = fs::read_to_string(daemon.root.path().join("ssh-pids")).unwrap();
+    let pid = pids.lines().last().unwrap().parse::<i32>().unwrap();
+    // SAFETY: kill the private fake-SSH/SFTP process recorded by this fixture.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+    let response = daemon.command("get image.txt");
+    // Reauthentication must work in the daemon, without prompting a client.
+    daemon.stream.write_all(b"DETACH\n").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if fs::read(downloads.join("image.txt")).is_ok_and(|data| data == b"image") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "download did not recover while detached"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    daemon.reattach();
+    daemon.finish(response, true);
+    assert!(daemon.command("status").contains(&cwd));
+    assert_eq!(
+        fs::read_to_string(daemon.root.path().join("ssh-pids"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+    let paths = fs::read_to_string(daemon.root.path().join("askpass-paths")).unwrap();
+    assert_eq!(paths.lines().count(), 2);
+    for path in paths.lines() {
+        assert!(
+            !Path::new(path).parent().unwrap().exists(),
+            "askpass helper leaked"
+        );
+    }
+    let response = daemon.command("close");
+    daemon.finish(response, true);
 }
