@@ -11,6 +11,7 @@ pub(crate) mod bookmark;
 pub(crate) mod cat;
 pub(crate) mod cd;
 pub(crate) mod connect;
+pub(crate) mod du;
 pub(crate) mod get;
 pub(crate) mod ls;
 pub(crate) mod output;
@@ -177,6 +178,7 @@ pub static COMMANDS: &[&dyn Command] = &[
     &PWD,
     &LCD,
     &ls::Ls,
+    &du::Du,
     &get::Get,
     &put::Put,
     &cat::Cat,
@@ -827,7 +829,7 @@ mod tests {
         assert!(app.command("show s3:region")[0].starts_with("s3:region: test region"));
         for (input, usage) in [
             ("cd a b", "usage: cd [directory]"),
-            ("ls a b", "usage: ls [-FlarS] [--] [path]"),
+            ("ls a b", "usage: ls [-FlarSh] [--] [path]"),
             ("get", "usage: get [-c] [--] <filenames...>"),
             ("pwd extra", "usage: pwd"),
         ] {

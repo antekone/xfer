@@ -75,6 +75,7 @@ pub trait ListingSink: Send {
 pub struct DisplayOptions {
     pub long: bool,
     pub classify: bool,
+    pub human_readable: bool,
 }
 
 /// Legacy long, classified rendering for generic record sinks.
@@ -82,6 +83,7 @@ pub fn render(content: &Content) -> String {
     render_with_options(
         content,
         DisplayOptions {
+            human_readable: false,
             long: true,
             classify: true,
         },
@@ -121,7 +123,12 @@ pub fn render_with_options(content: &Content, options: DisplayOptions) -> String
     let date = date
         .map(|date| date.format("%Y-%m-%d %H:%M:%S UTC").to_string())
         .unwrap_or_else(|| format!("{:>23}", "-"));
-    let basic = format!("[{date}] {:>10}  {name}", format_size(size));
+    let size = if options.human_readable {
+        size.map(human_size).unwrap_or_else(|| "-".into())
+    } else {
+        format_size(size)
+    };
+    let basic = format!("[{date}] {size:>10}  {name}");
     match unix {
         Some(unix) => format!(
             "{} {:>10} {:>10} {basic}",
@@ -151,6 +158,22 @@ fn printable(text: &str) -> String {
         }
     }
     output
+}
+
+/// Format apparent bytes with binary units, shared by ls and du.
+pub fn human_size(bytes: u64) -> String {
+    let units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit + 1 < units.len() {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes}B")
+    } else {
+        format!("{size:.1}{}", units[unit])
+    }
 }
 
 fn format_size(size: Option<u64>) -> String {
@@ -241,6 +264,7 @@ mod tests {
                 render_with_options(
                     &entry,
                     DisplayOptions {
+                        human_readable: false,
                         classify: true,
                         long: false
                     }
@@ -251,6 +275,7 @@ mod tests {
                 render_with_options(
                     &entry,
                     DisplayOptions {
+                        human_readable: false,
                         classify: false,
                         long: true
                     }
@@ -261,6 +286,7 @@ mod tests {
                 render_with_options(
                     &entry,
                     DisplayOptions {
+                        human_readable: false,
                         classify: true,
                         long: true
                     }
@@ -282,6 +308,7 @@ mod tests {
             render_with_options(
                 &file,
                 DisplayOptions {
+                    human_readable: false,
                     classify: true,
                     long: false
                 }
@@ -308,6 +335,49 @@ mod tests {
         assert!(line.contains("alice"));
         assert!(line.contains("ops\\u{1b}"));
         assert!(!line.contains('\x1b'));
+    }
+
+    #[test]
+    fn human_readable_sizes_preserve_alignment_and_unknown_values() {
+        let options = DisplayOptions {
+            long: true,
+            human_readable: true,
+            ..Default::default()
+        };
+        for (size, expected) in [
+            (Some(0), "0B"),
+            (Some(1536), "1.5KiB"),
+            (Some(1048576), "1.0MiB"),
+            (None, "-"),
+        ] {
+            let entry = Content::File(FileInfo {
+                name: "file".into(),
+                size,
+                modified: Some(date()),
+                unix: None,
+            });
+            assert_eq!(
+                render_with_options(&entry, options),
+                format!("[2026-10-16 13:22:00 UTC] {expected:>10}  file")
+            );
+            assert_eq!(
+                render_with_options(
+                    &entry,
+                    DisplayOptions {
+                        human_readable: true,
+                        ..Default::default()
+                    }
+                ),
+                "file"
+            );
+        }
+        let directory = Content::Directory(DirectoryInfo {
+            name: "dir".into(),
+            size: Some(4096),
+            modified: Some(date()),
+            unix: None,
+        });
+        assert!(render_with_options(&directory, options).contains("4.0KiB"));
     }
 
     #[test]

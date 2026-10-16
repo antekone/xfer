@@ -11,7 +11,7 @@ use crate::{
 use anyhow::{bail, Result};
 use std::cmp::Ordering;
 
-const USAGE: &str = "usage: ls [-FlarS] [--] [path]";
+const USAGE: &str = "usage: ls [-FlarSh] [--] [path]";
 
 pub(crate) fn register_settings(settings: &mut Settings) {
     settings.register(
@@ -57,6 +57,7 @@ impl LsArgs {
                 match word {
                     "--no-classify" => self.display.classify = false,
                     "--no-long" => self.display.long = false,
+                    "--no-human-readable" => self.display.human_readable = false,
                     "--no-all" => self.all = false,
                     "--no-size" => self.size = false,
                     "--no-reverse" => self.reverse = false,
@@ -67,6 +68,7 @@ impl LsArgs {
                     match flag {
                         'F' => self.display.classify = true,
                         'l' => self.display.long = true,
+                        'h' => self.display.human_readable = true,
                         'a' => self.all = true,
                         'S' => self.size = true,
                         'r' => self.reverse = true,
@@ -121,7 +123,7 @@ impl Command for Ls {
     }
     fn help(&self) -> Option<(&'static str, &'static str)> {
         Some((
-            "ls [-FlarS] [path]",
+            "ls [-FlarSh] [path]",
             "list entries; base: ui:ls-default-options, --no-* disables",
         ))
     }
@@ -391,6 +393,29 @@ mod tests {
             .contains("unknown ls option -z"));
         assert_eq!(LsArgs::parse(["a", "b"]).unwrap_err().to_string(), USAGE);
         assert!(LsArgs::parse(["--", "-a", "b"]).is_err());
+    }
+
+    #[test]
+    fn human_readable_flag_combines_and_can_override_defaults() {
+        let args = LsArgs::parse(["-lhS"]).unwrap();
+        assert!(args.display.long && args.display.human_readable && args.size);
+        assert_eq!(args, LsArgs::parse(["-l", "-h", "-S"]).unwrap());
+        assert!(
+            !LsArgs::with_defaults("-lh", ["--no-human-readable"])
+                .unwrap()
+                .display
+                .human_readable
+        );
+        assert!(
+            LsArgs::with_defaults("-lh", ["--no-human-readable", "-h"])
+                .unwrap()
+                .display
+                .human_readable
+        );
+        assert_eq!(
+            args.compare(&file("small", Some(1024)), &file("large", Some(2048))),
+            Ordering::Greater
+        );
     }
 
     #[test]

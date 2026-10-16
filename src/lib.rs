@@ -85,3 +85,5 @@ pub mod s3;
 pub mod sftp;
 pub mod ssh_askpass;
 pub mod transfer;
+
+pub mod walker;

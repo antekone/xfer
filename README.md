@@ -37,6 +37,26 @@ smb:max-credits: 32
 S3 and SFTP support connect, navigation, listing and downloads. SFTP also supports
 uploads with `put`; S3 uploads, mirroring, and SMB operations are not implemented yet.
 
+## Remote directory usage
+
+`du [paths...]` recursively lists the byte total for each remote directory,
+children before parents. With no path it uses the current remote directory;
+`du -s [paths...]` prints only each selected root's total. Add `-h` (or `-sh`)
+for human-readable sizes using binary units such as KiB, MiB, and GiB. Individual files are
+also accepted. For example:
+
+```text
+du
+du -s downloads archive
+du -- -directory
+```
+
+Totals are apparent file bytes, not allocated disk blocks: directory attributes
+are excluded, descendant symlinks are counted without following them, and hard
+links are counted per directory entry. Missing file sizes or listing failures
+report an error rather than a partial total. Traversal runs as a cancellable job
+with normal transport retries; it does not change the remote working directory.
+
 ## Command history
 
 `ui:history-file` defaults to `$XDG_STATE_HOME/xfer/history` (or
@@ -293,7 +313,7 @@ idempotency/resume handling rather than blindly replaying writes.
 ### `ls` output and sorting
 
 ```text
-ls [-FlarS] [--] [path]
+ls [-FlarSh] [--] [path]
 ```
 
 The string setting `ui:ls-default-options` supplies base flags, defaulting to `-lF`
@@ -321,6 +341,8 @@ buckets come first, then files, with names sorted lexically A–Z within each gr
 - `-F`: append `/` to directory and bucket names (no other type suffixes).
 - `-l`: long output with dates, exact byte sizes, and available Unix metadata.
   Directory suffixes still require `-F`.
+- `-h`: show sizes in binary human-readable units (KiB, MiB, etc.) in long output.
+  Size sorting still uses exact byte counts.
 - `-a`: include hidden dotfiles/directories. `.` and `..` are not synthesized.
   Explicitly named hidden files are shown even without `-a`.
 - `-S`: sort all items by size, largest first, then by name for ties. Unknown
@@ -328,7 +350,8 @@ buckets come first, then files, with names sorted lexically A–Z within each gr
 - `-r`: reverse the entire selected order, including directory/file groups or
   unknown-size placement.
 
-Use `--no-long`, `--no-classify`, `--no-all`, `--no-size`, or `--no-reverse` to
+Use `--no-long`, `--no-classify`, `--no-all`, `--no-size`, `--no-reverse`,
+or `--no-human-readable` to
 clear the corresponding inherited flag. Later flags win, so `--no-long -l` enables
 long output again. `--no-size` restores name sorting.
 
