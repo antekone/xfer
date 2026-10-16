@@ -112,6 +112,45 @@ pub async fn run() -> Result<()> {
                         let _ = writer.write_all(response);
                         let _ = writer.flush();
                     }
+                    Ok(_) if request.trim() == "SESSION" => {
+                        let info = daemon.lock().expect("daemon state poisoned").session_info();
+                        let _ =
+                            writeln!(writer, "SESSION {}", serde_json::to_string(&info).unwrap());
+                        let _ = writer.flush();
+                    }
+                    Ok(_)
+                        if request.starts_with("COMPLETE_CD ")
+                            || request.starts_with("COMPLETE_LS ") =>
+                    {
+                        let result = match serde_json::from_str::<String>(request[12..].trim()) {
+                            Ok(input) => {
+                                // Do not hold the daemon-state mutex over network I/O.
+                                let future = daemon
+                                    .lock()
+                                    .expect("daemon state poisoned")
+                                    .path_completion(input, request.starts_with("COMPLETE_CD "));
+                                runtime.block_on(future)
+                            }
+                            Err(_) => Err(anyhow::anyhow!("invalid completion request")),
+                        };
+                        match result {
+                            Ok(completion) => {
+                                let _ = writeln!(
+                                    writer,
+                                    "COMPLETION {}",
+                                    serde_json::to_string(&completion).unwrap()
+                                );
+                            }
+                            Err(error) => {
+                                let _ = writeln!(
+                                    writer,
+                                    "COMPLETION_ERROR {}",
+                                    serde_json::to_string(&error.to_string()).unwrap()
+                                );
+                            }
+                        }
+                        let _ = writer.flush();
+                    }
                     Ok(_) if request.starts_with("COMMAND ") => {
                         let response = daemon
                             .lock()

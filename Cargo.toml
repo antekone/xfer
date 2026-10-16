@@ -26,6 +26,7 @@ rustls = { version = "0.21", features = ["dangerous_configuration"] }
 hyper = { version = "0.14", features = ["client", "tcp"] }
 tower-service = "0.3"
 unicode-width = "0.2"
+chrono = { version = "0.4", default-features = false, features = ["std", "serde"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

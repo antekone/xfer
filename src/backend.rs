@@ -2,6 +2,8 @@
 use crate::{
     bookmarks::Bookmark,
     core::{SettingValue, Settings},
+    error::NonRetryableError,
+    listing::{BucketInfo, Content, DirectoryInfo, FileInfo, ListingSink},
 };
 use anyhow::{bail, Result};
 use async_trait::async_trait;
@@ -16,8 +18,31 @@ pub struct ConnectOptions {
 #[async_trait]
 pub trait Connection: Send + Sync {
     fn protocol(&self) -> &'static str;
-    async fn list(&self, _path: &str, _output: &mut crate::core::OutputStore) -> Result<u64> {
+    async fn list(&self, _path: &str, _output: &mut dyn ListingSink) -> Result<u64> {
         bail!("listing is not implemented for {}", self.protocol())
+    }
+    /// Canonicalize a directory against this connection's current location.
+    /// None selects the connection's initial directory (shell-style `cd`).
+    fn resolve_directory(&self, path: Option<&str>) -> Result<String> {
+        Ok(path.unwrap_or("/").to_owned())
+    }
+    fn resolve_listing_path(&self, path: &str) -> Result<String> {
+        self.resolve_directory(Some(path))
+    }
+    fn pwd(&self) -> Result<String> {
+        bail!("pwd is not implemented for {}", self.protocol())
+    }
+    async fn change_directory(&mut self, _path: &str) -> Result<()> {
+        Err(NonRetryableError(format!("cd is not implemented for {}", self.protocol())).into())
+    }
+    async fn complete_directories(&self, _input: &str) -> Result<crate::cache::PathCompletion> {
+        bail!(
+            "directory completion is not available for {}",
+            self.protocol()
+        )
+    }
+    async fn complete_paths(&self, _input: &str) -> Result<crate::cache::PathCompletion> {
+        bail!("path completion is not available for {}", self.protocol())
     }
     async fn disconnect(self: Box<Self>) -> Result<()> {
         Ok(())
@@ -37,44 +62,225 @@ pub trait Backend: Send + Sync {
 }
 
 pub struct S3;
+/// Namespace root contains buckets; all remaining components are an S3 prefix.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct S3Location {
+    bucket: Option<String>,
+    prefix: String,
+}
+impl S3Location {
+    fn path(&self) -> String {
+        match &self.bucket {
+            Some(bucket) => format!("/{bucket}/{}", self.prefix),
+            None => "/".into(),
+        }
+    }
+    fn resolve(&self, path: &str) -> Self {
+        let absolute = path.starts_with('/');
+        let base = self.path();
+        let mut parts = if absolute {
+            Vec::new()
+        } else {
+            base.split('/')
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+        };
+        for part in path.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                _ => parts.push(part),
+            }
+        }
+        if parts.is_empty() {
+            return Self::default();
+        }
+        Self {
+            bucket: Some(parts[0].to_owned()),
+            prefix: if parts.len() > 1 {
+                format!("{}/", parts[1..].join("/"))
+            } else {
+                String::new()
+            },
+        }
+    }
+}
+
 struct S3Connection {
     client: aws_sdk_s3::Client,
-    bucket: Option<String>,
+    location: S3Location,
+    home: S3Location,
     redactions: Vec<String>,
+}
+impl S3Connection {
+    fn new(client: aws_sdk_s3::Client, bucket: Option<String>, redactions: Vec<String>) -> Self {
+        let location = S3Location {
+            bucket,
+            prefix: String::new(),
+        };
+        Self {
+            client,
+            home: location.clone(),
+            location,
+            redactions,
+        }
+    }
 }
 #[async_trait]
 impl Connection for S3Connection {
     fn protocol(&self) -> &'static str {
         "s3"
     }
-    async fn list(&self, path: &str, output: &mut crate::core::OutputStore) -> Result<u64> {
+    fn resolve_directory(&self, path: Option<&str>) -> Result<String> {
+        Ok(match path {
+            Some(path) => self.location.resolve(path).path(),
+            None => self.home.path(),
+        })
+    }
+    fn resolve_listing_path(&self, path: &str) -> Result<String> {
+        let location = self.location.resolve(path);
+        let canonical = location.path();
+        if !location.prefix.is_empty() && !directory_path(path) {
+            Ok(canonical.trim_end_matches('/').to_owned())
+        } else {
+            Ok(canonical)
+        }
+    }
+    fn pwd(&self) -> Result<String> {
+        Ok(self.location.path())
+    }
+    async fn change_directory(&mut self, path: &str) -> Result<()> {
+        let target = self.location.resolve(path);
+        if target == self.location {
+            return Ok(());
+        }
+        match &target.bucket {
+            None => {
+                self.client
+                    .list_buckets()
+                    .max_buckets(1)
+                    .send()
+                    .await
+                    .map_err(|error| probe_error("ListBuckets", &error, &self.redactions))?;
+            }
+            Some(bucket) if target.prefix.is_empty() => {
+                self.client
+                    .head_bucket()
+                    .bucket(bucket)
+                    .send()
+                    .await
+                    .map_err(|error| {
+                        if error
+                            .raw_response()
+                            .is_some_and(|response| response.status().as_u16() == 404)
+                        {
+                            anyhow::Error::from(NonRetryableError(format!(
+                                "no such bucket: {bucket}"
+                            )))
+                        } else {
+                            probe_error("HeadBucket", &error, &self.redactions)
+                        }
+                    })?;
+            }
+            Some(bucket) => {
+                // Prefixes are virtual: existence means at least one object,
+                // including a directory marker. Do not download object data.
+                let result = self
+                    .client
+                    .list_objects_v2()
+                    .bucket(bucket)
+                    .prefix(&target.prefix)
+                    .max_keys(1)
+                    .send()
+                    .await
+                    .map_err(|error| {
+                        if error
+                            .raw_response()
+                            .is_some_and(|response| response.status().as_u16() == 404)
+                        {
+                            anyhow::Error::from(NonRetryableError(format!(
+                                "no such directory: {}",
+                                target.path()
+                            )))
+                        } else {
+                            probe_error("ListObjectsV2", &error, &self.redactions)
+                        }
+                    })?;
+                if result.contents().is_empty() && result.common_prefixes().is_empty() {
+                    return Err(
+                        NonRetryableError(format!("no such directory: {}", target.path())).into(),
+                    );
+                }
+            }
+        }
+        // Only commit after successful validation; failures/cancellation retain cwd.
+        self.location = target;
+        Ok(())
+    }
+    async fn list(&self, path: &str, output: &mut dyn ListingSink) -> Result<u64> {
+        let location = self.location.resolve(path);
+        let prefix = &location.prefix;
         let mut count = 0;
         let mut token = None;
-        if let Some(bucket) = &self.bucket {
+        if let Some(bucket) = &location.bucket {
+            if !prefix.is_empty() && !directory_path(path) {
+                let key = prefix.trim_end_matches('/');
+                // A literal file wins over an equally named virtual directory.
+                // ListObjects gives metadata without requiring GetObject/HEAD access.
+                let probe = self
+                    .client
+                    .list_objects_v2()
+                    .bucket(bucket)
+                    .prefix(key)
+                    .max_keys(1)
+                    .send()
+                    .await
+                    .map_err(|error| probe_error("ListObjectsV2", &error, &self.redactions))?;
+                if let Some(object) = probe
+                    .contents()
+                    .iter()
+                    .find(|object| object.key() == Some(key))
+                {
+                    output.emit(object_content(
+                        object,
+                        key.rsplit('/').next().unwrap_or(key),
+                    ))?;
+                    return Ok(1);
+                }
+            }
             loop {
                 let page = self
                     .client
                     .list_objects_v2()
                     .bucket(bucket)
-                    .prefix(path)
+                    .prefix(prefix)
                     .delimiter("/")
                     .set_continuation_token(token)
                     .max_keys(1000)
                     .send()
                     .await
                     .map_err(|error| probe_error("ListObjectsV2", &error, &self.redactions))?;
-                for prefix in page.common_prefixes() {
-                    if let Some(name) = prefix.prefix() {
-                        output.write_line(&format!("DIR  {}", name.escape_default()))?;
+                for common_prefix in page.common_prefixes() {
+                    if let Some(name) = common_prefix.prefix() {
+                        output.emit(Content::Directory(DirectoryInfo {
+                            name: name.strip_prefix(prefix).unwrap_or(name).to_owned(),
+                            modified: None,
+                        }))?;
                         count += 1;
                     }
                 }
                 for object in page.contents() {
                     if let Some(name) = object.key() {
-                        output.write_line(&format!(
-                            "{:>12}  {}",
-                            object.size().unwrap_or(0),
-                            name.escape_default()
+                        // An optional zero-byte directory marker is the current
+                        // directory itself, not one of its children.
+                        if name == prefix && name.ends_with('/') {
+                            continue;
+                        }
+                        output.emit(object_content(
+                            object,
+                            name.strip_prefix(prefix).unwrap_or(name),
                         ))?;
                         count += 1;
                     }
@@ -88,9 +294,6 @@ impl Connection for S3Connection {
                 }
             }
         } else {
-            if !path.is_empty() {
-                bail!("bucket listing takes no prefix; connect s3://bucket to list its contents");
-            }
             loop {
                 let page = self
                     .client
@@ -102,7 +305,12 @@ impl Connection for S3Connection {
                     .map_err(|error| probe_error("ListBuckets", &error, &self.redactions))?;
                 for bucket in page.buckets() {
                     if let Some(name) = bucket.name() {
-                        output.write_line(&name.escape_default().to_string())?;
+                        output.emit(Content::Bucket(BucketInfo {
+                            name: name.to_owned(),
+                            created: bucket.creation_date().and_then(|value| {
+                                chrono::DateTime::from_timestamp(value.secs(), value.subsec_nanos())
+                            }),
+                        }))?;
                         count += 1;
                     }
                 }
@@ -117,6 +325,19 @@ impl Connection for S3Connection {
         }
         Ok(count)
     }
+}
+
+fn directory_path(path: &str) -> bool {
+    path.is_empty() || path.ends_with('/') || matches!(path.rsplit('/').next(), Some("." | ".."))
+}
+fn object_content(object: &aws_sdk_s3::types::Object, name: &str) -> Content {
+    Content::File(FileInfo {
+        name: name.to_owned(),
+        size: object.size().and_then(|value| u64::try_from(value).ok()),
+        modified: object
+            .last_modified()
+            .and_then(|value| chrono::DateTime::from_timestamp(value.secs(), value.subsec_nanos())),
+    })
 }
 
 #[async_trait]
@@ -265,11 +486,7 @@ impl Backend for S3 {
                 .await
                 .map_err(|error| probe_error("ListBuckets", &error, &redactions))?;
         }
-        Ok(Box::new(S3Connection {
-            client,
-            bucket,
-            redactions,
-        }))
+        Ok(Box::new(S3Connection::new(client, bucket, redactions)))
     }
 }
 
@@ -499,6 +716,26 @@ mod tests {
     }
 
     #[test]
+    fn s3_directory_resolution_handles_root_parents_and_relative_paths() {
+        let root = S3Location::default();
+        assert_eq!(root.path(), "/");
+        let directory = root.resolve("archive/photos/2026");
+        assert_eq!(directory.path(), "/archive/photos/2026/");
+        assert_eq!(
+            directory.resolve("../other").path(),
+            "/archive/photos/other/"
+        );
+        assert_eq!(directory.resolve("./").path(), directory.path());
+        assert_eq!(directory.resolve("/other/images").path(), "/other/images/");
+        assert_eq!(directory.resolve("../../..").path(), "/");
+        assert_eq!(directory.resolve("../../../../..").path(), "/");
+        assert_eq!(
+            root.resolve("//archive///photos//").path(),
+            "/archive/photos/"
+        );
+    }
+
+    #[test]
     fn bucket_urls() {
         assert_eq!(parse_bucket("s3://example").unwrap(), "example");
         for url in ["s3://", "s3://example/key", "https://example", "s3://a?x"] {
@@ -514,6 +751,15 @@ mod connection_tests {
         io::{BufRead, BufReader, Write},
         net::TcpListener,
     };
+
+    #[derive(Default)]
+    struct Records(Vec<Content>);
+    impl ListingSink for Records {
+        fn emit(&mut self, content: Content) -> Result<()> {
+            self.0.push(content);
+            Ok(())
+        }
+    }
 
     fn self_signed_endpoint() -> (String, tokio::sync::oneshot::Receiver<bool>) {
         let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
@@ -653,39 +899,59 @@ mod connection_tests {
     }
 
     #[tokio::test]
-    async fn lists_all_bucket_pages_to_spool() {
+    async fn lists_all_bucket_pages_as_structured_records() {
         let (client, requests) = listing_client(vec![
-            "<ListAllMyBucketsResult><Buckets><Bucket><Name>alpha</Name></Bucket></Buckets><ContinuationToken>next</ContinuationToken></ListAllMyBucketsResult>",
+            "<ListAllMyBucketsResult><Buckets><Bucket><Name>alpha</Name><CreationDate>2025-04-16T10:11:00Z</CreationDate></Bucket></Buckets><ContinuationToken>next</ContinuationToken></ListAllMyBucketsResult>",
             "<ListAllMyBucketsResult><Buckets><Bucket><Name>beta</Name></Bucket></Buckets></ListAllMyBucketsResult>",
         ]).await;
-        let connection = S3Connection {
-            client,
-            bucket: None,
-            redactions: Vec::new(),
-        };
-        let mut output = crate::core::OutputStore::new(9001);
-        assert_eq!(connection.list("", &mut output).await.unwrap(), 2);
-        assert_eq!(output.read_all(), vec!["alpha", "beta"]);
+        let connection = S3Connection::new(client, None, Vec::new());
+        let mut records = Records::default();
+        assert_eq!(connection.list("", &mut records).await.unwrap(), 2);
+        let date = chrono::DateTime::parse_from_rfc3339("2025-04-16T10:11:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            records.0,
+            vec![
+                Content::Bucket(BucketInfo {
+                    name: "alpha".into(),
+                    created: Some(date)
+                }),
+                Content::Bucket(BucketInfo {
+                    name: "beta".into(),
+                    created: None
+                }),
+            ]
+        );
         assert!(requests.await.unwrap()[1].contains("continuation-token=next"));
-        std::fs::remove_file(output.path()).unwrap();
     }
 
     #[tokio::test]
     async fn lists_objects_and_prefixes_across_pages() {
         let (client, requests) = listing_client(vec![
             "<ListBucketResult><IsTruncated>true</IsTruncated><CommonPrefixes><Prefix>photos/sub/</Prefix></CommonPrefixes><NextContinuationToken>next</NextContinuationToken></ListBucketResult>",
-            "<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>photos/a.jpg</Key><Size>42</Size></Contents></ListBucketResult>",
+            "<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>photos/a.jpg</Key><Size>42</Size><LastModified>2026-10-16T13:22:00Z</LastModified></Contents></ListBucketResult>",
         ]).await;
-        let connection = S3Connection {
-            client,
-            bucket: Some("example".into()),
-            redactions: Vec::new(),
-        };
-        let mut output = crate::core::OutputStore::new(9002);
-        assert_eq!(connection.list("photos/", &mut output).await.unwrap(), 2);
-        let lines = output.read_all();
-        assert_eq!(lines[0], "DIR  photos/sub/");
-        assert!(lines[1].contains("42  photos/a.jpg"));
+        let connection = S3Connection::new(client, Some("example".into()), Vec::new());
+        let mut records = Records::default();
+        assert_eq!(connection.list("photos/", &mut records).await.unwrap(), 2);
+        let date = chrono::DateTime::parse_from_rfc3339("2026-10-16T13:22:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            records.0,
+            vec![
+                Content::Directory(DirectoryInfo {
+                    name: "sub/".into(),
+                    modified: None
+                }),
+                Content::File(FileInfo {
+                    name: "a.jpg".into(),
+                    size: Some(42),
+                    modified: Some(date)
+                }),
+            ]
+        );
         let requests = requests.await.unwrap();
         assert!(
             requests[0].starts_with("GET /example/") || requests[0].starts_with("GET /example?"),
@@ -693,7 +959,150 @@ mod connection_tests {
             requests[0]
         );
         assert!(requests[1].contains("continuation-token=next"));
-        std::fs::remove_file(output.path()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ls_file_uses_listing_metadata_and_does_not_change_pwd() {
+        let (client, requests) = listing_client(vec![
+            "<ListBucketResult><Contents><Key>notes.txt</Key><Size>42</Size><LastModified>2026-10-16T13:22:00Z</LastModified></Contents></ListBucketResult>",
+        ]).await;
+        let connection = S3Connection::new(client, Some("example".into()), Vec::new());
+        let target = connection.resolve_listing_path("notes.txt").unwrap();
+        assert_eq!(target, "/example/notes.txt");
+        let mut records = Records::default();
+        assert_eq!(connection.list(&target, &mut records).await.unwrap(), 1);
+        assert!(
+            matches!(&records.0[0], Content::File(info) if info.name == "notes.txt" && info.size == Some(42) && info.modified.is_some())
+        );
+        assert_eq!(connection.pwd().unwrap(), "/example/");
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("GET /example"));
+        assert!(requests[0].contains("prefix=notes.txt"));
+        assert!(requests[0].contains("max-keys=1"));
+    }
+
+    #[tokio::test]
+    async fn ls_bare_directory_falls_back_to_prefix_listing() {
+        let (client, requests) = listing_client(vec![
+            "<ListBucketResult><Contents><Key>photos/a.txt</Key><Size>42</Size></Contents></ListBucketResult>",
+            "<ListBucketResult><Contents><Key>photos/a.txt</Key><Size>42</Size></Contents></ListBucketResult>",
+        ]).await;
+        let connection = S3Connection::new(client, Some("example".into()), Vec::new());
+        let target = connection.resolve_listing_path("photos").unwrap();
+        assert_eq!(target, "/example/photos");
+        let mut records = Records::default();
+        assert_eq!(connection.list(&target, &mut records).await.unwrap(), 1);
+        assert!(matches!(&records.0[0], Content::File(info) if info.name == "a.txt"));
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains("prefix=photos%2F"));
+    }
+
+    #[tokio::test]
+    async fn ls_file_and_equally_named_directory_are_unambiguous() {
+        let (client, requests) = listing_client(vec![
+            "<ListBucketResult><Contents><Key>foo</Key><Size>10</Size></Contents></ListBucketResult>",
+            "<ListBucketResult><Contents><Key>foo/a.txt</Key><Size>42</Size></Contents></ListBucketResult>",
+        ]).await;
+        let connection = S3Connection::new(client, Some("example".into()), Vec::new());
+        let mut file = Records::default();
+        connection.list("foo", &mut file).await.unwrap();
+        assert!(matches!(&file.0[0], Content::File(info) if info.name == "foo"));
+        let mut folder = Records::default();
+        connection.list("foo/", &mut folder).await.unwrap();
+        assert!(matches!(&folder.0[0], Content::File(info) if info.name == "a.txt"));
+        assert_eq!(requests.await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn directory_changes_validate_existence_and_list_relative_names() {
+        let (client, requests) = listing_client(vec![
+            "", // HeadBucket for cd example
+            "<ListBucketResult><Contents><Key>photos/a.txt</Key></Contents></ListBucketResult>",
+            "<ListBucketResult><CommonPrefixes><Prefix>photos/sub/</Prefix></CommonPrefixes><Contents><Key>photos/</Key><Size>0</Size></Contents><Contents><Key>photos/a.txt</Key><Size>42</Size></Contents></ListBucketResult>",
+            "<ListBucketResult></ListBucketResult>", // cd missing must not change cwd
+            "", // HeadBucket for cd ..
+            "<ListAllMyBucketsResult><Buckets><Bucket><Name>example</Name></Bucket></Buckets></ListAllMyBucketsResult>",
+        ]).await;
+        let mut connection = S3Connection::new(client, None, Vec::new());
+        assert_eq!(connection.pwd().unwrap(), "/");
+        connection.change_directory("example").await.unwrap();
+        assert_eq!(connection.pwd().unwrap(), "/example/");
+        connection.change_directory("photos").await.unwrap();
+        assert_eq!(connection.pwd().unwrap(), "/example/photos/");
+        let mut records = Records::default();
+        assert_eq!(connection.list("", &mut records).await.unwrap(), 2);
+        assert!(matches!(&records.0[0], Content::Directory(info) if info.name == "sub/"));
+        assert!(matches!(&records.0[1], Content::File(info) if info.name == "a.txt"));
+        assert_eq!(connection.pwd().unwrap(), "/example/photos/"); // ls never changes cwd
+        let error = connection.change_directory("../missing").await.unwrap_err();
+        assert!(error.is::<NonRetryableError>());
+        assert_eq!(connection.pwd().unwrap(), "/example/photos/");
+        connection.change_directory("..").await.unwrap();
+        assert_eq!(connection.pwd().unwrap(), "/example/");
+        connection.change_directory("/").await.unwrap();
+        assert_eq!(connection.pwd().unwrap(), "/");
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 6);
+        assert!(requests[0].starts_with("HEAD /example"));
+        assert!(requests[1].contains("max-keys=1"));
+        assert!(requests[2].contains("prefix=photos%2F"));
+        assert!(requests[3].contains("prefix=missing%2F"));
+    }
+
+    #[tokio::test]
+    async fn cd_root_exits_initial_bucket_and_lists_the_account() {
+        let account = "<ListAllMyBucketsResult><Buckets><Bucket><Name>ci-production</Name></Bucket><Bucket><Name>macosx</Name></Bucket></Buckets></ListAllMyBucketsResult>";
+        let (client, requests) = listing_client(vec![
+            "<ListBucketResult><Contents><Key>test_agent/a.txt</Key></Contents></ListBucketResult>",
+            account, // validate account root on cd /
+            account, // ls must request ListBuckets, not the old bucket's objects
+            "",      // HeadBucket when bare cd returns home
+        ])
+        .await;
+        let mut connection = S3Connection::new(client, Some("macosx".into()), Vec::new());
+        connection.change_directory("test_agent").await.unwrap();
+        assert_eq!(connection.pwd().unwrap(), "/macosx/test_agent/");
+        connection.change_directory("/").await.unwrap();
+        assert_eq!(connection.pwd().unwrap(), "/");
+        assert_eq!(connection.location.bucket, None);
+        assert!(connection.location.prefix.is_empty());
+        let mut records = Records::default();
+        assert_eq!(connection.list("", &mut records).await.unwrap(), 2);
+        assert!(records
+            .0
+            .iter()
+            .all(|entry| matches!(entry, Content::Bucket(_))));
+        // Home is not the active directory. Only an explicit bare cd restores it.
+        let home = connection.resolve_directory(None).unwrap();
+        assert_eq!(home, "/macosx/");
+        assert_eq!(connection.pwd().unwrap(), "/");
+        connection.change_directory(&home).await.unwrap();
+        assert_eq!(connection.pwd().unwrap(), "/macosx/");
+        let requests = requests.await.unwrap();
+        for request in &requests[1..3] {
+            assert!(
+                request.starts_with("GET /?"),
+                "account request must not target the initial bucket: {request}"
+            );
+            assert!(!request.contains("list-type=2"));
+            assert!(!request.contains("macosx"));
+        }
+        assert!(requests[3].starts_with("HEAD /macosx"));
+    }
+
+    #[tokio::test]
+    async fn no_argument_cd_resolves_to_initial_bucket() {
+        let (client, _) = listing_client(Vec::new()).await;
+        let mut connection = S3Connection::new(client, Some("archive".into()), Vec::new());
+        connection.location = connection.location.resolve("photos/2026");
+        assert_eq!(connection.resolve_directory(None).unwrap(), "/archive/");
+        assert_eq!(connection.resolve_directory(Some("/")).unwrap(), "/");
+        assert_eq!(
+            connection.resolve_directory(Some("..")).unwrap(),
+            "/archive/photos/"
+        );
     }
 
     #[tokio::test]

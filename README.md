@@ -176,3 +176,146 @@ keep their settings snapshot and preserve an existing connection on failure.
 Syntax errors/unknown bookmarks are still reported immediately before a job
 starts. File transfers are not implemented yet; future write operations will
 need idempotency/resume handling rather than blindly replaying writes.
+
+### Listing records and display
+
+Backends emit typed `Content` records (`Bucket`, `Directory`, `File`, `Comment`)
+through a `ListingSink`, one entry at a time. `src/listing.rs` defines these types
+and the common renderer; backends do not format terminal output. The daemon's
+spool adapter invokes that renderer. This keeps paginated listings bounded and
+allows future completion/picker sinks to consume metadata without parsing text.
+
+Example output (fixed-width date and size columns):
+
+```text
+[2025-04-16 10:11:00 UTC]          -  ci-production/
+[                      -]          -  src/
+[2026-10-16 13:22:00 UTC]    4.0 KiB  notes.txt
+```
+
+S3 object dates are `LastModified` values from `ListObjectsV2`; bucket dates are
+creation dates from `ListBuckets`, not modification times. Virtual directory
+prefixes have no timestamp, and neither buckets nor prefixes have an aggregate
+size in the listing API: these fields display `-` rather than fabricated dates
+or zero sizes. All dates are UTC; file sizes use binary units. Permissions and
+ownership are omitted since ordinary S3 listing metadata does not contain them.
+Names preserve Unicode, while terminal control characters are escaped.
+
+### Working directory
+
+The daemon-owned backend connection holds its working directory. It survives
+client detach/reattach and resets on a new connection. For S3, `/` is the account
+root (buckets); `/bucket/photos/` is a bucket/prefix location:
+
+```text
+open minio
+cd archive
+cd photos
+pwd                 # /archive/photos/
+ls                  # names relative to photos/: a.jpg, sub/, ...
+ls ../documents     # does not change pwd
+cd ..
+cd /other-bucket
+cd                  # return to the connection's initial directory
+```
+
+`cd .`, `cd ..`, absolute paths, and trailing `/` are supported. A bucket bookmark
+starts at `/its-bucket/`; plain `cd` returns there, while `cd /` selects the account
+root. `cd /` really clears the active bucket and subsequent `ls` uses account-level
+`ListBuckets`, not the original bucket's objects. The bookmark's initial bucket
+is retained only as the home destination for bare `cd`, not as a hidden active
+bucket. `cd` validates bucket/prefix existence before changing state; errors or
+cancellation leave the previous directory intact. A virtual prefix must contain
+an object (including a directory marker) to exist. Missing directories fail
+immediately; network errors retain the retry/backoff policy. Relative paths are
+resolved once per job so retries do not drift if the working directory changes.
+As with shell paths, `.`/`..` and repeated `/` are normalized; unusual S3 keys
+using those literal path components are not navigable with `cd`.
+
+Explicit `ls` always fetches fresh content and refreshes the typed directory
+cache used by completion; manual listings are never silently served stale data.
+
+
+### Cached directory completion
+
+`cd <TAB>` completes only directory and bucket names, plus `../`. Files and
+comments are excluded. Prefixes and nested/absolute paths work (`cd pho<TAB>`,
+`cd ../ar<TAB>`, `cd /archive/pho<TAB>`); names containing spaces are inserted
+with shell quoting. Commands now accept quoted arguments.
+
+The cache belongs to the backend connection, survives client reattachment, and
+is discarded on close/reconnect. A successful manual `ls` refreshes it. On a cold
+or expired directory, TAB fetches a bounded listing; that lookup has a 3-second
+timeout and does not start a retrying job or change `pwd`. Warm completion uses
+memory only. Directory changes still validate against the server, not the cache.
+
+Defaults (applied to new connections):
+
+```text
+cache:ttl: 30
+cache:max-bytes: 4194304
+```
+
+Set `cache:ttl` or `cache:max-bytes` to `0` to disable retention. The cache uses
+LRU eviction, at most 32 directories, 2048 entries/1 MiB per directory, and the
+configured total estimated-memory budget. Large completion listings are explicitly
+marked as limited; TAB displays at most 20 choices at once. Manual `ls` remains
+unlimited and streams every result to disk even if the cached snapshot is partial.
+Failed refreshes invalidate their old snapshot rather than caching partial errors.
+
+Prompt editing supports Ctrl-W (erase trailing whitespace and the preceding
+whitespace-delimited word). TAB extends to the longest shared prefix of all
+matches, for commands, setting names, and `cd` paths. For example, `cd bui<TAB>`
+with `builddylib-ci/` and `builddylib-remote-ci/` becomes `cd builddylib-`.
+Common prefixes are computed before shell quoting, on Unicode character
+boundaries. A partial/limited cached listing does not auto-extend the prefix,
+since it may be missing other matches.
+
+### Prompt and daemon status
+
+The prompt shows the committed backend working directory, not a process ID:
+
+```text
+xfer> open minio
+xfer[s3:/]> cd archive
+xfer[s3:/archive/]> cd photos
+xfer[s3:/archive/photos/]> status
+```
+
+`status` displays the connected daemon's PID, backend, CWD, and running-job count.
+The prompt refreshes before each new command line after connect/cd/close or
+reattach. It reads a lightweight session snapshot without creating a job or
+waiting for a background operation to release the backend connection lock.
+
+### `ls` path completion
+
+`ls <TAB>` uses the same typed cache as `cd`, but includes files as well as
+buckets, directories, and `../`. Directories/buckets get a trailing `/`; files
+do not. Common-prefix completion, nested/absolute paths, quoting, and cache
+expiry/refetch work for both commands. `cd` continues to exclude files.
+
+```text
+ls READ<TAB>           # README.txt
+ls photos/im<TAB>      # photos/image.jpg
+ls README.txt          # show metadata for this exact file
+ls photos/            # list directory contents, without changing cwd
+```
+
+S3 file metadata is fetched with `ListObjectsV2`, so listing an individual file
+does not require `GetObject` permission. If both a file `foo` and a virtual
+prefix `foo/` exist, `ls foo` selects the file and `ls foo/` lists the directory.
+Single-file results are not stored as directory cache entries.
+
+### Typeahead during jobs
+
+While a foreground job runs or waits to retry, printable keys are buffered for
+the next command line instead of discarded. Backspace and Ctrl-W edit this
+pending text. When the job finishes, is cancelled with Ctrl-C, or is backgrounded
+with Ctrl-Z, the next prompt is prefilled with it. Startup foreground jobs share
+the same buffer. Buffered text is added to history only when submitted normally.
+
+Enter during a job does **not** queue execution: review the prefilled line and
+press Enter at the prompt. Other navigation/control keys are not stored; Ctrl-C
+and Ctrl-Z retain their immediate job-control meanings. Typeahead is bounded to
+16 KiB and does not echo over job progress. Pager and external-editor keys retain
+their usual behavior rather than becoming typeahead.
