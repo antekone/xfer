@@ -306,7 +306,7 @@ impl Connection for S3Connection {
                     .iter()
                     .find(|object| object.key() == Some(key))
                 {
-                    output.emit(object_content(
+                    output.emit_file(object_content(
                         object,
                         key.rsplit('/').next().unwrap_or(key),
                     ))?;

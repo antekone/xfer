@@ -5,6 +5,7 @@ use std::{
     collections::HashMap,
     fs::{self, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::PathBuf,
     time::Duration,
 };
@@ -55,6 +56,9 @@ pub enum JobState {
 pub struct OutputStore {
     path: PathBuf,
     bytes: u64,
+    // Raw remote contents may contain secrets: keep them in a private directory,
+    // removed when the final job/operation reference is dropped.
+    _directory: Option<std::sync::Arc<tempfile::TempDir>>,
 }
 impl OutputStore {
     pub(crate) fn new(id: JobId) -> Self {
@@ -75,7 +79,28 @@ impl OutputStore {
             let _ = fs::create_dir_all(parent);
         }
         let _ = fs::remove_file(&path);
-        Self { path, bytes: 0 }
+        Self {
+            path,
+            bytes: 0,
+            _directory: None,
+        }
+    }
+    pub(crate) fn temporary() -> Result<Self> {
+        let directory = tempfile::Builder::new()
+            .prefix("xfer-cat-")
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()?;
+        let path = directory.path().join("contents");
+        OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)?;
+        Ok(Self {
+            path,
+            bytes: 0,
+            _directory: Some(std::sync::Arc::new(directory)),
+        })
     }
     fn append(&mut self, line: &str) {
         if let Ok(mut file) = OpenOptions::new()
@@ -158,6 +183,7 @@ pub struct Job {
     cancel: CancellationToken,
     pub progress: watch::Receiver<Progress>,
     pub output: OutputStore,
+    pub(crate) raw_output: bool,
     pub(crate) started: time::Instant,
     _handle: JoinHandle<()>,
 }
@@ -246,9 +272,36 @@ impl JobManager {
         F: FnOnce(OutputStore, watch::Sender<Progress>) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<String>> + Send + 'static,
     {
+        self.start_task_with_output(title, None, operation)
+    }
+
+    pub(crate) fn start_raw_task<F, Fut>(
+        &mut self,
+        title: String,
+        output: OutputStore,
+        operation: F,
+    ) -> JobId
+    where
+        F: FnOnce(OutputStore, watch::Sender<Progress>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<String>> + Send + 'static,
+    {
+        self.start_task_with_output(title, Some(output), operation)
+    }
+
+    fn start_task_with_output<F, Fut>(
+        &mut self,
+        title: String,
+        output: Option<OutputStore>,
+        operation: F,
+    ) -> JobId
+    where
+        F: FnOnce(OutputStore, watch::Sender<Progress>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<String>> + Send + 'static,
+    {
         let id = self.next_id;
         self.next_id += 1;
-        let output = OutputStore::new(id);
+        let raw_output = output.is_some();
+        let output = output.unwrap_or_else(|| OutputStore::new(id));
         let task_output = output.clone();
         let (progress_tx, progress) = watch::channel(Progress::Indeterminate {
             message: "working".into(),
@@ -266,10 +319,14 @@ impl JobManager {
             let _ = progress_tx.send(Progress::Indeterminate {
                 message: message.clone(),
             });
-            let _ = events.send(JobEvent {
-                id,
-                event: JobEventKind::Output(message),
-            });
+            // Empty successes have no footer (ls); raw jobs keep all diagnostics
+            // exclusively in status, never mixed into their file bytes.
+            if !message.is_empty() && !raw_output {
+                let _ = events.send(JobEvent {
+                    id,
+                    event: JobEventKind::Output(message),
+                });
+            }
             let _ = events.send(JobEvent {
                 id,
                 event: JobEventKind::Finished(state),
@@ -284,6 +341,7 @@ impl JobManager {
                 cancel,
                 progress,
                 output,
+                raw_output,
                 _handle: handle,
                 started: time::Instant::now(),
             },
@@ -352,6 +410,7 @@ impl JobManager {
                 cancel,
                 progress,
                 output: OutputStore::new(id),
+                raw_output: false,
                 _handle: handle,
                 started: time::Instant::now(),
             },
@@ -563,6 +622,7 @@ impl Daemon {
             SettingValue::Bool(false),
             "Allow get to overwrite existing local files (get -c resumes independently)",
         );
+        crate::commands::ls::register_settings(&mut settings);
         crate::cache::CacheOptions::register(&mut settings);
         let backends: Vec<Box<dyn Backend>> = vec![Box::new(Sftp), Box::new(S3), Box::new(Smb)];
         for backend in &backends {

@@ -169,7 +169,7 @@ fn plans(
     }
     Ok(plans)
 }
-async fn backoff(
+pub(crate) async fn backoff(
     error: anyhow::Error,
     label: &str,
     attempt: u64,

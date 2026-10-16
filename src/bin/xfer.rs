@@ -1,3 +1,7 @@
+#[path = "xfer/line_editor.rs"]
+mod line_editor;
+use line_editor::{CommandLine, Edit};
+
 use std::{
     fs, io,
     io::{BufRead, BufReader, Write},
@@ -59,13 +63,7 @@ fn daemon_ready(instance: &xfer::Instance) -> bool {
 }
 
 fn erase_previous_word(command: &mut String) {
-    let trimmed = command.trim_end();
-    let start = trimmed
-        .char_indices()
-        .rfind(|(_, ch)| ch.is_whitespace())
-        .map(|(index, ch)| index + ch.len_utf8())
-        .unwrap_or(0);
-    command.truncate(start);
+    command.truncate(line_editor::previous_word_start(command));
 }
 
 fn common_completion_prefix(choices: &[String]) -> &str {
@@ -90,11 +88,7 @@ fn common_completion_prefix(choices: &[String]) -> &str {
 fn path_completion_context(command: &str) -> Option<(String, String, String)> {
     let command = command.trim_start();
     let verb = command.split_whitespace().next()?;
-    let Completion::RemotePath {
-        request,
-        multiple_arguments,
-    } = commands::completion_for(verb)
-    else {
+    let Completion::RemotePath { request, .. } = commands::completion_for(verb) else {
         return None;
     };
     let argument = command.strip_prefix(verb)?.trim_start();
@@ -141,7 +135,7 @@ fn path_completion_context(command: &str) -> Option<(String, String, String)> {
     } else {
         tokens.pop().unwrap_or_default()
     };
-    if !multiple_arguments && !tokens.is_empty() {
+    if !commands::accepts_path_completion(verb, &tokens, &path) {
         return None;
     }
     let mut head = verb.to_owned();
@@ -156,10 +150,9 @@ fn complete_path_command(
     stream: &mut UnixStream,
     reader: &mut BufReader<UnixStream>,
     command: &mut String,
-    prompt: &str,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     let Some((head, path, method)) = path_completion_context(command) else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     stream.write_all(format!("{method} {}\n", serde_json::to_string(&path)?).as_bytes())?;
     let mut response = String::new();
@@ -212,12 +205,69 @@ fn complete_path_command(
             ));
         }
     }
-    if !notices.is_empty() {
-        print!("\r\n{}\r\n", notices.join("\r\n"));
+    Ok(notices)
+}
+
+/// Completion operates on the prefix at the caret; the editor keeps later
+/// arguments intact and replaces only the remainder of the active token.
+fn complete_command(
+    stream: &mut UnixStream,
+    reader: &mut BufReader<UnixStream>,
+    command: &mut String,
+) -> Result<Vec<String>> {
+    let verb = command.split_whitespace().next().unwrap_or("");
+    let completion = commands::completion_for(verb);
+    if matches!(completion, Completion::RemotePath { .. }) && command.contains(char::is_whitespace)
+    {
+        return complete_path_command(stream, reader, command);
     }
-    print!("\r\x1b[2K{prompt}{command}");
-    io::stdout().flush()?;
-    Ok(())
+    let matches = if !command.contains(char::is_whitespace) {
+        commands::visible_names()
+            .filter(|name| name.starts_with(command.as_str()))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    } else if completion == Completion::Settings {
+        stream.write_all(b"COMMAND show\n")?;
+        let mut choices = Vec::new();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line)? == 0 {
+                anyhow::bail!("daemon disconnected");
+            }
+            if line.trim() == "DONE" {
+                break;
+            }
+            if let Some(name) = line
+                .strip_prefix("OUTPUT ")
+                .and_then(|v| v.split_once(": ").map(|(name, _)| name))
+            {
+                choices.push(name.to_owned());
+            }
+        }
+        let prefix = command.trim_start().strip_prefix(verb).unwrap_or("").trim();
+        choices
+            .into_iter()
+            .filter(|name| name.starts_with(prefix))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    if !matches.is_empty() {
+        let common = common_completion_prefix(&matches);
+        if let Some((verb, prefix)) = command.trim_start().split_once(char::is_whitespace) {
+            if common.len() > prefix.trim().len() {
+                *command = format!("{verb} {common}");
+            }
+        } else if common.len() > command.len() {
+            *command = common.to_owned();
+        }
+    }
+    Ok(if matches.len() > 1 {
+        vec![matches.join("  ")]
+    } else {
+        Vec::new()
+    })
 }
 
 const MAX_TYPEAHEAD_BYTES: usize = 16 * 1024;
@@ -266,6 +316,15 @@ impl Typeahead {
     }
 }
 
+fn redraw_command(command: &mut CommandLine, prompt: &str, clear: bool) -> Result<()> {
+    let columns = crossterm::terminal::size()
+        .map(|(width, _)| width)
+        .unwrap_or(80);
+    print!("{}", command.frame(prompt, columns, clear));
+    io::stdout().flush()?;
+    Ok(())
+}
+
 fn read_attached_command(
     stream: &mut UnixStream,
     reader: &mut BufReader<UnixStream>,
@@ -275,18 +334,30 @@ fn read_attached_command(
 ) -> Result<Option<String>> {
     enable_raw_mode()?;
     let _raw_input = RawInputGuard;
-    let mut command = typeahead.take();
+    let mut command = CommandLine::new(typeahead.take());
     let mut history_cursor = None;
-    print!("{prompt}{command}");
-    io::stdout().flush()?;
+    redraw_command(&mut command, prompt, false)?;
     loop {
-        let Event::Key(key) = event::read()? else {
-            continue;
+        let key = match event::read()? {
+            Event::Key(key) if key.kind != KeyEventKind::Release => key,
+            Event::Paste(text) => {
+                history_cursor = None;
+                command.paste(&text);
+                redraw_command(&mut command, prompt, false)?;
+                continue;
+            }
+            Event::Resize(..) => {
+                redraw_command(&mut command, prompt, true)?;
+                continue;
+            }
+            _ => continue,
         };
+        let mut clear = false;
         match key.code {
             KeyCode::Enter => {
                 disable_raw_mode()?;
                 println!();
+                let command = command.into_string();
                 if !command.trim().is_empty() {
                     history.push(command.clone());
                 }
@@ -298,119 +369,48 @@ fn read_attached_command(
                         .map(|value: usize| value.saturating_sub(1))
                         .unwrap_or(last);
                     history_cursor = Some(index);
-                    command = history[index].clone();
-                    print!("\r\x1b[2K{prompt}{command}");
-                    io::stdout().flush()?;
+                    command.replace(history[index].clone());
                 }
             }
             KeyCode::Down => {
                 if let Some(index) = history_cursor {
                     if index + 1 < history.len() {
                         history_cursor = Some(index + 1);
-                        command = history[index + 1].clone();
+                        command.replace(history[index + 1].clone());
                     } else {
                         history_cursor = None;
                         command.clear();
                     }
-                    print!("\r\x1b[2K{prompt}{command}");
-                    io::stdout().flush()?;
                 }
             }
-            KeyCode::Char('d') if key.modifiers == KeyModifiers::CONTROL && command.is_empty() => {
+            KeyCode::Char('d')
+                if key.modifiers == KeyModifiers::CONTROL && command.as_str().is_empty() =>
+            {
                 disable_raw_mode()?;
                 println!();
                 return Ok(None);
             }
             KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => {
+                history_cursor = None;
                 command.clear();
-                print!("\r\x1b[2K{prompt}");
-                io::stdout().flush()?;
             }
-            KeyCode::Char('w') if key.modifiers == KeyModifiers::CONTROL => {
-                history_cursor = None;
-                erase_previous_word(&mut command);
-                print!("\r\x1b[2K{prompt}{command}");
-                io::stdout().flush()?;
-            }
-            KeyCode::Backspace => {
-                history_cursor = None;
-                if command.pop().is_some() {
-                    print!("\x08 \x08");
-                    io::stdout().flush()?;
-                }
-            }
+            KeyCode::Char('l') if key.modifiers == KeyModifiers::CONTROL => clear = true,
             KeyCode::Tab => {
-                let verb = command.split_whitespace().next().unwrap_or("");
-                let completion = commands::completion_for(verb);
-                if matches!(completion, Completion::RemotePath { .. })
-                    && command.contains(char::is_whitespace)
-                {
-                    history_cursor = None;
-                    complete_path_command(stream, reader, &mut command, prompt)?;
-                    continue;
-                }
-                let matches = if !command.contains(char::is_whitespace) {
-                    commands::visible_names()
-                        .filter(|name| name.starts_with(&command))
-                        .map(str::to_owned)
-                        .collect::<Vec<_>>()
-                } else if completion == Completion::Settings {
-                    stream.write_all(
-                        b"COMMAND show
-",
-                    )?;
-                    let mut choices = Vec::new();
-                    let mut line = String::new();
-                    loop {
-                        line.clear();
-                        reader.read_line(&mut line)?;
-                        if line.trim() == "DONE" {
-                            break;
-                        }
-                        if let Some(name) = line
-                            .strip_prefix("OUTPUT ")
-                            .and_then(|v| v.split_once(": ").map(|(name, _)| name))
-                        {
-                            choices.push(name.to_owned());
-                        }
-                    }
-                    let prefix = command.trim_start().strip_prefix(verb).unwrap_or("").trim();
-                    choices
-                        .into_iter()
-                        .filter(|name| name.starts_with(prefix))
-                        .collect::<Vec<_>>()
-                } else {
-                    Vec::new()
-                };
-                if !matches.is_empty() {
-                    let common = common_completion_prefix(&matches);
-                    if let Some((verb, prefix)) =
-                        command.trim_start().split_once(char::is_whitespace)
-                    {
-                        if common.len() > prefix.trim().len() {
-                            command = format!("{verb} {common}");
-                        }
-                    } else if common.len() > command.len() {
-                        command = common.to_owned();
-                    }
-                    history_cursor = None;
-                    if matches.len() > 1 {
-                        print!("\r\n{}\r\n", matches.join("  "));
-                    }
-                    print!("\r\x1b[2K{prompt}{command}");
-                }
-                io::stdout().flush()?;
-            }
-            KeyCode::Char(c)
-                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
-            {
+                let mut prefix = command.prefix().to_owned();
+                let notices = complete_command(stream, reader, &mut prefix)?;
+                command.complete(prefix);
                 history_cursor = None;
-                command.push(c);
-                print!("{c}");
-                io::stdout().flush()?;
+                if !notices.is_empty() {
+                    print!("\r\n{}\r\n", notices.join("\r\n"));
+                }
             }
-            _ => {}
+            _ => match command.key(key) {
+                Edit::Changed => history_cursor = None,
+                Edit::Moved => {}
+                Edit::Ignored => continue,
+            },
         }
+        redraw_command(&mut command, prompt, clear)?;
     }
 }
 
@@ -439,6 +439,58 @@ impl Drop for PagerTerminal {
     }
 }
 
+struct CopiedOutput {
+    bytes: u64,
+    rows: usize,
+    last: Option<u8>,
+}
+
+/// Binary-safe bounded IPC copy, shared by paged output and raw cat stdout.
+fn copy_job_output(
+    stream: &mut UnixStream,
+    reader: &mut BufReader<UnixStream>,
+    id: u64,
+    output: &mut dyn Write,
+) -> Result<CopiedOutput> {
+    let mut copied = CopiedOutput {
+        bytes: 0,
+        rows: 0,
+        last: None,
+    };
+    loop {
+        stream.write_all(format!("COMMAND read-output {id} {}\n", copied.bytes).as_bytes())?;
+        let mut response = String::new();
+        if reader.read_line(&mut response)? == 0 {
+            anyhow::bail!("daemon disconnected");
+        }
+        let chunk = response
+            .strip_prefix("OUTPUT CHUNK ")
+            .ok_or_else(|| anyhow::anyhow!("invalid output response"))?;
+        let (next, bytes) = chunk
+            .trim()
+            .split_once(' ')
+            .ok_or_else(|| anyhow::anyhow!("invalid output chunk"))?;
+        let next: u64 = next.parse()?;
+        let bytes: Vec<u8> = serde_json::from_str(bytes)?;
+        response.clear();
+        if reader.read_line(&mut response)? == 0 || response.trim() != "DONE" {
+            anyhow::bail!("incomplete output response");
+        }
+        if bytes.len() > 64 * 1024 || copied.bytes.checked_add(bytes.len() as u64) != Some(next) {
+            anyhow::bail!("invalid output offset or chunk size");
+        }
+        if bytes.is_empty() {
+            break;
+        }
+        output.write_all(&bytes)?;
+        copied.bytes = next;
+        copied.rows += bytes.iter().filter(|&&byte| byte == b'\n').count();
+        copied.last = bytes.last().copied();
+    }
+    output.flush()?;
+    Ok(copied)
+}
+
 fn display_job_output(
     stream: &mut UnixStream,
     reader: &mut BufReader<UnixStream>,
@@ -461,37 +513,7 @@ fn display_job_output(
         .mode(0o600)
         .open(&path)?;
     let _cleanup = LocalOutput(path);
-    let mut offset = 0;
-    let mut rows = 0usize;
-    loop {
-        stream.write_all(format!("COMMAND read-output {id} {offset}\n").as_bytes())?;
-        let mut response = String::new();
-        if reader.read_line(&mut response)? == 0 {
-            anyhow::bail!("daemon disconnected");
-        }
-        let chunk = response
-            .strip_prefix("OUTPUT CHUNK ")
-            .ok_or_else(|| anyhow::anyhow!("invalid output response"))?;
-        let (next, bytes) = chunk
-            .trim()
-            .split_once(' ')
-            .ok_or_else(|| anyhow::anyhow!("invalid output chunk"))?;
-        let next: u64 = next.parse()?;
-        let bytes: Vec<u8> = serde_json::from_str(bytes)?;
-        response.clear();
-        if reader.read_line(&mut response)? == 0 || response.trim() != "DONE" {
-            anyhow::bail!("incomplete output response");
-        }
-        if bytes.is_empty() {
-            break;
-        }
-        if next != offset + bytes.len() as u64 {
-            anyhow::bail!("invalid output offset");
-        }
-        rows += bytes.iter().filter(|&&byte| byte == b'\n').count();
-        file.write_all(&bytes)?;
-        offset = next;
-    }
+    let copied = copy_job_output(stream, reader, id, &mut file)?;
     stream.write_all(b"COMMAND show ui:auto-pager\n")?;
     let mut response = String::new();
     reader.read_line(&mut response)?;
@@ -500,13 +522,13 @@ fn display_job_output(
     reader.read_line(&mut response)?;
     file.seek(SeekFrom::Start(0))?;
     let (_, height) = crossterm::terminal::size().unwrap_or((80, 24));
-    if !auto_pager || rows < height.saturating_sub(1) as usize {
+    if !auto_pager || copied.rows < height.saturating_sub(1) as usize {
         std::io::copy(&mut file, &mut io::stdout())?;
         io::stdout().flush()?;
-        return Ok(offset > 0);
+        return Ok(copied.bytes > 0);
     }
     page_output_file(&mut file)?;
-    Ok(offset > 0)
+    Ok(copied.bytes > 0)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -988,6 +1010,12 @@ fn foreground_job(
             anyhow::bail!("daemon disconnected");
         }
         let state = status.split_whitespace().nth(1);
+        let raw_output = status.split_whitespace().nth(2) == Some("RAW");
+        let human_status = if raw_output {
+            status.replacen(" RAW", "", 1)
+        } else {
+            status.clone()
+        };
         if matches!(state, Some("Completed" | "Cancelled" | "Failed")) || status == "no such job" {
             print!("\r\x1b[2K");
             io::stdout().flush()?;
@@ -996,7 +1024,18 @@ fn foreground_job(
                 println!("{status}");
             } else {
                 // Show the result once, not both as terminal status and spool text.
-                if !display_job_output(stream, reader, id)? {
+                if raw_output {
+                    let copied = copy_job_output(stream, reader, id, &mut io::stdout())?;
+                    // This is a terminal prompt separator, not part of the file:
+                    // avoid erasing an unterminated last line on prompt redraw.
+                    use std::io::IsTerminal;
+                    if io::stdout().is_terminal() && copied.last.is_some_and(|byte| byte != b'\n') {
+                        println!();
+                    }
+                    if state != Some("Completed") {
+                        eprintln!("{human_status}");
+                    }
+                } else if !display_job_output(stream, reader, id)? && state != Some("Completed") {
                     println!("{status}");
                 }
                 stream.write_all(format!("COMMAND ack-output {id}\n").as_bytes())?;
@@ -1036,7 +1075,7 @@ fn foreground_job(
                 format!("\r\x1b[2K{line}")
             }
         } else {
-            display.update(&status, width)
+            display.update(&human_status, width)
         };
         if !redraw.is_empty() {
             print!("{redraw}");
@@ -1853,7 +1892,7 @@ mod startup_tests {
         let candidates = candidates.iter().map(|value| value.to_string()).collect();
         let expected = if command.starts_with("ls ") {
             "COMPLETE_LS "
-        } else if command.starts_with("get ") {
+        } else if command.starts_with("get ") || command.starts_with("cat ") {
             "COMPLETE_GET "
         } else {
             "COMPLETE_CD "
@@ -1877,7 +1916,7 @@ mod startup_tests {
         });
         let mut reader = BufReader::new(client.try_clone().unwrap());
         let mut command = command.to_owned();
-        complete_path_command(&mut client, &mut reader, &mut command, "xfer> ").unwrap();
+        complete_path_command(&mut client, &mut reader, &mut command).unwrap();
         worker.join().unwrap();
         command
     }
@@ -1907,6 +1946,77 @@ mod startup_tests {
             vec!["get", "-c", "first.txt", "photo album.jpg"]
         );
     }
+    #[test]
+    fn cat_completion_handles_multiple_quoted_paths_and_literal_dash_names() {
+        assert_eq!(
+            path_completion_context("cat first.txt pho").unwrap(),
+            ("cat first.txt".into(), "pho".into(), "COMPLETE_GET".into())
+        );
+        let completed = complete_with_candidates("cat 'first file' -- -fi", &["-file name"], false);
+        assert_eq!(
+            shlex::split(&completed).unwrap(),
+            vec!["cat", "first file", "--", "-file name"]
+        );
+    }
+
+    #[test]
+    fn raw_output_copy_preserves_binary_bytes_across_chunks_without_pager_or_footer() {
+        let chunks = vec![
+            vec![0, 255, 10, 13],
+            (0..65536).map(|n| (n % 251) as u8).collect::<Vec<_>>(),
+            b"no newline".to_vec(),
+        ];
+        let expected = chunks.concat();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            let mut reader = BufReader::new(server);
+            let mut offset = 0;
+            for bytes in chunks.into_iter().chain(std::iter::once(Vec::new())) {
+                let mut request = String::new();
+                reader.read_line(&mut request).unwrap();
+                assert_eq!(request, format!("COMMAND read-output 42 {offset}\n"));
+                offset += bytes.len();
+                writeln!(
+                    reader.get_mut(),
+                    "OUTPUT CHUNK {offset} {}\nDONE",
+                    serde_json::to_string(&bytes).unwrap()
+                )
+                .unwrap();
+            }
+        });
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let mut output = Vec::new();
+        let copied = copy_job_output(&mut client, &mut reader, 42, &mut output).unwrap();
+        assert_eq!(output, expected);
+        assert_eq!(copied.bytes as usize, expected.len());
+        assert_eq!(copied.last, Some(b'e'));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn raw_copy_rejects_inconsistent_offsets_even_at_eof() {
+        for bytes in [vec![], vec![1, 2], vec![0; 65537]] {
+            let (mut client, mut server) = UnixStream::pair().unwrap();
+            let worker = std::thread::spawn(move || {
+                let mut request = String::new();
+                BufReader::new(server.try_clone().unwrap())
+                    .read_line(&mut request)
+                    .unwrap();
+                writeln!(
+                    server,
+                    "OUTPUT CHUNK 1 {}\nDONE",
+                    serde_json::to_string(&bytes).unwrap()
+                )
+                .unwrap();
+            });
+            let mut reader = BufReader::new(client.try_clone().unwrap());
+            let mut output = Vec::new();
+            assert!(copy_job_output(&mut client, &mut reader, 1, &mut output).is_err());
+            assert!(output.is_empty());
+            worker.join().unwrap();
+        }
+    }
+
     #[test]
     fn transfer_bar_includes_throughput_elapsed_and_eta_without_wrapping() {
         let stats = xfer::transfer::TransferProgress {
@@ -1953,6 +2063,32 @@ mod startup_tests {
             shlex::split(&command).unwrap(),
             vec!["ls", "folder/my file.txt"]
         );
+    }
+
+    #[test]
+    fn ls_completion_preserves_flags_and_the_end_of_options_marker() {
+        for prefix in [
+            "ls -laF",
+            "ls -l -a -S -r",
+            "ls --no-long --no-classify",
+            "ls --",
+        ] {
+            let command = format!("{prefix} pho");
+            assert_eq!(
+                path_completion_context(&command).unwrap(),
+                (prefix.into(), "pho".into(), "COMPLETE_LS".into())
+            );
+            let completed = complete_with_candidates(&command, &["photo album/"], false);
+            let mut expected = shlex::split(prefix).unwrap();
+            expected.push("photo album/".into());
+            assert_eq!(shlex::split(&completed).unwrap(), expected);
+        }
+        assert_eq!(path_completion_context("ls -l ").unwrap().1, "");
+        assert!(path_completion_context("ls -z pho").is_none());
+        assert!(path_completion_context("ls -l").is_none());
+        assert_eq!(path_completion_context("ls -- -l").unwrap().1, "-l");
+        assert!(path_completion_context("ls first second").is_none());
+        assert!(path_completion_context("ls -- first second").is_none());
     }
 
     #[test]
@@ -2014,9 +2150,50 @@ mod startup_tests {
         });
         let mut reader = BufReader::new(client.try_clone().unwrap());
         let mut command = "cd pho".to_owned();
-        complete_path_command(&mut client, &mut reader, &mut command, "xfer> ").unwrap();
+        complete_path_command(&mut client, &mut reader, &mut command).unwrap();
         assert_eq!(shlex::split(&command).unwrap(), vec!["cd", "photo album/"]);
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn completion_at_the_caret_preserves_later_arguments_and_uses_the_renamed_setting() {
+        for (text, before, expected_request, response, expected) in [
+            (
+                "get -c 'photo album' second.txt",
+                "get -c 'pho",
+                "COMPLETE_GET \"pho\"\n",
+                "COMPLETION {\"candidates\":[\"photo album/\"],\"truncated\":false}\n",
+                "get -c 'photo album/' second.txt",
+            ),
+            (
+                "set ui:ls-default-opt '-lF'",
+                "set ui:ls-default-opt",
+                "COMMAND show\n",
+                "OUTPUT ui:ls-default-options: -lF — options\nDONE\n",
+                "set ui:ls-default-options '-lF'",
+            ),
+        ] {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let worker = std::thread::spawn(move || {
+                let mut reader = BufReader::new(server);
+                let mut request = String::new();
+                reader.read_line(&mut request).unwrap();
+                assert_eq!(request, expected_request);
+                reader.get_mut().write_all(response.as_bytes()).unwrap();
+            });
+            let mut reader = BufReader::new(client.try_clone().unwrap());
+            let mut command = CommandLine::new(text.into());
+            command.key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+            for _ in before.chars() {
+                command.key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+            }
+            assert_eq!(command.prefix(), before);
+            let mut prefix = command.prefix().to_owned();
+            complete_command(&mut client, &mut reader, &mut prefix).unwrap();
+            command.complete(prefix);
+            assert_eq!(command.as_str(), expected);
+            worker.join().unwrap();
+        }
     }
 
     #[test]

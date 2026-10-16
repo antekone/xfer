@@ -25,7 +25,11 @@ pub trait Connection: Send + Sync {
         bail!("listing is not implemented for {}", self.protocol())
     }
     async fn stat_file(&self, _path: &str) -> Result<crate::transfer::RemoteFile> {
-        Err(NonRetryableError(format!("get is not implemented for {}", self.protocol())).into())
+        Err(NonRetryableError(format!(
+            "file reads are not implemented for {}",
+            self.protocol()
+        ))
+        .into())
     }
     async fn download(
         &self,
@@ -34,7 +38,11 @@ pub trait Connection: Send + Sync {
         _expected: &crate::transfer::RemoteFile,
         _sink: &mut dyn crate::transfer::DownloadSink,
     ) -> Result<()> {
-        Err(NonRetryableError(format!("get is not implemented for {}", self.protocol())).into())
+        Err(NonRetryableError(format!(
+            "file reads are not implemented for {}",
+            self.protocol()
+        ))
+        .into())
     }
     /// Canonicalize a directory against this connection's current location.
     /// None selects the connection's initial directory (shell-style `cd`).

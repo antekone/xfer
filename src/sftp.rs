@@ -569,7 +569,7 @@ fn record(name: String, metadata: &MetaData, directory: bool) -> Content {
 }
 fn remote_file(metadata: &MetaData) -> Result<RemoteFile> {
     if !metadata.file_type().is_some_and(|kind| kind.is_file()) {
-        return Err(permanent("get expects a regular remote file"));
+        return Err(permanent("expected a regular remote file"));
     }
     Ok(RemoteFile {
         size: metadata
@@ -714,7 +714,7 @@ async fn list_on(sftp: &Client, path: &str, output: &mut dyn ListingSink) -> Res
             return Err(permanent("not a remote directory"));
         }
         let name = path.rsplit('/').next().unwrap_or(path).to_owned();
-        output.emit(record(name, &metadata, false))?;
+        output.emit_file(record(name, &metadata, false))?;
         return Ok(1);
     }
     let dir = operation(sftp.fs().open_dir(&path)).await?;

@@ -31,7 +31,7 @@ libc = "0.2"
 openssh-sftp-client = "0.15.10"
 futures-util = "0.3"
 percent-encoding = "2"
-tempfile = "3"
+tempfile = "3.10"
 zeroize = "1"
 
 [dev-dependencies]

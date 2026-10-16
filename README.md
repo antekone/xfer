@@ -91,7 +91,7 @@ the server's initial directory (usually the login home). SFTP does not expose
 `cd` without an argument returns to the initial directory selected by the URL.
 Listings, file/directory completion, symlinked directories and `get [-c]` work
 through the same daemon jobs, cache and transfer UI as S3. Remote names must be UTF-8.
-SFTP listings include symbolic permissions (including file type and special bits),
+SFTP `ls -l` output includes symbolic permissions (file type and special bits),
 numeric server UID/GID, UTC modification time, and exact byte size, for example:
 
 ```text
@@ -288,15 +288,66 @@ starts. Downloads retry from the last locally written byte and retain their
 initial remote revision; future upload/write operations will need their own
 idempotency/resume handling rather than blindly replaying writes.
 
+### `ls` output and sorting
+
+```text
+ls [-FlarS] [--] [path]
+```
+
+The string setting `ui:ls-default-options` supplies base flags, defaulting to `-lF`
+(long output with directory suffixes). Command-line flags are applied afterward,
+overriding individual defaults; options not mentioned on the command line remain
+in effect. Changes apply to new listings without reconnecting and do not alter
+already-running jobs or retries.
+
+```text
+set ui:ls-default-options '-lF'
+ls -S                         # long/classified output, sorted by size
+ls --no-long --no-classify     # bare names for this command only
+set ui:ls-default-options ''     # bare names by default
+```
+
+In `xfer.conf`, use `ui:ls-default-options: -lF` (or an empty value to disable base
+flags). Quote interactive values containing separate flags, e.g.
+`set ui:ls-default-options '-lF -a'`. Defaults must contain options only, not a path.
+
+Without `-l`/`-F`, `ls` prints one bare name per line. Listings have no summary
+footer. Dotfiles and dot-directories are hidden unless `-a` is enabled.
+Unless changed by sorting flags, directories (including directory symlinks) and
+buckets come first, then files, with names sorted lexically A–Z within each group.
+
+- `-F`: append `/` to directory and bucket names (no other type suffixes).
+- `-l`: long output with dates, exact byte sizes, and available Unix metadata.
+  Directory suffixes still require `-F`.
+- `-a`: include hidden dotfiles/directories. `.` and `..` are not synthesized.
+  Explicitly named hidden files are shown even without `-a`.
+- `-S`: sort all items by size, largest first, then by name for ties. Unknown
+  sizes (e.g. virtual S3 directories/buckets) come last, ordered by name.
+- `-r`: reverse the entire selected order, including directory/file groups or
+  unknown-size placement.
+
+Use `--no-long`, `--no-classify`, `--no-all`, `--no-size`, or `--no-reverse` to
+clear the corresponding inherited flag. Later flags win, so `--no-long -l` enables
+long output again. `--no-size` restores name sorting.
+
+Flags can be combined (`ls -laFSr`) or separate (`ls -l -a`). Use `--` before a
+path beginning with `-`, e.g. `ls -l -- -filename`. Display filtering does not
+remove hidden entries or metadata from the shared completion cache. Each retry
+restarts the listing with the same options and resolved remote path.
+
 ### Listing records and display
 
 Backends emit typed `Content` records (`Bucket`, `Directory`, `File`, `Comment`)
 through a `ListingSink`, one entry at a time. `src/listing.rs` defines these types
-and the common renderer; backends do not format terminal output. The daemon's
-spool adapter invokes that renderer. This keeps paginated listings bounded and
-allows future completion/picker sinks to consume metadata without parsing text.
+and the common renderer; backends do not format terminal output. `ls` collects
+small sorted runs (at most 2048 records/about 1 MiB) and merges them using a private
+temporary directory, then renders the chosen view to the output spool. Small
+listings stay in memory; large/paginated listings do not require retaining all
+records or opening all runs at once. Temporary runs are removed after success,
+error, or cancellation. Completion/picker sinks can consume the same metadata
+without parsing text.
 
-Example output (fixed-width date and size columns):
+Example `ls -lF` output (fixed-width date and size columns):
 
 ```text
 [2025-04-16 10:11:00 UTC]          -  ci-production/
@@ -324,7 +375,7 @@ open minio
 cd archive
 cd photos
 pwd                 # /archive/photos/
-ls                  # names relative to photos/: a.jpg, sub/, ...
+ls -F               # names relative to photos/: sub/, a.jpg, ...
 ls ../documents     # does not change pwd
 cd ..
 cd /other-bucket
@@ -372,12 +423,23 @@ Set `cache:ttl` or `cache:max-bytes` to `0` to disable retention. The cache uses
 LRU eviction, at most 32 directories, 2048 entries/1 MiB per directory, and the
 configured total estimated-memory budget. Large completion listings are explicitly
 marked as limited; TAB displays at most 20 choices at once. Manual `ls` remains
-unlimited and streams every result to disk even if the cached snapshot is partial.
+unlimited and sorts/spools its results independently, even if the cached snapshot
+is partial.
 Failed refreshes invalidate their old snapshot rather than caching partial errors.
 
-Prompt editing supports Ctrl-W (erase trailing whitespace and the preceding
-whitespace-delimited word). TAB extends to the longest shared prefix of all
-matches, for commands, setting names, and `cd` paths. For example, `cd bui<TAB>`
+Prompt editing supports Left/Right to move the caret, insertion at the caret, and
+Backspace to erase the preceding character. Home/Ctrl-A go to the beginning;
+End/Ctrl-E go to the end. Ctrl-L clears the screen and redraws the prompt and
+command without changing the text or caret. Delete/Ctrl-D erase the character
+under the caret; Ctrl-D on an empty line detaches. Ctrl-W erases whitespace and
+the preceding word before the caret, preserving later text. Up/Down recall history
+with the caret at the end. Long lines scroll horizontally; wide Unicode characters
+are accounted for when positioning the caret, and long prompts are shortened to
+leave editing room.
+
+TAB completes the token at the caret, preserving later arguments (including when
+completing inside a quoted path). It extends to the longest shared prefix of all
+matches, for commands, setting names, and remote paths. For example, `cd bui<TAB>`
 with `builddylib-ci/` and `builddylib-remote-ci/` becomes `cd builddylib-`.
 Common prefixes are computed before shell quoting, on Unicode character
 boundaries. A partial/limited cached listing does not auto-extend the prefix,
@@ -408,12 +470,13 @@ waiting for a background operation to release the backend connection lock.
 `ls <TAB>` uses the same typed cache as `cd`, but includes files as well as
 buckets, directories, and `../`. Directories/buckets get a trailing `/`; files
 do not. Common-prefix completion, nested/absolute paths, quoting, and cache
-expiry/refetch work for both commands. `cd` continues to exclude files.
+expiry/refetch work for both commands. Completion preserves `ls` flags and `--`,
+e.g. `ls -laF photos/im<TAB>`. `cd` continues to exclude files.
 
 ```text
 ls READ<TAB>           # README.txt
 ls photos/im<TAB>      # photos/image.jpg
-ls README.txt          # show metadata for this exact file
+ls -l README.txt       # show metadata for this exact file
 ls photos/            # list directory contents, without changing cwd
 ```
 
@@ -437,6 +500,35 @@ and Ctrl-Z retain their immediate job-control meanings. Typeahead is bounded to
 their usual behavior rather than becoming typeahead.
 
 
+## Remote file contents
+
+`cat [--] <files...>` prints remote file contents to stdout using the active
+S3/SFTP connection:
+
+```text
+cat README.txt
+cat 'first file.txt' /absolute/path/second.txt
+cat -- -filename
+```
+
+Relative paths use remote `pwd`, not Local CWD. Files are concatenated in argument
+order, without headings, separators, success footers, UTF-8 conversion, or the
+pager. No options other than `--` are accepted; this does not read local files or
+stdin (`!cat ...` runs local Bash instead). TAB completes each remote filename.
+
+Contents are first spooled to a private temporary file (0700 directory, 0600 file),
+then copied to stdout in bounded chunks when the job finishes. Network failures
+use the existing backoff/reconnect policy and resume from the last written byte,
+with the backend's size/revision checks. Errors stop the command; bytes from prior
+files or a partial read may still be printed, but diagnostics go to stderr and
+never become part of the file bytes. Ctrl-C cancels fetching; Ctrl-Z backgrounds
+it, and `fg` retains raw-output behavior. Temporary contents are removed when the
+job output is acknowledged, or on daemon exit.
+
+Contents are emitted verbatim, including terminal control sequences: only display
+trusted files. Ordinary terminal newline processing still applies. If the final
+byte is not a newline, the interactive UI puts its next prompt on a separate line.
+
 ## Downloads
 
 ```text
@@ -447,12 +539,29 @@ set xfer:clobber true
 get README.txt
 ```
 
-`get [-c] [--] <filenames...>` downloads sequentially to the **attached client's
-current local directory**, preserving each basename (`photos/image.jpg` becomes
+`get [-c] [--] <filenames...>` downloads sequentially to the **daemon's local
+working directory**, preserving each basename (`photos/image.jpg` becomes
 `./image.jpg`). Relative sources resolve against backend `pwd`; absolute sources
-such as `/bucket/path/file` also work. The client sends its local directory after
-each attach, and every job snapshots it, so background jobs keep their original
-destination even when a new client attaches elsewhere. `status` shows Local CWD.
+such as `/bucket/path/file` also work. The client initializes the daemon's local
+directory from its own CWD on each attach. `status` shows Local CWD.
+
+`lcd [directory]` changes this local directory for subsequent downloads. Relative
+paths resolve against the previous Local CWD; absolute paths, `..`, quoted names
+with spaces, and `~`/`~/...` are supported. With no argument, `lcd` selects the
+daemon's `$HOME`. The directory must already exist; errors leave Local CWD
+unchanged. This does not change the remote CWD, attached client's directory (used
+by `!` commands), or process-wide CWD used for configuration paths.
+
+```text
+lcd ~/Downloads
+lcd 'photo album'
+lcd ..
+lcd                 # local home directory
+```
+
+Every download job snapshots its destination, so `lcd` or attaching another client
+elsewhere does not redirect an existing background job. A later attach initializes
+Local CWD again from that client's directory.
 
 `xfer:clobber` defaults to `false`. Existing local files cause an error suggesting
 `set xfer:clobber true`; enabling it allows replacement. `get -c` instead resumes
@@ -492,10 +601,11 @@ old file; partial downloads are not atomically renamed into place.
 table. Both the attached client's dispatcher and the daemon walk this table to
 match parsed input. Help, aliases, command-name completion, argument-completion
 policy, and history policy come from the same entries rather than separate lists.
+Help and command-name completion sort names alphabetically, including aliases.
 
-Small commands (`help`, `pwd`, `show`, `set`, jobs, and client session controls) are
+Small commands (`help`, `lcd`, `pwd`, `show`, `set`, jobs, and client session controls) are
 grouped in `commands.rs` using `SmallCommand`, which implements `Command`. Larger
-handlers live in dedicated modules under `src/commands/`: `connect.rs`, `get.rs`,
+handlers live in dedicated modules under `src/commands/`: `connect.rs`, `cat.rs`, `get.rs`,
 `ls.rs`, `cd.rs`, `bookmark.rs`, `status.rs`, `output.rs`, and `shell.rs`.
 
 Each implementation provides `names()` (canonical name and aliases) and

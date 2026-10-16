@@ -235,7 +235,7 @@ fn interactive_password_sftp_navigation_listing_completion_and_resumed_download(
     daemon.connect("test-secret", true);
     let home = format!("{}/", daemon.remote().display());
     assert!(daemon.command("status").contains(&format!("CWD: {home}")));
-    let response = daemon.command("ls");
+    let response = daemon.command("ls -lF");
     let listing = daemon.finish(response, true).join("\n");
     assert!(listing.contains("hello world.txt"));
     assert!(listing.contains("photos/"));
@@ -458,6 +458,229 @@ fn password_is_reused_for_transport_recovery_even_without_an_attached_client() {
             "askpass helper leaked"
         );
     }
+    let response = daemon.command("close");
+    daemon.finish(response, true);
+}
+
+#[test]
+fn lcd_uses_daemon_home_and_changes_future_download_destinations_only() {
+    let Some(mut daemon) = Daemon::start() else {
+        return;
+    };
+    let home = daemon.root.path().join("home");
+    let downloads = home.join("photo album");
+    fs::create_dir_all(&downloads).unwrap();
+    daemon.connect("test-secret", true);
+    let response = daemon.command("cd photos");
+    daemon.finish(response, true);
+    assert_eq!(
+        daemon.command("lcd"),
+        vec![format!("Local CWD: {}", home.display())]
+    );
+    assert_eq!(
+        daemon.command("lcd '~//photo album'"),
+        vec![format!("Local CWD: {}", downloads.display())]
+    );
+    let response = daemon.command("get image.txt");
+    // A new lcd must not redirect a download already submitted by the client.
+    assert_eq!(
+        daemon.command("lcd .."),
+        vec![format!("Local CWD: {}", home.display())]
+    );
+    daemon.finish(response, true);
+    assert_eq!(fs::read(downloads.join("image.txt")).unwrap(), b"image");
+    assert!(!home.join("image.txt").exists());
+    let status = daemon.command("status");
+    assert!(status.contains(&format!("Local CWD: {}", home.display())));
+    assert!(status.contains(&format!("CWD: {}/photos/", daemon.remote().display())));
+    let response = daemon.command("close");
+    daemon.finish(response, true);
+}
+
+#[test]
+fn ls_flags_control_names_classification_metadata_visibility_and_sorting() {
+    fn ls(daemon: &mut Daemon, command: &str) -> Vec<String> {
+        let response = daemon.command(command);
+        let output = daemon.finish(response, true);
+        assert!(output[0].starts_with("OFFSET "));
+        output.into_iter().skip(1).collect()
+    }
+    let Some(mut daemon) = Daemon::start() else {
+        return;
+    };
+    fs::write(daemon.remote().join(".secret"), b"secret").unwrap();
+    fs::create_dir(daemon.remote().join(".private")).unwrap();
+    fs::create_dir(daemon.remote().join("adir")).unwrap();
+    daemon.connect("test-secret", true);
+    let names = vec![
+        "adir",
+        "linked photos",
+        "photos",
+        "hello world.txt",
+        "large.bin",
+    ];
+    assert!(
+        daemon.command("show ui:ls-default-options")[0].starts_with("ui:ls-default-options: -lF")
+    );
+    let defaults = ls(&mut daemon, "ls");
+    assert!(defaults[0].starts_with('d') && defaults[0].ends_with("  adir/"));
+    assert_eq!(
+        ls(&mut daemon, "ls -r"),
+        defaults.iter().rev().cloned().collect::<Vec<_>>()
+    );
+    assert_eq!(ls(&mut daemon, "ls --no-long --no-classify"), names);
+    assert!(ls(&mut daemon, "ls --no-classify")[0].ends_with("  adir"));
+    daemon.command("set ui:ls-default-options ''");
+    assert_eq!(ls(&mut daemon, "ls"), names);
+    assert_eq!(
+        ls(&mut daemon, "ls -F"),
+        vec![
+            "adir/",
+            "linked photos/",
+            "photos/",
+            "hello world.txt",
+            "large.bin"
+        ]
+    );
+    assert_eq!(
+        ls(&mut daemon, "ls -r"),
+        names.iter().rev().copied().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        ls(&mut daemon, "ls -a"),
+        vec![
+            ".private",
+            "adir",
+            "linked photos",
+            "photos",
+            ".secret",
+            "hello world.txt",
+            "large.bin"
+        ]
+    );
+    let mut by_size = names.clone();
+    by_size.sort_by(|a, b| {
+        fs::symlink_metadata(daemon.remote().join(b))
+            .unwrap()
+            .len()
+            .cmp(&fs::symlink_metadata(daemon.remote().join(a)).unwrap().len())
+            .then_with(|| a.cmp(b))
+    });
+    assert_eq!(ls(&mut daemon, "ls -S"), by_size);
+    assert_eq!(
+        ls(&mut daemon, "ls -Sr"),
+        by_size.into_iter().rev().collect::<Vec<_>>()
+    );
+    let long = ls(&mut daemon, "ls -l");
+    assert!(long[0].starts_with('d') && long[0].ends_with("  adir"));
+    assert!(long[1].starts_with('l') && long[1].ends_with("  linked photos"));
+    assert!(long[3].starts_with("-rw-r-----") && long[3].ends_with("18  hello world.txt"));
+    let all = ls(&mut daemon, "ls -laF");
+    assert!(all[0].ends_with("  .private/"));
+    assert!(all.iter().any(|line| line.ends_with("  .secret")));
+    assert_eq!(ls(&mut daemon, "ls .secret"), vec![".secret"]);
+    assert_eq!(ls(&mut daemon, "ls adir/"), Vec::<String>::new());
+    // Hidden records remain in the shared typed cache despite display filtering.
+    ls(&mut daemon, "ls");
+    daemon.stream.write_all(b"COMPLETE_LS \".s\"\n").unwrap();
+    let line = daemon.line();
+    let completion: xfer::cache::PathCompletion =
+        serde_json::from_str(line.strip_prefix("COMPLETION ").unwrap()).unwrap();
+    assert_eq!(completion.candidates, vec![".secret"]);
+    daemon.command("set ui:ls-default-options '-laFSr'");
+    assert_eq!(
+        ls(
+            &mut daemon,
+            "ls --no-long --no-classify --no-all --no-size --no-reverse"
+        ),
+        names
+    );
+    daemon.command("set ui:ls-default-options ''");
+    fs::write(daemon.remote().join("-literal"), b"dash").unwrap();
+    assert_eq!(ls(&mut daemon, "ls -F -- -literal"), vec!["-literal"]);
+    assert!(daemon.command("ls -z")[0].starts_with("unknown ls option -z"));
+    let response = daemon.command("close");
+    daemon.finish(response, true);
+}
+
+#[test]
+fn cat_reads_remote_files_as_exact_bytes_and_recovers_a_dead_transport() {
+    fn cat(daemon: &mut Daemon, command: &str, success: bool) -> Vec<u8> {
+        let response = daemon.command(command);
+        let id = response[0]
+            .strip_prefix("JOB ")
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let status = daemon.command(&format!("status {id}"));
+            assert!(status[0].split_whitespace().nth(2) == Some("RAW"));
+            if status[0].contains("Completed") || status[0].contains("Failed") {
+                assert_eq!(status[0].contains("Completed"), success, "{status:?}");
+                break;
+            }
+            assert!(Instant::now() < deadline, "cat did not finish: {status:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut data = Vec::new();
+        loop {
+            let response = daemon.command(&format!("read-output {id} {}", data.len()));
+            let (next, bytes) = response[0]
+                .strip_prefix("CHUNK ")
+                .unwrap()
+                .split_once(' ')
+                .unwrap();
+            let bytes: Vec<u8> = serde_json::from_str(bytes).unwrap();
+            assert!(bytes.len() <= 64 * 1024);
+            assert_eq!(next.parse::<usize>().unwrap(), data.len() + bytes.len());
+            if bytes.is_empty() {
+                break;
+            }
+            data.extend(bytes);
+        }
+        assert_eq!(
+            daemon.command(&format!("ack-output {id}")),
+            vec!["output acknowledged"]
+        );
+        data
+    }
+    let Some(mut daemon) = Daemon::start() else {
+        return;
+    };
+    daemon.connect("test-secret", true);
+    let data = (0..200_000).map(|n| (n % 256) as u8).collect::<Vec<_>>();
+    fs::write(daemon.remote().join("binary.bin"), &data).unwrap();
+    fs::write(daemon.remote().join("empty"), b"").unwrap();
+    fs::write(daemon.remote().join("photos/-literal"), b"dash").unwrap();
+    assert_eq!(
+        cat(
+            &mut daemon,
+            "cat 'hello world.txt' empty photos/image.txt",
+            true
+        ),
+        b"hello remote worldimage"
+    );
+    assert_eq!(cat(&mut daemon, "cat empty", true), b"");
+    let response = daemon.command("cd photos");
+    daemon.finish(response, true);
+    assert_eq!(
+        cat(&mut daemon, "cat image.txt '../hello world.txt'", true),
+        b"imagehello remote world"
+    );
+    let pids = fs::read_to_string(daemon.root.path().join("ssh-pids")).unwrap();
+    let pid = pids.lines().last().unwrap().parse::<i32>().unwrap();
+    // SAFETY: terminate only the private SSH/SFTP transport created by this fixture.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+    assert_eq!(cat(&mut daemon, "cat ../binary.bin", true), data);
+    assert_eq!(cat(&mut daemon, "cat -- -literal", true), b"dash");
+    assert_eq!(cat(&mut daemon, "cat image.txt missing", false), b"image");
+    assert_eq!(cat(&mut daemon, "cat .", false), b"");
+    assert!(daemon.command("cat")[0].starts_with("usage: cat"));
+    assert!(daemon.command("cat -n file")[0].starts_with("unknown cat option"));
+    assert!(daemon
+        .command("status")
+        .contains(&format!("CWD: {}/photos/", daemon.remote().display())));
     let response = daemon.command("close");
     daemon.finish(response, true);
 }

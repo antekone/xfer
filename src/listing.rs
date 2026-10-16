@@ -1,4 +1,4 @@
-//! Backend-independent listing records and their single default text renderer.
+//! Backend-independent listing records and text rendering.
 //!
 //! Backends emit records incrementally, keeping large/paginated listings bounded.
 //! A sink can render them, collect a page, or feed a future completion/picker UI.
@@ -58,22 +58,51 @@ pub struct CommentInfo {
 
 pub trait ListingSink: Send {
     fn emit(&mut self, content: Content) -> Result<()>;
+    /// An explicitly named file, not a child of a directory listing. Display
+    /// filters should not hide a dotfile the user requested directly.
+    fn emit_file(&mut self, content: Content) -> Result<()> {
+        self.emit(content)
+    }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DisplayOptions {
+    pub long: bool,
+    pub classify: bool,
+}
+
+/// Legacy long, classified rendering for generic record sinks.
 pub fn render(content: &Content) -> String {
+    render_with_options(
+        content,
+        DisplayOptions {
+            long: true,
+            classify: true,
+        },
+    )
+}
+
+pub fn render_with_options(content: &Content, options: DisplayOptions) -> String {
     let (name, date, size, directory, unix) = match content {
         Content::Directory(info) => (&info.name, info.modified, info.size, true, info.unix),
         Content::File(info) => (&info.name, info.modified, info.size, false, info.unix),
         Content::Bucket(info) => (&info.name, info.created, None, true, None),
         Content::Comment(info) => return format!("# {}", printable(&info.text)),
     };
+    let mut name = printable(if directory {
+        name.trim_end_matches('/')
+    } else {
+        name
+    });
+    if directory && options.classify {
+        name.push('/');
+    }
+    if !options.long {
+        return name;
+    }
     let date = date
         .map(|date| date.format("%Y-%m-%d %H:%M:%S UTC").to_string())
         .unwrap_or_else(|| format!("{:>23}", "-"));
-    let mut name = printable(name);
-    if directory && !name.ends_with('/') {
-        name.push('/');
-    }
     let basic = format!("[{date}] {:>10}  {name}", format_size(size));
     match unix {
         Some(unix) => format!(
@@ -170,6 +199,73 @@ mod tests {
         assert_eq!(file.find("notes.txt"), bucket.find("archive/"));
         assert_eq!(file.find("notes.txt"), directory.find("src/"));
         assert!(!directory.ends_with("src//"));
+    }
+
+    #[test]
+    fn bare_names_are_default_and_long_mode_and_directory_markers_are_independent() {
+        let directory = Content::Directory(DirectoryInfo {
+            name: "src/".into(),
+            size: None,
+            modified: None,
+            unix: None,
+        });
+        let bucket = Content::Bucket(BucketInfo {
+            name: "archive".into(),
+            created: None,
+        });
+        for (entry, name) in [(directory, "src"), (bucket, "archive")] {
+            assert_eq!(render_with_options(&entry, DisplayOptions::default()), name);
+            assert_eq!(
+                render_with_options(
+                    &entry,
+                    DisplayOptions {
+                        classify: true,
+                        long: false
+                    }
+                ),
+                format!("{name}/")
+            );
+            assert_eq!(
+                render_with_options(
+                    &entry,
+                    DisplayOptions {
+                        classify: false,
+                        long: true
+                    }
+                ),
+                render(&entry).trim_end_matches('/')
+            );
+            assert_eq!(
+                render_with_options(
+                    &entry,
+                    DisplayOptions {
+                        classify: true,
+                        long: true
+                    }
+                ),
+                render(&entry)
+            );
+        }
+        let file = Content::File(FileInfo {
+            name: "file\n\x1b".into(),
+            size: Some(1),
+            modified: None,
+            unix: None,
+        });
+        assert_eq!(
+            render_with_options(&file, DisplayOptions::default()),
+            "file\\n\\u{1b}"
+        );
+        assert_eq!(
+            render_with_options(
+                &file,
+                DisplayOptions {
+                    classify: true,
+                    long: false
+                }
+            ),
+            "file\\n\\u{1b}"
+        );
     }
 
     #[test]

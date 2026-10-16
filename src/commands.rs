@@ -5,8 +5,10 @@ use crate::{
     credentials::Password,
 };
 use anyhow::{bail, Result};
+use std::path::PathBuf;
 
 pub(crate) mod bookmark;
+pub(crate) mod cat;
 pub(crate) mod cd;
 pub(crate) mod connect;
 pub(crate) mod get;
@@ -150,6 +152,16 @@ pub trait Command: Sync {
     fn completion(&self) -> Completion {
         Completion::None
     }
+    /// Whether completed arguments before the active path are valid. Commands
+    /// with options can accept flag prefixes without treating them as paths.
+    fn accepts_path_completion(&self, arguments: &[String], _path: &str) -> bool {
+        match self.completion() {
+            Completion::RemotePath {
+                multiple_arguments, ..
+            } => multiple_arguments || arguments.is_empty(),
+            _ => false,
+        }
+    }
     fn record_history(&self) -> bool {
         true
     }
@@ -162,8 +174,10 @@ pub static COMMANDS: &[&dyn Command] = &[
     &DISCONNECT,
     &cd::Cd,
     &PWD,
+    &LCD,
     &ls::Ls,
     &get::Get,
+    &cat::Cat,
     &bookmark::Bookmark,
     &status::Status,
     &JOBS,
@@ -195,11 +209,21 @@ pub fn completion_for(name: &str) -> Completion {
         .unwrap_or(Completion::None)
 }
 
-pub fn visible_names() -> impl Iterator<Item = &'static str> {
+pub fn accepts_path_completion(name: &str, arguments: &[String], path: &str) -> bool {
     COMMANDS
+        .iter()
+        .find(|command| command.names().contains(&name))
+        .is_some_and(|command| command.accepts_path_completion(arguments, path))
+}
+
+pub fn visible_names() -> impl Iterator<Item = &'static str> {
+    let mut names = COMMANDS
         .iter()
         .filter(|command| command.help().is_some())
         .flat_map(|command| command.names().iter().copied())
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    names.into_iter()
 }
 
 pub fn dispatch_daemon(app: &mut Daemon, line: &str) -> Vec<String> {
@@ -267,15 +291,21 @@ impl Command for SmallCommand {
 }
 
 fn help(_context: &mut CommandContext<'_>, _parser: &ParserContext<'_>) -> Result<CommandResult> {
-    let mut lines = vec!["Commands:".into()];
+    let mut entries = Vec::new();
     for command in COMMANDS {
         if let Some((usage, description)) = command.help() {
-            lines.push(format!("  {usage:<20} {description}"));
-            for alias in &command.names()[1..] {
-                lines.push(format!("  {alias:<20} alias for {}", command.names()[0]));
+            entries.push((command.names()[0], format!("  {usage:<20} {description}")));
+            for &alias in &command.names()[1..] {
+                entries.push((
+                    alias,
+                    format!("  {alias:<20} alias for {}", command.names()[0]),
+                ));
             }
         }
     }
+    entries.sort_unstable_by_key(|(name, _)| *name);
+    let mut lines = vec!["Commands:".into()];
+    lines.extend(entries.into_iter().map(|(_, line)| line));
     Ok(lines.into())
 }
 
@@ -333,6 +363,14 @@ static PWD: SmallCommand = small(
     &["pwd"],
     Some(("pwd", "print backend working directory")),
     pwd,
+);
+static LCD: SmallCommand = small(
+    &["lcd"],
+    Some((
+        "lcd [directory]",
+        "change daemon local download directory (default: home)",
+    )),
+    lcd,
 );
 static JOBS: SmallCommand = small(&["jobs"], Some(("jobs", "list daemon jobs")), jobs);
 static CANCEL: SmallCommand = small(
@@ -432,6 +470,32 @@ fn pwd_lines(app: &mut Daemon, parser: &ParserContext<'_>) -> Vec<String> {
 
 fn pwd(context: &mut CommandContext<'_>, parser: &ParserContext<'_>) -> Result<CommandResult> {
     Ok(pwd_lines(context.daemon()?, parser).into())
+}
+
+fn lcd(context: &mut CommandContext<'_>, parser: &ParserContext<'_>) -> Result<CommandResult> {
+    let path = match parser.arguments() {
+        [] => "~",
+        [path] if !path.is_empty() => path.as_str(),
+        _ => return Ok(vec!["usage: lcd [directory]".into()].into()),
+    };
+    let home = || {
+        std::env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow::anyhow!("cannot resolve local home directory: HOME is not set"))
+    };
+    let path = if path == "~" {
+        home()?
+    } else if let Some(relative) = path.strip_prefix("~/") {
+        home()?.join(relative.trim_start_matches('/'))
+    } else {
+        PathBuf::from(path)
+    };
+    let app = context.daemon()?;
+    let path = app.local_directory.join(path);
+    app.set_local_directory(path)
+        .map_err(|error| anyhow::anyhow!("cannot change local directory: {error}"))?;
+    Ok(vec![format!("Local CWD: {}", app.local_directory.display())].into())
 }
 
 fn jobs_lines(app: &mut Daemon, _parser: &ParserContext<'_>) -> Vec<String> {
@@ -601,7 +665,78 @@ mod tests {
                 multiple_arguments: true
             }
         );
+        assert_eq!(completion_for("cat"), completion_for("get"));
         assert_eq!(completion_for("bogus"), Completion::None);
+    }
+
+    #[test]
+    fn help_and_command_completion_sort_canonical_names_and_aliases_together() {
+        let names = visible_names().collect::<Vec<_>>();
+        assert!(names.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(names.contains(&"lcd"));
+        let mut app = Daemon::bootstrap().unwrap();
+        let help = app.command("help");
+        assert_eq!(help[0], "Commands:");
+        let displayed = help[1..]
+            .iter()
+            .map(|line| line.split_whitespace().next().unwrap())
+            .map(|name| if name == "!<command>" { "!" } else { name })
+            .collect::<Vec<_>>();
+        assert_eq!(displayed, names);
+    }
+
+    #[test]
+    fn lcd_changes_only_the_daemon_local_directory_and_resolves_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().canonicalize().unwrap();
+        let album = base.join("photo album");
+        std::fs::create_dir(&album).unwrap();
+        std::os::unix::fs::symlink("photo album", base.join("link")).unwrap();
+        let process_directory = std::env::current_dir().unwrap();
+        let mut app = Daemon::bootstrap().unwrap();
+        app.set_local_directory(base.clone()).unwrap();
+        app.session.lock().unwrap().cwd = Some("/remote/photos/".into());
+        assert_eq!(
+            app.command("lcd 'photo album'"),
+            vec![format!("Local CWD: {}", album.display())]
+        );
+        assert_eq!(app.local_directory, album);
+        assert_eq!(
+            app.command("lcd .."),
+            vec![format!("Local CWD: {}", base.display())]
+        );
+        assert_eq!(
+            app.command("lcd link"),
+            vec![format!("Local CWD: {}", album.display())]
+        );
+        let absolute = format!("lcd {}", shlex::try_quote(base.to_str().unwrap()).unwrap());
+        assert_eq!(
+            app.command(&absolute),
+            vec![format!("Local CWD: {}", base.display())]
+        );
+        let status = app.command("status");
+        assert!(status.contains(&format!("Local CWD: {}", base.display())));
+        assert!(status.contains(&"CWD: /remote/photos/".into()));
+        assert_eq!(std::env::current_dir().unwrap(), process_directory);
+        assert!(app.jobs.jobs.is_empty());
+    }
+
+    #[test]
+    fn lcd_errors_do_not_change_the_local_directory() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("file"), b"not a directory").unwrap();
+        let mut app = Daemon::bootstrap().unwrap();
+        app.set_local_directory(root.path().to_owned()).unwrap();
+        let original = app.local_directory.clone();
+        for input in ["lcd a b", "lcd ''"] {
+            assert_eq!(app.command(input), vec!["usage: lcd [directory]"]);
+            assert_eq!(app.local_directory, original);
+        }
+        assert!(app.command("lcd missing")[0].starts_with("cannot change local directory:"));
+        assert_eq!(app.local_directory, original);
+        assert!(app.command("lcd file")[0].contains("not a directory"));
+        assert_eq!(app.local_directory, original);
+        assert!(app.jobs.jobs.is_empty());
     }
 
     #[derive(Default)]
@@ -690,7 +825,7 @@ mod tests {
         assert!(app.command("show s3:region")[0].starts_with("s3:region: test region"));
         for (input, usage) in [
             ("cd a b", "usage: cd [directory]"),
-            ("ls a b", "usage: ls [path]"),
+            ("ls a b", "usage: ls [-FlarS] [--] [path]"),
             ("get", "usage: get [-c] [--] <filenames...>"),
             ("pwd extra", "usage: pwd"),
         ] {

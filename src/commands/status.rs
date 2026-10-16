@@ -59,9 +59,10 @@ fn execute_lines(app: &mut Daemon, parser: &ParserContext<'_>) -> Vec<String> {
                     stats.elapsed_ms =
                         job.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
                     vec![format!(
-                        "[{}] {:?} TRANSFER {}",
+                        "[{}] {:?}{} TRANSFER {}",
                         job.id,
                         job.state,
+                        if job.raw_output { " RAW" } else { "" },
                         serde_json::to_string(&stats).unwrap()
                     )]
                 }
@@ -70,11 +71,18 @@ fn execute_lines(app: &mut Daemon, parser: &ParserContext<'_>) -> Vec<String> {
                     total,
                     message,
                 } => vec![format!(
-                    "[{}] {:?} {done}/{total} {message}",
-                    job.id, job.state
+                    "[{}] {:?}{} {done}/{total} {message}",
+                    job.id,
+                    job.state,
+                    if job.raw_output { " RAW" } else { "" }
                 )],
                 Progress::Indeterminate { message } => {
-                    vec![format!("[{}] {:?} {message}", job.id, job.state)]
+                    vec![format!(
+                        "[{}] {:?}{} {message}",
+                        job.id,
+                        job.state,
+                        if job.raw_output { " RAW" } else { "" }
+                    )]
                 }
             },
             None => vec!["no such job".into()],

@@ -1,4 +1,4 @@
-//! Download to the client local directory (-c resumes).
+//! Download to the daemon local directory (-c resumes).
 use super::{Command, CommandContext, CommandResult, Completion, Handler, ParserContext};
 use crate::core::Daemon;
 use anyhow::Result;
@@ -14,7 +14,7 @@ impl Command for Get {
     fn help(&self) -> Option<(&'static str, &'static str)> {
         Some((
             "get [-c] <files...>",
-            "download to the client local directory (-c resumes)",
+            "download to the daemon local directory (-c resumes)",
         ))
     }
     fn completion(&self) -> Completion {
