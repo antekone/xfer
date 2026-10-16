@@ -1,15 +1,15 @@
 # xfer
 
-A runnable Rust scaffold for an lftp-like transfer client. It implements the
-runtime shape, not network protocol implementations yet:
+A Rust prototype for an lftp-like transfer client, with an S3 backend and a
+client/daemon runtime:
 
 - lftp-style inline prompt in the normal terminal buffer; only pager mode uses the alternate screen;
 - Tokio jobs with foreground/background state, progress updates and cooperative
   `Ctrl-C` cancellation;
 - `Ctrl-Z` backgrounds the foreground job; `jobs` and `fg [id]` manage jobs;
 - pager mode (`help`, `q`/Escape, arrows/Space) and the `ui:auto-pager` setting;
-- settings registered by core and SFTP/S3/SMB backend stubs before configuration
-  is read and backend initialization occurs.
+- typed settings and backend interfaces, with S3 listing/download support
+  and SFTP/SMB placeholders.
 
 Run it with:
 
@@ -17,8 +17,7 @@ Run it with:
 cargo run
 ```
 
-Try `help`, `get example`, `mirror remote-dir`, `jobs`, `fg`, and `set
-ui:auto-pager false`.
+Try `help`, `open <bookmark>`, `ls`, `get <filename>`, `jobs`, and `status`.
 
 ## Configuration
 
@@ -34,8 +33,8 @@ s3:region: us-east-1
 smb:max-credits: 32
 ```
 
-The transfer commands currently run simulated jobs. Replace `start_demo` with
-protocol-specific job factories once SFTP, S3, and SMB adapters exist.
+S3 supports connect, navigation, listing and downloads. Uploads, mirroring,
+SFTP and SMB operations are not implemented yet.
 
 ## Command history
 
@@ -60,7 +59,7 @@ private Unix socket. There is no separate `xferd` binary.
 `connect s3://bucket` selects the backend by its registered `s3` protocol token.
 The AWS Rust SDK uses its default credential chain (environment, shared AWS
 config, workload/instance credentials). `disconnect` releases the active logical
-connection. Transfers are not implemented yet. Connection changes run as
+connection. S3 downloads use `get` (see below). Connection changes run as
 cancellable daemon jobs; failed connects preserve the previous connection.
 
 `connect` probes bucket access using `HeadBucket`. For an endpoint-only bookmark,
@@ -174,8 +173,9 @@ Each failed listing attempt's partial output is discarded before retrying, so
 restarting a paginated listing does not duplicate entries. Connection attempts
 keep their settings snapshot and preserve an existing connection on failure.
 Syntax errors/unknown bookmarks are still reported immediately before a job
-starts. File transfers are not implemented yet; future write operations will
-need idempotency/resume handling rather than blindly replaying writes.
+starts. Downloads retry from the last locally written byte and retain their
+initial remote revision; future upload/write operations will need their own
+idempotency/resume handling rather than blindly replaying writes.
 
 ### Listing records and display
 
@@ -319,3 +319,53 @@ press Enter at the prompt. Other navigation/control keys are not stored; Ctrl-C
 and Ctrl-Z retain their immediate job-control meanings. Typeahead is bounded to
 16 KiB and does not echo over job progress. Pager and external-editor keys retain
 their usual behavior rather than becoming typeahead.
+
+
+## Downloads
+
+```text
+get README.txt photos/image.jpg
+get 'file with spaces.txt'
+get -c large.iso
+set xfer:clobber true
+get README.txt
+```
+
+`get [-c] [--] <filenames...>` downloads sequentially to the **attached client's
+current local directory**, preserving each basename (`photos/image.jpg` becomes
+`./image.jpg`). Relative sources resolve against backend `pwd`; absolute sources
+such as `/bucket/path/file` also work. The client sends its local directory after
+each attach, and every job snapshots it, so background jobs keep their original
+destination even when a new client attaches elsewhere. `status` shows Local CWD.
+
+`xfer:clobber` defaults to `false`. Existing local files cause an error suggesting
+`set xfer:clobber true`; enabling it allows replacement. `get -c` instead resumes
+from the existing local size regardless of clobber, creates missing files from
+scratch, skips already complete files, and rejects files larger than the remote
+object. Duplicate destination basenames in one command, symlinks/non-regular
+files, and destinations locked by another download are rejected. Local conflicts
+are checked before remote requests or truncation. Partial files keep their final
+names and remain after errors/cancellation, ready for `get -c`.
+
+TAB completes each filename argument, including after `-c`, using the same typed
+cache as `ls`. Directories/buckets remain available for completing nested paths;
+quoted names and common-prefix expansion work with multiple arguments.
+
+During transfer, the foreground status shows a progress bar, aggregate bytes and
+percentage, elapsed time (`t`), a recent throughput estimate (about 2 seconds),
+and ETA. Resumed bytes count toward completion but not new network throughput.
+Ctrl-C cancels; Ctrl-Z backgrounds the job; normal typeahead still works.
+
+Downloads stream in bounded chunks, without loading objects into memory. Network
+failures use the 3/6/12/24/30-second indefinite retry policy and automatically
+continue from bytes already written. Files completed earlier in the same command
+are not downloaded again. S3 uses `HeadObject` for size/ETag, and `GetObject` with
+`If-Match` and validated byte ranges to avoid appending a full/changed response.
+A changed remote revision, invalid range, missing file, or local safety error
+stops the job. Stalled response bodies time out after 30 seconds.
+
+For an existing file supplied to `get -c`, the user must ensure it is a prefix of
+the intended remote object: length alone cannot prove that existing local bytes
+match. The ETag guard protects requests/retries within this job, not the provenance
+of a pre-existing local partial file. Enabling clobber intentionally truncates the
+old file; partial downloads are not atomically renamed into place.

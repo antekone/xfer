@@ -27,6 +27,7 @@ hyper = { version = "0.14", features = ["client", "tcp"] }
 tower-service = "0.3"
 unicode-width = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["std", "serde"] }
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

@@ -257,6 +257,18 @@ impl Connection for CachedConnection {
     fn resolve_directory(&self, path: Option<&str>) -> Result<String> {
         self.inner.resolve_directory(path)
     }
+    async fn stat_file(&self, path: &str) -> Result<crate::transfer::RemoteFile> {
+        self.inner.stat_file(path).await
+    }
+    async fn download(
+        &self,
+        path: &str,
+        offset: u64,
+        expected: &crate::transfer::RemoteFile,
+        sink: &mut dyn crate::transfer::DownloadSink,
+    ) -> Result<()> {
+        self.inner.download(path, offset, expected, sink).await
+    }
     fn resolve_listing_path(&self, path: &str) -> Result<String> {
         self.inner.resolve_listing_path(path)
     }

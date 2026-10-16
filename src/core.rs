@@ -32,6 +32,7 @@ pub enum Progress {
     Indeterminate {
         message: String,
     },
+    Transfer(crate::transfer::TransferProgress),
     Determinate {
         done: u64,
         total: u64,
@@ -157,6 +158,7 @@ pub struct Job {
     cancel: CancellationToken,
     pub progress: watch::Receiver<Progress>,
     pub output: OutputStore,
+    started: time::Instant,
     _handle: JoinHandle<()>,
 }
 
@@ -283,6 +285,7 @@ impl JobManager {
                 progress,
                 output,
                 _handle: handle,
+                started: time::Instant::now(),
             },
         );
         id
@@ -350,6 +353,7 @@ impl JobManager {
                 progress,
                 output: OutputStore::new(id),
                 _handle: handle,
+                started: time::Instant::now(),
             },
         );
         id
@@ -532,6 +536,7 @@ pub struct Daemon {
     backends: HashMap<String, std::sync::Arc<dyn Backend>>,
     connection: std::sync::Arc<tokio::sync::Mutex<Option<Box<dyn crate::backend::Connection>>>>,
     session: std::sync::Arc<std::sync::Mutex<SessionInfo>>,
+    local_directory: PathBuf,
 }
 
 impl Daemon {
@@ -546,6 +551,11 @@ impl Daemon {
             "ui:history-file",
             SettingValue::Text(default_history_path()),
             "Client history path; session or /dev/null disables persistence",
+        );
+        settings.register(
+            "xfer:clobber",
+            SettingValue::Bool(false),
+            "Allow get to overwrite existing local files (get -c resumes independently)",
         );
         crate::cache::CacheOptions::register(&mut settings);
         let backends: Vec<Box<dyn Backend>> = vec![Box::new(Sftp), Box::new(S3), Box::new(Smb)];
@@ -583,6 +593,7 @@ impl Daemon {
                 .collect(),
             connection: Default::default(),
             session: std::sync::Arc::new(std::sync::Mutex::new(SessionInfo::disconnected())),
+            local_directory: std::env::current_dir()?,
         })
     }
 
@@ -649,6 +660,18 @@ impl Daemon {
             }))
     }
 
+    pub fn set_local_directory(&mut self, path: PathBuf) -> Result<()> {
+        if !path.is_absolute() {
+            anyhow::bail!("local directory must be absolute");
+        }
+        let path = path.canonicalize()?;
+        if !path.is_dir() {
+            anyhow::bail!("local directory is not a directory");
+        }
+        self.local_directory = path;
+        Ok(())
+    }
+
     pub fn session_info(&self) -> SessionInfo {
         self.session.lock().expect("session state poisoned").clone()
     }
@@ -692,6 +715,7 @@ impl Daemon {
                 "  disconnect          release active backend connection".into(),
                 "  close               alias for disconnect".into(),
                 "  ls [path]           list buckets, a directory, or a file".into(),
+                "  get [-c] <files...> download files to the client's local directory (-c resumes)".into(),
                 "  cd [directory]      change backend working directory (default: initial directory)".into(),
                 "  pwd                 print backend working directory".into(),
                 "  bookmark            list bookmark aliases, URLs and buckets".into(),
@@ -809,7 +833,19 @@ impl Daemon {
                 });
                 vec![format!("JOB {id}")]
             }
-            Some("get" | "mirror") => vec!["file transfers are not implemented yet".into()],
+            Some("get") => {
+                let args = match crate::transfer::GetArgs::parse(words) { Ok(args) => args, Err(error) => return vec![error.to_string()] };
+                let connection = self.connection.clone();
+                let directory = self.local_directory.clone();
+                let clobber = self.settings.bool("xfer:clobber");
+                let id = self.jobs.start_task(line.to_owned(), move |output, progress| async move {
+                    let active = connection.lock().await;
+                    let active = active.as_ref().ok_or_else(|| crate::error::NonRetryableError("not connected; use connect first".into()))?;
+                    crate::transfer::get(active.as_ref(), args, directory, clobber, progress, output).await
+                });
+                vec![format!("JOB {id}")]
+            },
+            Some("mirror") => vec!["mirror is not implemented yet".into()],
             Some("read-output") => {
                 let id = words.next().and_then(|value| value.parse().ok());
                 let offset = words
@@ -871,11 +907,16 @@ impl Daemon {
                         format!("Daemon PID: {}", info.daemon_pid),
                         format!("Backend: {}", info.protocol.as_deref().unwrap_or("disconnected")),
                         format!("CWD: {}", info.cwd.as_deref().unwrap_or("-")),
+                        format!("Local CWD: {}", self.local_directory.display()),
                         format!("Running jobs: {}", self.jobs.jobs.values().filter(|job| job.state == JobState::Running).count()),
                     ]
                 },
                 Some(id) => match id.parse().ok().and_then(|id| self.jobs.jobs.get(&id)) {
                     Some(job) => match job.progress.borrow().clone() {
+                        Progress::Transfer(mut stats) => {
+                            stats.elapsed_ms = job.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                            vec![format!("[{}] {:?} TRANSFER {}", job.id, job.state, serde_json::to_string(&stats).unwrap())]
+                        },
                         Progress::Determinate { done, total, message } => vec![format!("[{}] {:?} {done}/{total} {message}", job.id, job.state)],
                         Progress::Indeterminate { message } => vec![format!("[{}] {:?} {message}", job.id, job.state)],
                     },

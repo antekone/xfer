@@ -68,3 +68,4 @@ pub mod cache;
 pub mod daemon_server;
 pub mod error;
 pub mod listing;
+pub mod transfer;

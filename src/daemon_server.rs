@@ -112,6 +112,29 @@ pub async fn run() -> Result<()> {
                         let _ = writer.write_all(response);
                         let _ = writer.flush();
                     }
+                    Ok(_) if request.starts_with("LOCAL_CWD ") => {
+                        let result = serde_json::from_str::<String>(request[10..].trim())
+                            .map_err(anyhow::Error::from)
+                            .and_then(|path| {
+                                daemon
+                                    .lock()
+                                    .expect("daemon state poisoned")
+                                    .set_local_directory(PathBuf::from(path))
+                            });
+                        match result {
+                            Ok(()) => {
+                                let _ = writer.write_all(b"LOCAL_CWD_OK\n");
+                            }
+                            Err(error) => {
+                                let _ = writeln!(
+                                    writer,
+                                    "LOCAL_CWD_ERROR {}",
+                                    serde_json::to_string(&error.to_string()).unwrap()
+                                );
+                            }
+                        }
+                        let _ = writer.flush();
+                    }
                     Ok(_) if request.trim() == "SESSION" => {
                         let info = daemon.lock().expect("daemon state poisoned").session_info();
                         let _ =
@@ -120,9 +143,12 @@ pub async fn run() -> Result<()> {
                     }
                     Ok(_)
                         if request.starts_with("COMPLETE_CD ")
-                            || request.starts_with("COMPLETE_LS ") =>
+                            || request.starts_with("COMPLETE_LS ")
+                            || request.starts_with("COMPLETE_GET ") =>
                     {
-                        let result = match serde_json::from_str::<String>(request[12..].trim()) {
+                        let result = match serde_json::from_str::<String>(
+                            request.split_once(' ').unwrap().1.trim(),
+                        ) {
                             Ok(input) => {
                                 // Do not hold the daemon-state mutex over network I/O.
                                 let future = daemon

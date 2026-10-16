@@ -256,6 +256,7 @@ fn render_foreground(app: &App, id: JobId) {
         return;
     };
     let status = match job.progress.borrow().clone() {
+        Progress::Transfer(stats) => format!("{}/{} bytes", stats.done, stats.total),
         Progress::Determinate {
             done,
             total,
@@ -351,24 +352,77 @@ fn completion_path(argument: &str) -> Option<String> {
     }
 }
 
+fn path_completion_context(command: &str) -> Option<(String, String, String)> {
+    let verb = command.split_whitespace().next()?;
+    let argument = command.strip_prefix(verb)?.trim_start();
+    let mut tokens = shlex::split(argument)
+        .or_else(|| shlex::split(&format!("{argument}'")))
+        .or_else(|| shlex::split(&format!("{argument}\"")))?;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut boundary = true;
+    for ch in argument.chars() {
+        if escaped {
+            escaped = false;
+            boundary = false;
+            continue;
+        }
+        if quote == Some('\'') {
+            if ch == '\'' {
+                quote = None;
+            }
+            boundary = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            boundary = false;
+            continue;
+        }
+        if let Some(current) = quote {
+            if ch == current {
+                quote = None;
+            }
+            boundary = false;
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            boundary = false;
+        } else {
+            boundary = ch.is_whitespace();
+        }
+    }
+    let path = if boundary {
+        String::new()
+    } else {
+        tokens.pop().unwrap_or_default()
+    };
+    if verb != "get" && !tokens.is_empty() {
+        return None;
+    }
+    let mut head = verb.to_owned();
+    for token in tokens {
+        head.push(' ');
+        head.push_str(&shlex::try_quote(&token).ok()?);
+    }
+    let method = match verb {
+        "cd" => "COMPLETE_CD",
+        "ls" => "COMPLETE_LS",
+        "get" => "COMPLETE_GET",
+        _ => return None,
+    };
+    Some((head, path, method.to_owned()))
+}
+
 fn complete_path_command(
     stream: &mut UnixStream,
     reader: &mut BufReader<UnixStream>,
     command: &mut String,
     prompt: &str,
 ) -> Result<()> {
-    let verb = if command.starts_with("ls") {
-        "ls"
-    } else {
-        "cd"
-    };
-    let Some(path) = completion_path(command.strip_prefix(verb).unwrap_or("").trim_start()) else {
+    let Some((head, path, method)) = path_completion_context(command) else {
         return Ok(());
-    };
-    let method = if verb == "ls" {
-        "COMPLETE_LS"
-    } else {
-        "COMPLETE_CD"
     };
     stream.write_all(format!("{method} {}\n", serde_json::to_string(&path)?).as_bytes())?;
     let mut response = String::new();
@@ -405,7 +459,7 @@ fn complete_path_command(
     if complete_set && common.starts_with(&path) && common.len() > path.len() {
         // Compute on decoded paths, THEN quote: quotes themselves are not part
         // of the directory name and must not affect the shared prefix.
-        *command = format!("{verb} {}", shlex::try_quote(common)?);
+        *command = format!("{head} {}", shlex::try_quote(common)?);
     }
     if choices.len() > 1 || (!complete_set && !choices.is_empty()) {
         let labels = choices
@@ -553,6 +607,8 @@ fn read_attached_command(
                     || command.starts_with("cd\t")
                     || command.starts_with("ls ")
                     || command.starts_with("ls\t")
+                    || command.starts_with("get ")
+                    || command.starts_with("get\t")
                 {
                     history_cursor = None;
                     complete_path_command(stream, reader, &mut command, prompt)?;
@@ -846,6 +902,100 @@ impl ForegroundDisplay {
     }
 }
 
+#[derive(Default)]
+struct TransferRate {
+    samples: std::collections::VecDeque<(Instant, u64)>,
+}
+impl TransferRate {
+    fn sample(&mut self, stats: &xfer::transfer::TransferProgress) -> f64 {
+        let now = Instant::now();
+        self.samples.push_back((now, stats.transferred));
+        while self.samples.len() > 1
+            && now.duration_since(self.samples.front().unwrap().0) > Duration::from_secs(2)
+        {
+            self.samples.pop_front();
+        }
+        while self.samples.len() > 32 {
+            self.samples.pop_front();
+        }
+        let (time, bytes) = self.samples.front().unwrap();
+        let elapsed = now.duration_since(*time).as_secs_f64();
+        if elapsed >= 0.1 {
+            stats.transferred.saturating_sub(*bytes) as f64 / elapsed
+        } else {
+            stats.transferred as f64 / (stats.elapsed_ms as f64 / 1000.0).max(0.001)
+        }
+    }
+}
+fn transfer_bytes(bytes: f64) -> String {
+    let mut value = bytes.max(0.0);
+    let units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
+    let mut unit = 0;
+    while value >= 1024.0 && unit < units.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{value:.0}B")
+    } else {
+        format!("{value:.1}{}", units[unit])
+    }
+}
+fn transfer_time(seconds: u64) -> String {
+    if seconds >= 3600 {
+        format!(
+            "{}:{:02}:{:02}",
+            seconds / 3600,
+            seconds / 60 % 60,
+            seconds % 60
+        )
+    } else {
+        format!("{:02}:{:02}", seconds / 60, seconds % 60)
+    }
+}
+fn render_transfer(
+    id: u64,
+    stats: &xfer::transfer::TransferProgress,
+    speed: f64,
+    width: u16,
+) -> String {
+    let ratio = if stats.total == 0 {
+        1.0
+    } else {
+        (stats.done as f64 / stats.total as f64).clamp(0.0, 1.0)
+    };
+    let length = if width >= 75 { 10 } else { 5 };
+    let filled = (ratio * length as f64) as usize;
+    let bar = format!("{}{}", "█".repeat(filled), "░".repeat(length - filled));
+    let eta = if stats.done >= stats.total {
+        "00:00".into()
+    } else if speed > 0.0 {
+        transfer_time(((stats.total - stats.done) as f64 / speed).ceil() as u64)
+    } else {
+        "--:--".into()
+    };
+    let metrics = format!(
+        " [{bar}] {:3.0}% {}/{} {}/s t{} ETA{}",
+        (ratio * 100.0).floor(),
+        transfer_bytes(stats.done as f64),
+        transfer_bytes(stats.total as f64),
+        transfer_bytes(speed),
+        transfer_time(stats.elapsed_ms / 1000),
+        eta
+    );
+    let prefix = format!("[{id}] ");
+    let label = if stats.file_count > 1 {
+        format!("{}/{} {}", stats.file_index, stats.file_count, stats.file)
+    } else {
+        stats.file.clone()
+    };
+    let budget = width.saturating_sub(
+        unicode_width::UnicodeWidthStr::width(metrics.as_str()) as u16 + prefix.len() as u16 + 1,
+    );
+    let label = fit_status_line(&label, budget.saturating_add(1));
+    fit_status_line(&format!("{prefix}{label}{metrics}"), width)
+}
+
 fn foreground_job(
     stream: &mut UnixStream,
     reader: &mut BufReader<UnixStream>,
@@ -855,6 +1005,7 @@ fn foreground_job(
     enable_raw_mode()?;
     let _raw_input = RawInputGuard;
     let mut display = ForegroundDisplay::default();
+    let mut transfer_rate = TransferRate::default();
     loop {
         stream.write_all(format!("COMMAND status {id}\n").as_bytes())?;
         let mut line = String::new();
@@ -904,7 +1055,23 @@ fn foreground_job(
             .ok()
             .filter(|width| *width > 0)
             .unwrap_or(80);
-        let redraw = display.update(&status, width);
+        let transfer_status = if let Some((_, json)) = status.split_once(" TRANSFER ") {
+            serde_json::from_str::<xfer::transfer::TransferProgress>(json)
+                .ok()
+                .map(|stats| render_transfer(id, &stats, transfer_rate.sample(&stats), width))
+        } else {
+            None
+        };
+        let redraw = if let Some(line) = transfer_status {
+            if display.previous_line.as_deref() == Some(&line) {
+                String::new()
+            } else {
+                display.previous_line = Some(line.clone());
+                format!("\r\x1b[2K{line}")
+            }
+        } else {
+            display.update(&status, width)
+        };
         if !redraw.is_empty() {
             print!("{redraw}");
             io::stdout().flush()?;
@@ -1111,6 +1278,16 @@ fn attach(args: &[String]) -> Result<()> {
     }
     if line.trim() != "ATTACHED" {
         anyhow::bail!("attach failed: {}", line.trim());
+    }
+    let local_directory = std::env::current_dir()?;
+    let local_directory = local_directory
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("local directory must be valid UTF-8"))?;
+    stream
+        .write_all(format!("LOCAL_CWD {}\n", serde_json::to_string(local_directory)?).as_bytes())?;
+    line.clear();
+    if reader.read_line(&mut line)? == 0 || line.trim() != "LOCAL_CWD_OK" {
+        anyhow::bail!("cannot set daemon local directory: {}", line.trim());
     }
     let mut typeahead = Typeahead::default();
     // Claim startup exactly once per daemon, not on every later attach.
@@ -1623,6 +1800,8 @@ mod startup_tests {
         let candidates = candidates.iter().map(|value| value.to_string()).collect();
         let expected = if command.starts_with("ls ") {
             "COMPLETE_LS "
+        } else if command.starts_with("get ") {
+            "COMPLETE_GET "
         } else {
             "COMPLETE_CD "
         };
@@ -1648,6 +1827,58 @@ mod startup_tests {
         complete_path_command(&mut client, &mut reader, &mut command, "xfer> ").unwrap();
         worker.join().unwrap();
         command
+    }
+
+    #[test]
+    fn get_completion_preserves_continue_flag_and_prior_filenames() {
+        assert_eq!(
+            path_completion_context("get -c first.txt pho").unwrap(),
+            (
+                "get -c first.txt".into(),
+                "pho".into(),
+                "COMPLETE_GET".into()
+            )
+        );
+        assert_eq!(
+            path_completion_context("get -c ").unwrap(),
+            ("get -c".into(), "".into(), "COMPLETE_GET".into())
+        );
+        let (head, path, _) = path_completion_context("get 'first file.txt' \"next fi").unwrap();
+        assert_eq!(shlex::split(&head).unwrap(), vec!["get", "first file.txt"]);
+        assert_eq!(path, "next fi");
+        assert_eq!(path_completion_context("get my\\ ").unwrap().1, "my ");
+        assert_eq!(path_completion_context("get -- -fi").unwrap().1, "-fi");
+        let command = complete_with_candidates("get -c first.txt pho", &["photo album.jpg"], false);
+        assert_eq!(
+            shlex::split(&command).unwrap(),
+            vec!["get", "-c", "first.txt", "photo album.jpg"]
+        );
+    }
+    #[test]
+    fn transfer_bar_includes_throughput_elapsed_and_eta_without_wrapping() {
+        let stats = xfer::transfer::TransferProgress {
+            file: "file.iso".into(),
+            file_index: 1,
+            file_count: 1,
+            done: 1024,
+            total: 2048,
+            transferred: 1024,
+            elapsed_ms: 2000,
+        };
+        let line = render_transfer(1, &stats, 512.0, 100);
+        assert!(line.contains("50%"));
+        assert!(line.contains("512B/s"));
+        assert!(line.contains("t00:02"));
+        assert!(line.contains("ETA00:02"));
+        assert!(line.contains('█'));
+        for width in [20, 40, 80, 100] {
+            assert!(
+                unicode_width::UnicodeWidthStr::width(
+                    render_transfer(1, &stats, 512.0, width).as_str()
+                ) < width as usize
+            );
+        }
+        assert!(render_transfer(1, &stats, 0.0, 100).contains("ETA--:--"));
     }
 
     #[test]

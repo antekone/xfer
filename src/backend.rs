@@ -21,6 +21,18 @@ pub trait Connection: Send + Sync {
     async fn list(&self, _path: &str, _output: &mut dyn ListingSink) -> Result<u64> {
         bail!("listing is not implemented for {}", self.protocol())
     }
+    async fn stat_file(&self, _path: &str) -> Result<crate::transfer::RemoteFile> {
+        Err(NonRetryableError(format!("get is not implemented for {}", self.protocol())).into())
+    }
+    async fn download(
+        &self,
+        _path: &str,
+        _offset: u64,
+        _expected: &crate::transfer::RemoteFile,
+        _sink: &mut dyn crate::transfer::DownloadSink,
+    ) -> Result<()> {
+        Err(NonRetryableError(format!("get is not implemented for {}", self.protocol())).into())
+    }
     /// Canonicalize a directory against this connection's current location.
     /// None selects the connection's initial directory (shell-style `cd`).
     fn resolve_directory(&self, path: Option<&str>) -> Result<String> {
@@ -132,6 +144,122 @@ impl S3Connection {
 impl Connection for S3Connection {
     fn protocol(&self) -> &'static str {
         "s3"
+    }
+    async fn stat_file(&self, path: &str) -> Result<crate::transfer::RemoteFile> {
+        let location = self.location.resolve(path);
+        let bucket = location
+            .bucket
+            .as_deref()
+            .ok_or_else(|| NonRetryableError("select a bucket before downloading".into()))?;
+        let key = location.prefix.trim_end_matches('/');
+        if key.is_empty() || directory_path(path) {
+            return Err(NonRetryableError("get expects an object filename".into()).into());
+        }
+        let result = self
+            .client
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|error| {
+                if error
+                    .raw_response()
+                    .is_some_and(|response| response.status().as_u16() == 404)
+                {
+                    NonRetryableError(format!("no such file: {path}")).into()
+                } else {
+                    probe_error("HeadObject", &error, &self.redactions)
+                }
+            })?;
+        let size = result
+            .content_length()
+            .and_then(|value| u64::try_from(value).ok())
+            .ok_or_else(|| NonRetryableError("S3 response has no valid object length".into()))?;
+        Ok(crate::transfer::RemoteFile {
+            size,
+            revision: result.e_tag().map(str::to_owned),
+        })
+    }
+    async fn download(
+        &self,
+        path: &str,
+        offset: u64,
+        expected: &crate::transfer::RemoteFile,
+        sink: &mut dyn crate::transfer::DownloadSink,
+    ) -> Result<()> {
+        let location = self.location.resolve(path);
+        let bucket = location
+            .bucket
+            .as_deref()
+            .ok_or_else(|| NonRetryableError("select a bucket before downloading".into()))?;
+        let key = location.prefix.trim_end_matches('/');
+        if offset > expected.size {
+            return Err(NonRetryableError("resume offset exceeds remote size".into()).into());
+        }
+        if offset == expected.size {
+            return Ok(());
+        }
+        let mut request = self
+            .client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .set_if_match(expected.revision.clone());
+        if offset > 0 {
+            request = request.range(format!("bytes={offset}-"));
+        }
+        let mut response = request.send().await.map_err(|error| {
+            if error.raw_response().is_some_and(|response| matches!(response.status().as_u16(), 404 | 412 | 416)) {
+                NonRetryableError("remote file changed/disappeared or resume range is invalid; partial file was retained".into()).into()
+            } else { probe_error("GetObject", &error, &self.redactions) }
+        })?;
+        if expected
+            .revision
+            .as_deref()
+            .is_some_and(|revision| response.e_tag() != Some(revision))
+        {
+            return Err(NonRetryableError(
+                "remote object revision changed; partial file was retained".into(),
+            )
+            .into());
+        }
+        if offset > 0 {
+            let wanted = format!("bytes {offset}-{}/{}", expected.size - 1, expected.size);
+            if response.content_range() != Some(wanted.as_str()) {
+                return Err(NonRetryableError(
+                    "server did not honor the resume range; refusing to append a full response"
+                        .into(),
+                )
+                .into());
+            }
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| u64::try_from(length).ok() != Some(expected.size - offset))
+        {
+            return Err(NonRetryableError(
+                "S3 response length does not match the requested download".into(),
+            )
+            .into());
+        }
+        let mut position = offset;
+        while let Some(chunk) =
+            tokio::time::timeout(std::time::Duration::from_secs(30), response.body.next())
+                .await
+                .map_err(|_| anyhow::anyhow!("download stalled for 30 seconds"))?
+        {
+            let chunk = chunk.map_err(|_| anyhow::anyhow!("download stream interrupted"))?;
+            if chunk.len() as u64 > expected.size - position {
+                return Err(NonRetryableError("server sent more data than expected".into()).into());
+            }
+            sink.write(&chunk)?;
+            position += chunk.len() as u64;
+        }
+        if position != expected.size {
+            bail!("download ended early at {position}/{} bytes", expected.size);
+        }
+        Ok(())
     }
     fn resolve_directory(&self, path: Option<&str>) -> Result<String> {
         Ok(match path {
@@ -959,6 +1087,133 @@ mod connection_tests {
             requests[0]
         );
         assert!(requests[1].contains("continuation-token=next"));
+    }
+
+    async fn download_client(
+        responses: Vec<(&'static str, &'static [u8])>,
+    ) -> (S3Connection, tokio::sync::oneshot::Receiver<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (send, receive) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (headers, body) in responses {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut request = String::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                    request.push_str(&line);
+                }
+                requests.push(request);
+                socket.write_all(headers.as_bytes()).unwrap();
+                socket.write_all(body).unwrap();
+            }
+            let _ = send.send(requests);
+        });
+        let shared = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "test", "secret", None, None, "test",
+            ))
+            .load()
+            .await;
+        let config = aws_sdk_s3::config::Builder::from(&shared)
+            .endpoint_url(format!("http://{address}"))
+            .force_path_style(true)
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(1))
+            .build();
+        (
+            S3Connection::new(
+                aws_sdk_s3::Client::from_conf(config),
+                Some("example".into()),
+                Vec::new(),
+            ),
+            receive,
+        )
+    }
+    #[derive(Default)]
+    struct Downloaded(Vec<u8>);
+    impl crate::transfer::DownloadSink for Downloaded {
+        fn write(&mut self, bytes: &[u8]) -> Result<()> {
+            self.0.extend_from_slice(bytes);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn s3_download_supports_head_metadata_if_match_and_ranges() {
+        let (connection, requests) = download_client(vec![
+            ("HTTP/1.1 200 OK\r\ncontent-length: 6\r\netag: \"v1\"\r\nconnection: close\r\n\r\n", b""),
+            ("HTTP/1.1 200 OK\r\ncontent-length: 6\r\netag: \"v1\"\r\nconnection: close\r\n\r\n", b"abcdef"),
+            ("HTTP/1.1 206 Partial Content\r\ncontent-length: 3\r\ncontent-range: bytes 3-5/6\r\netag: \"v1\"\r\nconnection: close\r\n\r\n", b"def"),
+        ]).await;
+        let metadata = connection.stat_file("/example/a.txt").await.unwrap();
+        assert_eq!(metadata.size, 6);
+        assert_eq!(metadata.revision.as_deref(), Some("\"v1\""));
+        let mut full = Downloaded::default();
+        connection
+            .download("/example/a.txt", 0, &metadata, &mut full)
+            .await
+            .unwrap();
+        assert_eq!(full.0, b"abcdef");
+        let mut tail = Downloaded::default();
+        connection
+            .download("/example/a.txt", 3, &metadata, &mut tail)
+            .await
+            .unwrap();
+        assert_eq!(tail.0, b"def");
+        let requests = requests.await.unwrap();
+        assert!(requests[0].starts_with("HEAD /example/a.txt"));
+        assert!(requests[1]
+            .to_ascii_lowercase()
+            .contains("if-match: \"v1\""));
+        assert!(requests[2].to_ascii_lowercase().contains("range: bytes=3-"));
+    }
+    #[tokio::test]
+    async fn changed_revision_is_rejected_before_writing_any_bytes() {
+        let (connection, requests) = download_client(vec![
+            ("HTTP/1.1 206 Partial Content\r\ncontent-length: 3\r\ncontent-range: bytes 3-5/6\r\netag: \"v2\"\r\nconnection: close\r\n\r\n", b"xyz"),
+        ]).await;
+        let metadata = crate::transfer::RemoteFile {
+            size: 6,
+            revision: Some("\"v1\"".into()),
+        };
+        let mut output = Downloaded::default();
+        assert!(connection
+            .download("/example/a.txt", 3, &metadata, &mut output)
+            .await
+            .unwrap_err()
+            .is::<NonRetryableError>());
+        assert!(output.0.is_empty());
+        requests.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ignored_resume_range_cannot_append_duplicate_data() {
+        let (connection, requests) = download_client(vec![(
+            "HTTP/1.1 200 OK\r\ncontent-length: 6\r\netag: \"v1\"\r\nconnection: close\r\n\r\n",
+            b"abcdef",
+        )])
+        .await;
+        let metadata = crate::transfer::RemoteFile {
+            size: 6,
+            revision: Some("\"v1\"".into()),
+        };
+        let mut output = Downloaded::default();
+        assert!(connection
+            .download("/example/a.txt", 3, &metadata, &mut output)
+            .await
+            .unwrap_err()
+            .is::<NonRetryableError>());
+        assert!(output.0.is_empty());
+        requests.await.unwrap();
     }
 
     #[tokio::test]

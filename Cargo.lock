@@ -2678,6 +2678,7 @@ dependencies = [
  "crossterm",
  "hyper 0.14.32",
  "hyper-rustls 0.24.2",
+ "libc",
  "rcgen",
  "rustls 0.21.12",
  "serde",
