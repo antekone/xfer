@@ -14,6 +14,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use zeroize::{Zeroize, Zeroizing};
 
 fn socket_path() -> Result<PathBuf> {
     let mut args = std::env::args_os().skip(1);
@@ -70,7 +71,7 @@ pub async fn run() -> Result<()> {
         thread::spawn(move || {
             let _runtime_guard = runtime.enter();
             let mut reader = BufReader::new(stream.try_clone().expect("clone client socket"));
-            let mut request = String::new();
+            let mut request = Zeroizing::new(String::new());
             let result = reader.read_line(&mut request);
             let mut writer = stream;
             if result.is_err() {
@@ -99,7 +100,7 @@ pub async fn run() -> Result<()> {
             let _ = writer.flush();
             // The lease belongs to this connection until it explicitly detaches or closes.
             loop {
-                request.clear();
+                request.zeroize();
                 match reader.read_line(&mut request) {
                     Ok(0) | Err(_) => break,
                     Ok(_) if request.trim() == "DETACH" => break,
@@ -110,6 +111,21 @@ pub async fn run() -> Result<()> {
                             b"RUN_STARTUP\n"
                         };
                         let _ = writer.write_all(response);
+                        let _ = writer.flush();
+                    }
+                    Ok(_) if request.starts_with("STARTUP_FILE ") => {
+                        match serde_json::from_str::<PathBuf>(request[13..].trim()) {
+                            Ok(path) => {
+                                daemon
+                                    .lock()
+                                    .expect("daemon state poisoned")
+                                    .set_startup_file(path);
+                                let _ = writer.write_all(b"STARTUP_FILE_OK\n");
+                            }
+                            Err(_) => {
+                                let _ = writer.write_all(b"ERROR invalid startup file path\n");
+                            }
+                        }
                         let _ = writer.flush();
                     }
                     Ok(_) if request.starts_with("LOCAL_CWD ") => {
@@ -175,6 +191,25 @@ pub async fn run() -> Result<()> {
                                 );
                             }
                         }
+                        let _ = writer.flush();
+                    }
+                    Ok(_) if request.starts_with("CONNECT_PASSWORD ") => {
+                        let response = match serde_json::from_str::<
+                            crate::credentials::PasswordConnect,
+                        >(request[17..].trim())
+                        {
+                            Ok(credentials) => daemon
+                                .lock()
+                                .expect("daemon state poisoned")
+                                .connect_command(&credentials.target, Some(credentials.password)),
+                            // Parser errors may contain the password: never include them.
+                            Err(_) => vec!["invalid password connection request".into()],
+                        };
+                        request.zeroize();
+                        for line in response {
+                            let _ = writeln!(writer, "OUTPUT {line}");
+                        }
+                        let _ = writer.write_all(b"DONE\n");
                         let _ = writer.flush();
                     }
                     Ok(_) if request.starts_with("COMMAND ") => {

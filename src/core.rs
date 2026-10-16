@@ -415,10 +415,11 @@ pub struct Settings {
     pub values: HashMap<String, Setting>,
 }
 impl Settings {
-    pub fn load_file(&mut self, path: &std::path::Path) -> Result<()> {
+    /// Load settings, returning false when the optional file is missing.
+    pub fn load_file(&mut self, path: &std::path::Path) -> Result<bool> {
         let source = match std::fs::read_to_string(path) {
             Ok(source) => source,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error.into()),
         };
         for (line_no, line) in source.lines().enumerate() {
@@ -435,7 +436,7 @@ impl Settings {
             self.set(name.trim(), value.trim())
                 .map_err(|e| anyhow::anyhow!("{}:{}: {e}", path.display(), line_no + 1))?;
         }
-        Ok(())
+        Ok(true)
     }
     pub fn new() -> Self {
         Self {
@@ -528,6 +529,31 @@ impl SessionInfo {
     }
 }
 
+struct ConfigFile {
+    path: PathBuf,
+    loaded: bool,
+}
+
+impl ConfigFile {
+    fn load(settings: &mut Settings, path: PathBuf) -> Result<Self> {
+        let path = std::path::absolute(path)?;
+        let loaded = settings.load_file(&path)?;
+        Ok(Self { path, loaded })
+    }
+
+    fn status(&self, label: &str) -> String {
+        format!(
+            "{label}: {}{}",
+            self.path.display(),
+            if self.loaded {
+                ""
+            } else {
+                " (not loaded: file not found)"
+            }
+        )
+    }
+}
+
 /// Authoritative daemon state. Clients interact with it through IPC and do not
 /// own jobs, connections, or backend configuration.
 pub struct Daemon {
@@ -537,6 +563,9 @@ pub struct Daemon {
     connection: std::sync::Arc<tokio::sync::Mutex<Option<Box<dyn crate::backend::Connection>>>>,
     session: std::sync::Arc<std::sync::Mutex<SessionInfo>>,
     local_directory: PathBuf,
+    config_file: ConfigFile,
+    config_override: Option<ConfigFile>,
+    startup_file: Option<PathBuf>,
 }
 
 impl Daemon {
@@ -572,10 +601,10 @@ impl Daemon {
             SettingValue::Bool(true),
             "Use pager for long output",
         );
-        settings.load_file(std::path::Path::new("xfer.conf"))?;
-        if let Some(path) = std::env::var_os("XFER_CONFIG") {
-            settings.load_file(std::path::Path::new(&path))?;
-        }
+        let config_file = ConfigFile::load(&mut settings, crate::config_dir().join("xfer.conf"))?;
+        let config_override = std::env::var_os("XFER_CONFIG")
+            .map(|path| ConfigFile::load(&mut settings, PathBuf::from(path)))
+            .transpose()?;
         for backend in &backends {
             backend.initialize(&settings)?;
         }
@@ -594,6 +623,9 @@ impl Daemon {
             connection: Default::default(),
             session: std::sync::Arc::new(std::sync::Mutex::new(SessionInfo::disconnected())),
             local_directory: std::env::current_dir()?,
+            config_file,
+            config_override,
+            startup_file: None,
         })
     }
 
@@ -606,7 +638,11 @@ impl Daemon {
             .any(|job| job.state == JobState::Running)
     }
 
-    fn connect(&mut self, target: &str) -> Result<JobId> {
+    fn connect(
+        &mut self,
+        target: &str,
+        password: Option<crate::credentials::Password>,
+    ) -> Result<JobId> {
         let bookmark = if target.contains("://") {
             None
         } else {
@@ -623,16 +659,27 @@ impl Daemon {
             .map(|value| value.protocol.as_str())
             .or_else(|| target.split_once("://").map(|(token, _)| token))
             .unwrap_or("");
+        if password.is_some() && token != "sftp" {
+            anyhow::bail!("interactive passwords are only supported for sftp");
+        }
         let backend = self
             .backends
             .get(token)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("no backend for protocol: {token}"))?;
+        if bookmark
+            .as_ref()
+            .is_some_and(|bookmark| bookmark.password_interactive)
+            && password.is_none()
+        {
+            return Err(crate::credentials::PasswordRequired.into());
+        }
         let cache_options = crate::cache::CacheOptions::from_settings(&self.settings)?;
         let options = crate::backend::ConnectOptions {
             target: target.to_owned(),
             bookmark,
             settings: self.settings.clone(),
+            password,
         };
         let connection = self.connection.clone();
         let session = self.session.clone();
@@ -660,6 +707,23 @@ impl Daemon {
             }))
     }
 
+    pub fn connect_command(
+        &mut self,
+        target: &str,
+        password: Option<crate::credentials::Password>,
+    ) -> Vec<String> {
+        match self.connect(target, password) {
+            Ok(id) => vec![format!("JOB {id}")],
+            Err(error) if error.is::<crate::credentials::PasswordRequired>() => {
+                vec![format!(
+                    "PASSWORD_REQUIRED {}",
+                    serde_json::to_string(target).unwrap()
+                )]
+            }
+            Err(error) => vec![error.to_string()],
+        }
+    }
+
     pub fn set_local_directory(&mut self, path: PathBuf) -> Result<()> {
         if !path.is_absolute() {
             anyhow::bail!("local directory must be absolute");
@@ -670,6 +734,11 @@ impl Daemon {
         }
         self.local_directory = path;
         Ok(())
+    }
+
+    /// Remember the client-side rc file before dispatching its startup commands.
+    pub fn set_startup_file(&mut self, path: PathBuf) {
+        self.startup_file = Some(path);
     }
 
     pub fn session_info(&self) -> SessionInfo {
@@ -720,11 +789,12 @@ impl Daemon {
                 "  pwd                 print backend working directory".into(),
                 "  bookmark            list bookmark aliases, URLs and buckets".into(),
                 "  bookmark edit       edit TOML bookmarks using VISUAL/EDITOR".into(),
-                "  status              show daemon PID and current connection details".into(),
+                "  status              show daemon, connection and configuration details".into(),
                 "  jobs                list daemon jobs".into(),
                 "  cancel <job-id>     cancel a job".into(),
                 "  show [setting]      show daemon settings".into(),
                 "  set <name> <value>  update a daemon setting".into(),
+                "  !<command>          run local Bash command (client-side)".into(),
                 "  detach              detach this client".into(),
                 "  exit                detach; daemon remains only while jobs run".into(),
             ],
@@ -755,10 +825,7 @@ impl Daemon {
                 _ => vec!["usage: bookmark [edit | reload]".into()],
             },
             Some("connect" | "open") => match words.next() {
-                Some(target) => match self.connect(target) {
-                    Ok(id) => vec![format!("JOB {id}")],
-                    Err(error) => vec![error.to_string()],
-                },
+                Some(target) => self.connect_command(target, None),
                 None => vec!["usage: connect <protocol://target | bookmark>".into()],
             },
             Some("cd") => {
@@ -903,13 +970,24 @@ impl Daemon {
             Some("status") => match words.next() {
                 None => {
                     let info = self.session_info();
-                    vec![
+                    let mut lines = vec![
                         format!("Daemon PID: {}", info.daemon_pid),
                         format!("Backend: {}", info.protocol.as_deref().unwrap_or("disconnected")),
                         format!("CWD: {}", info.cwd.as_deref().unwrap_or("-")),
                         format!("Local CWD: {}", self.local_directory.display()),
                         format!("Running jobs: {}", self.jobs.jobs.values().filter(|job| job.state == JobState::Running).count()),
-                    ]
+                        self.config_file.status("Config file"),
+                    ];
+                    if let Some(config) = &self.config_override {
+                        lines.push(config.status("Config override (XFER_CONFIG)"));
+                    }
+                    if let Some(path) = &self.startup_file {
+                        lines.push(format!("RC file: {}", path.display()));
+                    }
+                    let bookmarks = std::path::Path::new(self.settings.text("bookmarks:file").unwrap());
+                    let bookmarks = std::path::absolute(bookmarks).unwrap_or_else(|_| bookmarks.to_owned());
+                    lines.push(format!("Bookmarks file: {}", bookmarks.display()));
+                    lines
                 },
                 Some(id) => match id.parse().ok().and_then(|id| self.jobs.jobs.get(&id)) {
                     Some(job) => match job.progress.borrow().clone() {
@@ -1089,6 +1167,90 @@ mod backend_tests {
         assert_eq!(jobs.jobs[&id].state, JobState::Failed);
     }
 
+    #[test]
+    fn config_status_distinguishes_missing_and_loaded_files() {
+        let dir = std::env::temp_dir().join(format!("xfer-config-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("xfer.conf");
+        let mut settings = Settings::new();
+        settings.register("test:value", SettingValue::Text("default".into()), "test");
+        let missing = ConfigFile::load(&mut settings, path.clone()).unwrap();
+        assert!(!missing.loaded);
+        assert_eq!(
+            missing.status("Config file"),
+            format!(
+                "Config file: {} (not loaded: file not found)",
+                path.display()
+            )
+        );
+        assert_eq!(settings.text("test:value"), Some("default"));
+
+        fs::write(&path, "test:value: configured\n").unwrap();
+        let loaded = ConfigFile::load(&mut settings, path.clone()).unwrap();
+        assert!(loaded.loaded);
+        assert_eq!(
+            loaded.status("Config file"),
+            format!("Config file: {}", path.display())
+        );
+        assert_eq!(settings.text("test:value"), Some("configured"));
+
+        let override_path = dir.join("override.conf");
+        fs::write(&override_path, "test:value: overridden\n").unwrap();
+        ConfigFile::load(&mut settings, override_path).unwrap();
+        assert_eq!(settings.text("test:value"), Some("overridden"));
+        fs::remove_dir_all(dir).unwrap();
+        // Status describes what was loaded at startup, not whether it still exists.
+        assert!(!loaded.status("Config file").contains("not loaded"));
+    }
+
+    #[test]
+    fn status_shows_config_paths_and_current_bookmarks() {
+        let mut daemon = Daemon::bootstrap().unwrap();
+        let config = std::path::absolute(crate::config_dir().join("xfer.conf")).unwrap();
+        assert_eq!(daemon.config_file.path, config);
+        assert_eq!(
+            daemon.config_override.as_ref().map(|config| &config.path),
+            std::env::var_os("XFER_CONFIG")
+                .map(std::path::absolute)
+                .transpose()
+                .unwrap()
+                .as_ref()
+        );
+        let expected_config = daemon.config_file.status("Config file");
+        let status = daemon.command("status");
+        assert!(status.contains(&expected_config));
+        assert!(!status.iter().any(|line| line.starts_with("RC file:")));
+
+        let override_path = std::path::absolute("custom config.conf").unwrap();
+        daemon.config_override = Some(ConfigFile {
+            path: override_path.clone(),
+            loaded: true,
+        });
+        let rc = std::path::absolute(".xferrc").unwrap();
+        daemon.set_startup_file(rc.clone());
+        daemon.command("set bookmarks:file 'custom bookmarks.toml'");
+        // Client reattachment may change the download directory, not config paths.
+        daemon.set_local_directory(std::env::temp_dir()).unwrap();
+        let status = daemon.command("status");
+        assert!(status.contains(&expected_config));
+        assert!(status.contains(&format!(
+            "Config override (XFER_CONFIG): {}",
+            override_path.display()
+        )));
+        assert!(status.contains(&format!("RC file: {}", rc.display())));
+        assert!(status.contains(&format!(
+            "Bookmarks file: {}",
+            std::path::absolute("custom bookmarks.toml")
+                .unwrap()
+                .display()
+        )));
+        daemon.command("set bookmarks:file other.toml");
+        assert!(daemon.command("status").contains(&format!(
+            "Bookmarks file: {}",
+            std::path::absolute("other.toml").unwrap().display()
+        )));
+    }
+
     #[tokio::test]
     async fn status_snapshot_tracks_cwd_close_and_does_not_wait_on_connection_lock() {
         let mut daemon = Daemon::bootstrap().unwrap();
@@ -1136,10 +1298,13 @@ mod backend_tests {
         use crate::listing::{Content, DirectoryInfo, FileInfo, ListingSink};
         let mut spool = OutputStore::new(1);
         let directory = Content::Directory(DirectoryInfo {
+            unix: None,
+            size: None,
             name: "src".into(),
             modified: None,
         });
         let file = Content::File(FileInfo {
+            unix: None,
             name: "notes.txt".into(),
             size: Some(4096),
             modified: None,

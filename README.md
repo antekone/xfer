@@ -1,15 +1,15 @@
 # xfer
 
-A Rust prototype for an lftp-like transfer client, with an S3 backend and a
+A Rust prototype for an lftp-like transfer client, with S3/SFTP backends and a
 client/daemon runtime:
 
 - lftp-style inline prompt in the normal terminal buffer; only pager mode uses the alternate screen;
 - Tokio jobs with foreground/background state, progress updates and cooperative
   `Ctrl-C` cancellation;
 - `Ctrl-Z` backgrounds the foreground job; `jobs` and `fg [id]` manage jobs;
-- pager mode (`help`, `q`/Escape, arrows/Space) and the `ui:auto-pager` setting;
-- typed settings and backend interfaces, with S3 listing/download support
-  and SFTP/SMB placeholders.
+- pager mode with vi-style navigation, `$VISUAL` handoff, and the `ui:auto-pager` setting;
+- typed settings and backend interfaces, with S3/SFTP listing/download support
+  and an SMB placeholder.
 
 Run it with:
 
@@ -21,9 +21,10 @@ Try `help`, `open <bookmark>`, `ls`, `get <filename>`, `jobs`, and `status`.
 
 ## Configuration
 
-`xfer.conf` in the working directory is read first; `XFER_CONFIG`, if set, is
-read afterward and overrides it. The format is `name: value`, including
-namespaced keys:
+`$XDG_CONFIG_HOME/xfer/xfer.conf` (normally `~/.config/xfer/xfer.conf`) is read
+first; `XFER_CONFIG`, if set, is read afterward and overrides it. Missing files
+are ignored; `status` marks them as not loaded. The working directory is not
+searched for configuration. The format is `name: value`, including namespaced keys:
 
 ```text
 ssl:skip-validation: false
@@ -33,15 +34,15 @@ s3:region: us-east-1
 smb:max-credits: 32
 ```
 
-S3 supports connect, navigation, listing and downloads. Uploads, mirroring,
-SFTP and SMB operations are not implemented yet.
+S3 and SFTP support connect, navigation, listing and downloads. Uploads, mirroring,
+and SMB operations are not implemented yet.
 
 ## Command history
 
 `ui:history-file` defaults to `$XDG_STATE_HOME/xfer/history` (or
 `~/.local/state/xfer/history`). Set it to `session` to retain history only
 while the process runs, or `/dev/null` to disable history entirely. Set it in
-`xfer.conf` before startup, for example:
+`~/.config/xfer/xfer.conf` before startup, for example:
 
 ```text
 ui:history-file: session
@@ -53,6 +54,93 @@ ui:history-file: session
 The same `xfer` executable runs the per-session daemon with `xfer --daemon`.
 Normal `xfer` startup spawns that mode automatically, then attaches through its
 private Unix socket. There is no separate `xferd` binary.
+
+## Local shell commands
+
+Start a line with `!` to run the rest verbatim using the installed `bash -c`, locally
+in the attached client's working directory:
+
+```text
+!pwd
+!echo ok
+!vim test.c
+!cat file.txt
+!ls -la
+!ls -la | grep something
+```
+
+Bash handles quoting, variables, redirection and pipelines. Input, stdout and stderr
+are attached directly to the terminal, so editors work and output is not paged or
+captured as a daemon job. Ctrl-C interrupts the local command without exiting xfer.
+A failure reports the exit status and returns to the prompt. Each invocation is a
+separate shell: `!cd ...` and `!export ...` do not change xfer's directory/environment.
+The original `!` line follows normal command history rules; rc lines use the same
+execution path without being added to history. A bare `!` prints usage.
+
+## SFTP connections
+
+SFTP uses the installed `ssh` executable and the binary SFTP subsystem (not shell
+commands or parsed `ls` output). It respects OpenSSH configuration, host aliases,
+SSH agents, identity files and `ProxyJump`. URLs are
+`sftp://[user@]host[:port][/absolute/directory]`; omitting the path starts in the
+server's login directory. URL paths `/~` and `/~/...` select the remote home, e.g.
+`sftp://seedhost/~` or `sftp://seedhost/~/downloads`. OpenSSH's `expand-path`
+extension expands `~` on the server; without it, these paths resolve relative to
+the server's initial directory (usually the login home). SFTP does not expose
+`$HOME` or other environment variables, and the client's local home is never used.
+`cd` without an argument returns to the initial directory selected by the URL.
+Listings, file/directory completion, symlinked directories and `get [-c]` work
+through the same daemon jobs, cache and transfer UI as S3. Remote names must be UTF-8.
+SFTP listings include symbolic permissions (including file type and special bits),
+numeric server UID/GID, UTC modification time, and exact byte size, for example:
+
+```text
+-rw-r-----       1000       1001 [2026-10-16 13:22:00 UTC]       4096  notes.txt
+```
+
+SFTP v3 provides numeric owner/group IDs, not account names; xfer never resolves
+remote IDs using the local account database. Missing attributes are shown as `-`
+(or `??????????` for an unknown mode). Directory sizes are the server's directory
+attribute, not a recursive total. Symlink entries retain their own metadata, even
+when their target is a directory offered by completion.
+
+For agent/key authentication, use `open sftp://user@host` or a bookmark without
+`password_interactive`. Encrypted private keys should be loaded into `ssh-agent`.
+For an interactive login password, add this bookmark to `~/.config/xfer/bookmarks.toml`:
+
+```toml
+[server]
+type = 'sftp'
+url = 'sftp://user@my-ssh-alias'
+password_interactive = true
+```
+
+`open server` (or `connect server`) asks for the password **before starting the
+connection job**, without echoing it. Escape/Ctrl-C cancels; Backspace edits and
+Ctrl-U clears it. The password is sent over the private daemon socket, then supplied
+only when OpenSSH requests it using a short-lived private askpass socket. It is
+not stored in bookmarks/history/job output, process arguments or environment
+variables. Credentials are retained only for that connection job, including any
+transient connection retries, not in the established session. A wrong password
+fails the job; run `open server` again to enter a new one. Startup rc commands use
+the same prompting path and require an attached terminal.
+
+Host-key verification is always strict, independent of `ssl:skip-validation`.
+Connect using normal `ssh` first to verify/trust a new host key. xfer never supplies
+a password as a host-key confirmation or private-key passphrase. Keyboard-interactive
+MFA/challenge-response authentication is not supported by this single-password flow.
+`sftp:connect-timeout` bounds SSH connection/authentication (default 30 seconds).
+Authentication, host-key and remote filesystem errors fail immediately; transient
+SSH connection failures use the normal retry backoff. If an established transport
+fails or an operation times out, reconnect explicitly with `open`. Connection errors
+include the target, failed setup step, underlying cause, SSH exit status (when available),
+and captured SSH stderr; supplied passwords are redacted.
+
+SFTP downloads compare the opened file's size and modification time before/after
+reading and on retries. Unlike S3's `If-Match` conditional reads, these checks are
+not atomic and timestamps have second resolution: same-size changes with an
+unchanged timestamp may go undetected. A pre-existing local partial file is still
+the user's responsibility when using `get -c`.
 
 ## S3 connections (first backend)
 
@@ -114,9 +202,19 @@ When the bookmark has no `bucket`, `ls` lists the account's available buckets
 (requires `ListAllMyBuckets`). With a selected bucket, `ls` lists its top-level
 objects and directory prefixes; `ls photos/` lists under that prefix (requires
 `ListBucket`). Results are paginated by the backend and written to a spool file.
-Long output opens the pager when `ui:auto-pager` is enabled; use Space/PgDn,
-PgUp, and `q`. Once displayed or dismissed, output and the finished job are
-removed. Ctrl-Z during listing leaves the job in the background for later `fg`.
+Long output opens the pager when `ui:auto-pager` is enabled:
+
+- `j`/Down and `k`/Up scroll one line.
+- Ctrl-F, PageDown, or Space scroll down a page; Ctrl-B or PageUp scroll up a page.
+- Home/End jump to the first/last screen; `q` or Escape closes the pager.
+- `|` opens the **full output** in `$VISUAL`, falling back to `$EDITOR`, then `vi`.
+  The editor gets a private temporary file as its final argument and keeps terminal
+  stdin for interactive use. Quoted editor arguments are supported; shell pipelines
+  are not evaluated. On exit, the pager returns to the same position. Editor changes
+  do not alter the original output, and the temporary copy is removed afterward.
+
+Once displayed or dismissed, output and the finished job are removed. Ctrl-Z during
+listing leaves the job in the background for later `fg`.
 
 ## Startup commands
 
@@ -162,7 +260,8 @@ currently apply to S3 bookmarks and affect neither the URL path nor TLS name.
 
 ## Retry policy
 
-`connect` and `ls` retry failed backend operations indefinitely. Delays are
+Retryable backend errors from `connect` and `ls` are retried indefinitely; SFTP
+transport/authentication limits are described above. Delays are
 3, 6, 12, 24, then 30 seconds between attempts, staying at 30 seconds until the
 operation succeeds or is cancelled. Foreground progress includes the last error
 and the next delay. Ctrl-C cancels either an active request or a backoff wait;
@@ -190,15 +289,16 @@ Example output (fixed-width date and size columns):
 ```text
 [2025-04-16 10:11:00 UTC]          -  ci-production/
 [                      -]          -  src/
-[2026-10-16 13:22:00 UTC]    4.0 KiB  notes.txt
+[2026-10-16 13:22:00 UTC]       4096  notes.txt
 ```
 
 S3 object dates are `LastModified` values from `ListObjectsV2`; bucket dates are
 creation dates from `ListBuckets`, not modification times. Virtual directory
 prefixes have no timestamp, and neither buckets nor prefixes have an aggregate
 size in the listing API: these fields display `-` rather than fabricated dates
-or zero sizes. All dates are UTC; file sizes use binary units. Permissions and
-ownership are omitted since ordinary S3 listing metadata does not contain them.
+or zero sizes. All dates are UTC; listing sizes are exact byte counts, not rounded
+human-readable units. Permissions and ownership are omitted for S3, since ordinary
+S3 listing metadata does not contain them.
 Names preserve Unicode, while terminal control characters are escaped.
 
 ### Working directory
@@ -282,7 +382,11 @@ xfer[s3:/archive/]> cd photos
 xfer[s3:/archive/photos/]> status
 ```
 
-`status` displays the connected daemon's PID, backend, CWD, and running-job count.
+`status` displays the connected daemon's PID, backend, CWD, and running-job count,
+plus absolute paths for the user config, the `XFER_CONFIG` override (if set), and
+the current `bookmarks:file`. Config files missing at startup are explicitly marked
+`not loaded: file not found`. It also shows the rc file if it supplied startup
+commands; that path is remembered across client reattachments.
 The prompt refreshes before each new command line after connect/cd/close or
 reattach. It reads a lightweight session snapshot without creating a job or
 waiting for a background operation to release the backend connection lock.

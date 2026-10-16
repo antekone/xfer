@@ -2,7 +2,7 @@
 use std::{
     fs, io,
     io::{BufRead, BufReader, Write},
-    os::unix::net::UnixStream,
+    os::unix::{net::UnixStream, process::CommandExt},
     path::PathBuf,
     process::Command,
     time::{Duration, Instant},
@@ -12,12 +12,13 @@ use anyhow::Result;
 use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
-    execute,
+    execute, queue,
     terminal::{
-        disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen,
-        LeaveAlternateScreen,
+        disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, Clear, ClearType,
+        EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
     },
 };
+use zeroize::{Zeroize, Zeroizing};
 
 use xfer::core::{
     Backend, JobId, JobManager, JobState, Progress, SettingValue, Settings, Sftp, Smb, S3,
@@ -41,6 +42,7 @@ struct App {
     settings: Settings,
     jobs: JobManager,
     running: bool,
+    pager_display: PagerDisplay,
 }
 
 fn default_history_path() -> PathBuf {
@@ -91,6 +93,7 @@ impl App {
             settings,
             jobs: JobManager::new(),
             running: true,
+            pager_display: PagerDisplay::default(),
         })
     }
     fn record_history(&mut self, input: &str) {
@@ -116,6 +119,10 @@ impl App {
         if !input.trim().is_empty() {
             self.record_history(&input);
         }
+        if let Some(source) = input.strip_prefix('!') {
+            execute_local_shell(source);
+            return;
+        }
         let mut words = input.split_whitespace();
         let cmd = match words.next() {
             Some(v) => v,
@@ -132,6 +139,7 @@ impl App {
                     "  fg [id]             foreground a job",
                     "  set <name> <value>  update a setting",
                     "  show <name>         display setting",
+                    "  !<command>          run local Bash command",
                     "  quit                exit",
                     "Keys while foreground: Ctrl-C cancel; Ctrl-Z background.",
                 ]
@@ -218,29 +226,27 @@ fn show_jobs(app: &App) {
     prompt(app);
 }
 
-fn draw_pager(lines: &[String], offset: usize) {
-    let (_, height) = crossterm::terminal::size().unwrap_or((80, 24));
-    let page = height.saturating_sub(1) as usize;
-    let mut out = stdout();
-    let _ = execute!(out, cursor::MoveTo(0, 0), Clear(ClearType::All));
-    for line in lines.iter().skip(offset).take(page) {
-        let _ = writeln!(out, "{line}");
-    }
-    let _ = write!(
-        out,
-        "-- pager: q/Esc close, arrows/space scroll ({}/{}) --",
-        offset + 1,
-        lines.len().max(1)
-    );
-    let _ = io::Write::flush(&mut out);
+fn draw_pager(lines: &[String], offset: usize, notice: Option<&str>, display: &mut PagerDisplay) {
+    let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
+    let visible = lines
+        .iter()
+        .skip(offset)
+        .take(pager_page_size(height))
+        .cloned()
+        .collect::<Vec<_>>();
+    let label = notice
+        .map(str::to_owned)
+        .unwrap_or_else(|| pager_label(offset, lines.len()));
+    let _ = display.draw(&mut stdout(), width, height, &visible, &label);
 }
 
 fn enter_pager(app: &mut App, lines: Vec<String>) {
     let mut out = stdout();
     let _ = execute!(out, EnterAlternateScreen, cursor::Hide);
+    app.pager_display.invalidate();
     app.mode = UiMode::Pager { lines, offset: 0 };
     if let UiMode::Pager { lines, offset } = &app.mode {
-        draw_pager(lines, *offset);
+        draw_pager(lines, *offset, None, &mut app.pager_display);
     }
 }
 
@@ -712,7 +718,12 @@ impl Drop for RawInputGuard {
 struct PagerTerminal;
 impl Drop for PagerTerminal {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, cursor::Show);
+        let _ = execute!(
+            io::stdout(),
+            EndSynchronizedUpdate,
+            LeaveAlternateScreen,
+            cursor::Show
+        );
         let _ = disable_raw_mode();
     }
 }
@@ -783,54 +794,298 @@ fn display_job_output(
         io::stdout().flush()?;
         return Ok(offset > 0);
     }
+    page_output_file(&mut file)?;
+    Ok(offset > 0)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PagerAction {
+    Up,
+    Down,
+    PageUp,
+    PageDown,
+    Home,
+    End,
+    Visual,
+    Quit,
+}
+
+fn pager_action(key: KeyEvent) -> Option<PagerAction> {
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
+    let plain = !key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+    Some(match key.code {
+        KeyCode::Esc => PagerAction::Quit,
+        KeyCode::Char('q') if plain => PagerAction::Quit,
+        KeyCode::Up => PagerAction::Up,
+        KeyCode::Down => PagerAction::Down,
+        KeyCode::Char('k') if plain => PagerAction::Up,
+        KeyCode::Char('j') if plain => PagerAction::Down,
+        KeyCode::PageUp => PagerAction::PageUp,
+        KeyCode::PageDown => PagerAction::PageDown,
+        KeyCode::Char(' ') if plain => PagerAction::PageDown,
+        KeyCode::Char('f') if key.modifiers == KeyModifiers::CONTROL => PagerAction::PageDown,
+        KeyCode::Char('b') if key.modifiers == KeyModifiers::CONTROL => PagerAction::PageUp,
+        KeyCode::Home => PagerAction::Home,
+        KeyCode::End => PagerAction::End,
+        KeyCode::Char('|') if plain => PagerAction::Visual,
+        _ => return None,
+    })
+}
+
+fn pager_page_size(height: u16) -> usize {
+    usize::from(height.saturating_sub(1)).max(1)
+}
+
+fn pager_offset(action: PagerAction, offset: usize, rows: usize, page_size: usize) -> usize {
+    let page_size = page_size.max(1);
+    let last = rows.saturating_sub(page_size);
+    let offset = offset.min(last);
+    match action {
+        PagerAction::Up => offset.saturating_sub(1),
+        PagerAction::Down => offset.saturating_add(1).min(last),
+        PagerAction::PageUp => offset.saturating_sub(page_size),
+        PagerAction::PageDown => offset.saturating_add(page_size).min(last),
+        PagerAction::Home => 0,
+        PagerAction::End => last,
+        _ => offset,
+    }
+}
+
+fn pager_label(offset: usize, rows: usize) -> String {
+    format!(
+        "-- {}/{}  j/k ↑↓  ^F/^B PgDn/PgUp  Home/End  | VISUAL  q quit --",
+        (offset + 1).min(rows),
+        rows
+    )
+}
+
+/// Line offsets live on disk, not in a growing in-memory list. This allows
+/// single-line navigation and End on arbitrarily large spooled output.
+struct PagerIndex {
+    offsets: fs::File,
+    rows: usize,
+}
+impl PagerIndex {
+    fn new(source: &mut fs::File) -> io::Result<Self> {
+        use std::io::{Read, Seek, SeekFrom};
+        let length = source.metadata()?.len();
+        let mut offsets = io::BufWriter::new(tempfile::tempfile()?);
+        let mut rows = 0;
+        if length > 0 {
+            offsets.write_all(&0u64.to_le_bytes())?;
+            rows += 1;
+        }
+        source.seek(SeekFrom::Start(0))?;
+        let mut position = 0;
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            let count = source.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            for &byte in &buffer[..count] {
+                position += 1;
+                if byte == b'\n' && position < length {
+                    offsets.write_all(&position.to_le_bytes())?;
+                    rows += 1;
+                }
+            }
+        }
+        offsets.flush()?;
+        Ok(Self {
+            offsets: offsets.into_inner().map_err(|e| e.into_error())?,
+            rows,
+        })
+    }
+    fn offset(&mut self, row: usize) -> io::Result<u64> {
+        use std::io::{Read, Seek, SeekFrom};
+        if self.rows == 0 {
+            return Ok(0);
+        }
+        self.offsets
+            .seek(SeekFrom::Start(row.min(self.rows - 1) as u64 * 8))?;
+        let mut bytes = [0; 8];
+        self.offsets.read_exact(&mut bytes)?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+}
+
+fn visual_command(editor: &str, path: &std::path::Path) -> Result<Command> {
+    let args = shlex::split(editor)
+        .filter(|args| !args.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("invalid VISUAL/EDITOR command"))?;
+    let mut command = Command::new(&args[0]);
+    command.args(&args[1..]).arg(path);
+    Ok(command)
+}
+
+fn pager_output_copy(
+    write_output: impl FnOnce(&mut fs::File) -> io::Result<()>,
+) -> io::Result<tempfile::NamedTempFile> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut copy = tempfile::Builder::new()
+        .prefix("xfer-pager-")
+        .suffix(".txt")
+        .permissions(fs::Permissions::from_mode(0o600))
+        .tempfile()?;
+    write_output(copy.as_file_mut())?;
+    copy.as_file_mut().flush()?;
+    Ok(copy)
+}
+
+/// Always restore the pager's terminal, including on editor launch/exit errors.
+struct ResumePager;
+impl Drop for ResumePager {
+    fn drop(&mut self) {
+        let _ = enable_raw_mode();
+        let _ = execute!(io::stdout(), EnterAlternateScreen, cursor::Hide);
+    }
+}
+
+fn open_pager_visual(write_output: impl FnOnce(&mut fs::File) -> io::Result<()>) -> Result<()> {
+    let copy = pager_output_copy(write_output)?;
+    let editor = std::env::var("VISUAL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::env::var("EDITOR")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_else(|| "vi".into());
+    let mut command = visual_command(&editor, copy.path())?;
+    // An interactive editor needs the terminal on stdin, not a pipe of output.
+    // Pass a private copy as a file argument so edits cannot alter pager data.
+    disable_raw_mode()?;
+    let _resume = ResumePager;
+    execute!(io::stdout(), LeaveAlternateScreen, cursor::Show)?;
+    let status = command.status()?;
+    if !status.success() {
+        anyhow::bail!("editor exited with {status}");
+    }
+    Ok(())
+}
+
+/// Compare one screen at a time and send changed rows in a single synchronized
+/// write. Never blank the screen before painting; unsupported terminals can
+/// safely ignore synchronized-update escapes and still avoid clear/repaint flicker.
+#[derive(Default)]
+struct PagerDisplay {
+    size: Option<(u16, u16)>,
+    rows: Vec<String>,
+}
+impl PagerDisplay {
+    fn invalidate(&mut self) {
+        self.size = None;
+    }
+
+    fn update(
+        &mut self,
+        width: u16,
+        height: u16,
+        lines: &[String],
+        label: &str,
+    ) -> io::Result<Vec<u8>> {
+        let mut rows = vec![String::new(); usize::from(height)];
+        for (row, line) in rows
+            .iter_mut()
+            .take(usize::from(height.saturating_sub(1)))
+            .zip(lines)
+        {
+            *row = fit_status_line(line, width);
+        }
+        if let Some(row) = rows.last_mut() {
+            *row = fit_status_line(label, width);
+        }
+        let resized = self.size != Some((width, height));
+        let mut output = Vec::new();
+        for (index, row) in rows.iter().enumerate() {
+            if !resized && self.rows.get(index) == Some(row) {
+                continue;
+            }
+            if output.is_empty() {
+                queue!(output, BeginSynchronizedUpdate)?;
+            }
+            queue!(output, cursor::MoveTo(0, index as u16))?;
+            output.extend_from_slice(row.as_bytes());
+            // Erase only the suffix left by an older, longer line.
+            queue!(output, Clear(ClearType::UntilNewLine))?;
+        }
+        if !output.is_empty() {
+            queue!(output, EndSynchronizedUpdate)?;
+        }
+        self.size = Some((width, height));
+        self.rows = rows;
+        Ok(output)
+    }
+
+    fn draw(
+        &mut self,
+        out: &mut impl Write,
+        width: u16,
+        height: u16,
+        lines: &[String],
+        label: &str,
+    ) -> io::Result<()> {
+        let frame = self.update(width, height, lines, label)?;
+        if !frame.is_empty() {
+            out.write_all(&frame)?;
+            out.flush()?;
+        }
+        Ok(())
+    }
+}
+
+fn page_output_file(file: &mut fs::File) -> Result<()> {
+    use std::io::{Seek, SeekFrom};
+    let mut index = PagerIndex::new(file)?;
     enable_raw_mode()?;
     let _terminal = PagerTerminal;
     execute!(io::stdout(), EnterAlternateScreen, cursor::Hide)?;
-    let mut page_offsets = vec![0];
-    let mut page = 0;
+    let mut offset = 0;
+    let mut notice = None;
+    let mut display = PagerDisplay::default();
     loop {
         let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
-        let mut input = BufReader::new(&mut file);
-        input.seek(SeekFrom::Start(page_offsets[page]))?;
-        execute!(io::stdout(), cursor::MoveTo(0, 0), Clear(ClearType::All))?;
-        for _ in 0..height.saturating_sub(1) {
+        let page_size = pager_page_size(height);
+        offset = offset.min(index.rows.saturating_sub(page_size));
+        let mut input = BufReader::new(&mut *file);
+        input.seek(SeekFrom::Start(index.offset(offset)?))?;
+        let mut visible = Vec::with_capacity(page_size);
+        for _ in 0..page_size {
             let mut line = String::new();
             if input.read_line(&mut line)? == 0 {
                 break;
             }
-            let visible = fit_status_line(line.trim_end_matches(['\r', '\n']), width);
-            print!("{visible}\r\n");
+            visible.push(line.trim_end_matches(['\r', '\n']).to_owned());
         }
-        let next = input.stream_position()?;
-        let end = next >= offset;
-        execute!(io::stdout(), cursor::MoveTo(0, height.saturating_sub(1)))?;
-        let label = format!(
-            "-- page {}{}; Space/PgDn next, PgUp previous, q exit --",
-            page + 1,
-            if end { " (end)" } else { "" }
-        );
-        print!(
-            "{}",
-            label
-                .chars()
-                .take(width.saturating_sub(1) as usize)
-                .collect::<String>()
-        );
-        io::stdout().flush()?;
+        let label = notice
+            .take()
+            .unwrap_or_else(|| pager_label(offset, index.rows));
+        display.draw(&mut io::stdout(), width, height, &visible, &label)?;
         if let Event::Key(key) = event::read()? {
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => break,
-                KeyCode::Char(' ') | KeyCode::PageDown | KeyCode::Down if !end => {
-                    page_offsets.truncate(page + 1);
-                    page_offsets.push(next);
-                    page += 1;
+            if let Some(action) = pager_action(key) {
+                match action {
+                    PagerAction::Quit => break,
+                    PagerAction::Visual => {
+                        notice = open_pager_visual(|copy| {
+                            file.seek(SeekFrom::Start(0))?;
+                            io::copy(file, copy).map(|_| ())
+                        })
+                        .err()
+                        .map(|error| error.to_string());
+                        display.invalidate();
+                    }
+                    action => offset = pager_offset(action, offset, index.rows, page_size),
                 }
-                KeyCode::PageUp | KeyCode::Up => page = page.saturating_sub(1),
-                _ => {}
             }
         }
     }
-    Ok(offset > 0)
+    Ok(())
 }
 
 /// Never let an in-place status wrap: clearing only the current line cannot
@@ -1107,6 +1362,75 @@ fn foreground_job(
     }
 }
 
+fn read_connection_password(target: &str) -> Result<Option<xfer::credentials::Password>> {
+    use std::io::IsTerminal;
+    if !io::stdin().is_terminal() {
+        anyhow::bail!("interactive password requires a terminal");
+    }
+    enable_raw_mode()?;
+    let _raw = RawInputGuard;
+    print!("Password for {}: ", target.escape_default());
+    io::stdout().flush()?;
+    let mut password = Zeroizing::new(String::new());
+    loop {
+        match event::read()? {
+            Event::Key(key) if key.kind != KeyEventKind::Release => match (key.code, key.modifiers)
+            {
+                (KeyCode::Enter, _) => {
+                    print!("\r\n");
+                    io::stdout().flush()?;
+                    return Ok(Some(xfer::credentials::Password::new(std::mem::take(
+                        &mut *password,
+                    ))));
+                }
+                (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                    print!("\r\nconnection cancelled\r\n");
+                    io::stdout().flush()?;
+                    return Ok(None);
+                }
+                (KeyCode::Backspace, _) => {
+                    password.pop();
+                }
+                (KeyCode::Char('u'), KeyModifiers::CONTROL) => password.zeroize(),
+                (KeyCode::Char(ch), modifiers)
+                    if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                        && !ch.is_control()
+                        && password.len() + ch.len_utf8() <= 16 * 1024 =>
+                {
+                    password.push(ch)
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+}
+
+fn send_connection_password(
+    stream: &mut UnixStream,
+    target: String,
+    password: xfer::credentials::Password,
+) -> Result<()> {
+    let credentials = xfer::credentials::PasswordConnect { target, password };
+    let json = Zeroizing::new(serde_json::to_string(&credentials)?);
+    stream.write_all(b"CONNECT_PASSWORD ")?;
+    stream.write_all(json.as_bytes())?;
+    stream.write_all(b"\n")?;
+    Ok(())
+}
+
+fn execute_local_shell(source: &str) {
+    if source.trim().is_empty() {
+        eprintln!("usage: !<bash command>");
+        return;
+    }
+    match xfer::local_shell::run(source) {
+        Ok(status) if status.success() => {}
+        Ok(status) => eprintln!("bash exited with {status}"),
+        Err(error) => eprintln!("cannot run local command: {error:#}"),
+    }
+}
+
 /// Shared execution path for rc lines and interactive commands.
 fn dispatch_attached_command(
     stream: &mut UnixStream,
@@ -1116,6 +1440,11 @@ fn dispatch_attached_command(
     typeahead: &mut Typeahead,
 ) -> Result<bool> {
     if command.trim().is_empty() {
+        return Ok(true);
+    }
+    if let Some(source) = command.strip_prefix('!') {
+        append_history(history_file, command);
+        execute_local_shell(source);
         return Ok(true);
     }
     let mut line = String::new();
@@ -1145,13 +1474,31 @@ fn dispatch_attached_command(
     stream.write_all(format!("COMMAND {command}\n").as_bytes())?;
     let mut foreground = None;
     let mut edit_bookmarks = None;
+    let mut password_sent = false;
+    let mut password_target: Option<String> = None;
     loop {
         line.clear();
         if reader.read_line(&mut line)? == 0 {
             anyhow::bail!("daemon disconnected");
         }
         if line.trim() == "DONE" {
+            if let Some(target) = password_target.take() {
+                if password_sent {
+                    anyhow::bail!("daemon requested a password twice");
+                }
+                typeahead.text.zeroize();
+                let Some(password) = read_connection_password(&target)? else {
+                    return Ok(true);
+                };
+                send_connection_password(stream, target, password)?;
+                password_sent = true;
+                continue;
+            }
             break;
+        }
+        if let Some(target) = line.strip_prefix("OUTPUT PASSWORD_REQUIRED ") {
+            password_target = Some(serde_json::from_str::<String>(target)?);
+            continue;
         }
         if let Some(id) = line
             .strip_prefix("OUTPUT JOB ")
@@ -1208,6 +1555,19 @@ fn read_startup_commands(path: &std::path::Path) -> Result<Vec<String>> {
         .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
         .map(str::to_owned)
         .collect())
+}
+
+fn report_startup_file(
+    stream: &mut UnixStream,
+    reader: &mut BufReader<UnixStream>,
+    path: &std::path::Path,
+) -> Result<()> {
+    stream.write_all(format!("STARTUP_FILE {}\n", serde_json::to_string(path)?).as_bytes())?;
+    let mut response = String::new();
+    if reader.read_line(&mut response)? == 0 || response.trim() != "STARTUP_FILE_OK" {
+        anyhow::bail!("cannot report startup file: {}", response.trim());
+    }
+    Ok(())
 }
 
 fn session_prompt(info: &xfer::core::SessionInfo) -> String {
@@ -1299,7 +1659,12 @@ fn attach(args: &[String]) -> Result<()> {
     match line.trim() {
         "RUN_STARTUP" => {
             if let Some(home) = std::env::var_os("HOME") {
-                for command in read_startup_commands(&PathBuf::from(home).join(".xferrc"))? {
+                let path = std::path::absolute(PathBuf::from(home).join(".xferrc"))?;
+                let commands = read_startup_commands(&path)?;
+                if !commands.is_empty() {
+                    report_startup_file(&mut stream, &mut reader, &path)?;
+                }
+                for command in commands {
                     // Configuration commands are not interactive history entries.
                     if !dispatch_attached_command(
                         &mut stream,
@@ -1361,6 +1726,9 @@ fn start_daemon_and_attach() -> Result<()> {
     let daemon = executable;
     let child = Command::new(&daemon)
         .arg("--daemon")
+        // Local shell commands share the client's foreground group, but Ctrl-C
+        // there must never signal the session daemon or its background jobs.
+        .process_group(0)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -1385,6 +1753,9 @@ fn start_daemon_and_attach() -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
+    if std::env::var_os(xfer::ssh_askpass::SOCKET_ENV).is_some() {
+        return xfer::ssh_askpass::run(args.get(1).map(String::as_str).unwrap_or(""));
+    }
     if args.get(1).map(String::as_str) == Some("--daemon") {
         return xfer::daemon_server::run().await;
     }
@@ -1531,32 +1902,31 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         },
         UiMode::Pager { lines, mut offset } => {
             let (_, height) = crossterm::terminal::size().unwrap_or((80, 24));
-            let page = height.saturating_sub(1) as usize;
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => leave_pager(app),
-                KeyCode::Down => {
-                    offset = (offset + 1).min(lines.len().saturating_sub(1));
-                    app.mode = UiMode::Pager { lines, offset };
-                    if let UiMode::Pager { lines, offset } = &app.mode {
-                        draw_pager(lines, *offset);
-                    }
-                }
-                KeyCode::Up => {
-                    offset = offset.saturating_sub(1);
-                    app.mode = UiMode::Pager { lines, offset };
-                    if let UiMode::Pager { lines, offset } = &app.mode {
-                        draw_pager(lines, *offset);
-                    }
-                }
-                KeyCode::PageDown | KeyCode::Char(' ') => {
-                    offset = (offset + page).min(lines.len().saturating_sub(1));
-                    app.mode = UiMode::Pager { lines, offset };
-                    if let UiMode::Pager { lines, offset } = &app.mode {
-                        draw_pager(lines, *offset);
-                    }
-                }
-                _ => {}
+            let Some(action) = pager_action(key) else {
+                return;
+            };
+            if action == PagerAction::Quit {
+                leave_pager(app);
+                return;
             }
+            let notice = if action == PagerAction::Visual {
+                open_pager_visual(|copy| {
+                    for line in &lines {
+                        writeln!(copy, "{line}")?;
+                    }
+                    Ok(())
+                })
+                .err()
+                .map(|error| error.to_string())
+            } else {
+                offset = pager_offset(action, offset, lines.len(), pager_page_size(height));
+                None
+            };
+            if action == PagerAction::Visual {
+                app.pager_display.invalidate();
+            }
+            draw_pager(&lines, offset, notice.as_deref(), &mut app.pager_display);
+            app.mode = UiMode::Pager { lines, offset };
         }
         UiMode::Jobs => {}
         UiMode::Command => match key.code {
@@ -1616,6 +1986,173 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 mod startup_tests {
     use super::*;
     #[test]
+    fn pager_repaints_changed_rows_without_clearing_or_newlines() {
+        let mut display = PagerDisplay::default();
+        let lines = vec!["long old line".into(), "unchanged".into()];
+        let first = String::from_utf8(display.update(80, 4, &lines, "footer").unwrap()).unwrap();
+        assert!(first.starts_with("\x1b[?2026h"));
+        assert!(first.ends_with("\x1b[?2026l"));
+        assert!(!first.contains("\x1b[2J"));
+        assert!(!first.contains(['\r', '\n']));
+        assert!(display.update(80, 4, &lines, "footer").unwrap().is_empty());
+
+        let lines = vec!["short".into(), "unchanged".into()];
+        let changed = String::from_utf8(display.update(80, 4, &lines, "footer").unwrap()).unwrap();
+        assert_eq!(changed, "\x1b[?2026h\x1b[1;1Hshort\x1b[K\x1b[?2026l");
+        let removed = String::from_utf8(display.update(80, 4, &[], "footer").unwrap()).unwrap();
+        assert!(removed.contains("\x1b[1;1H\x1b[K"));
+        assert!(removed.contains("\x1b[2;1H\x1b[K"));
+        assert!(!removed.contains("footer"));
+    }
+
+    #[test]
+    fn pager_repaints_after_resize_or_editor_return() {
+        let mut display = PagerDisplay::default();
+        let lines = vec!["same content".into()];
+        let first = display.update(80, 3, &lines, "footer").unwrap();
+        assert!(display.update(80, 3, &lines, "footer").unwrap().is_empty());
+        display.invalidate();
+        assert_eq!(display.update(80, 3, &lines, "footer").unwrap(), first);
+        assert!(!display.update(40, 3, &lines, "footer").unwrap().is_empty());
+        assert!(!display.update(40, 4, &lines, "footer").unwrap().is_empty());
+    }
+
+    #[test]
+    fn pager_sends_one_write_and_flush_per_changed_frame() {
+        #[derive(Default)]
+        struct Output {
+            writes: usize,
+            flushes: usize,
+        }
+        impl Write for Output {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.writes += 1;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.flushes += 1;
+                Ok(())
+            }
+        }
+        let mut out = Output::default();
+        let mut display = PagerDisplay::default();
+        display
+            .draw(&mut out, 80, 3, &["line".into()], "footer")
+            .unwrap();
+        assert_eq!((out.writes, out.flushes), (1, 1));
+        display
+            .draw(&mut out, 80, 3, &["line".into()], "footer")
+            .unwrap();
+        assert_eq!((out.writes, out.flushes), (1, 1));
+    }
+
+    #[test]
+    fn pager_keys_cover_line_page_boundary_and_visual_actions() {
+        use PagerAction::*;
+        for (code, modifiers, expected) in [
+            (KeyCode::Char('j'), KeyModifiers::NONE, Down),
+            (KeyCode::Down, KeyModifiers::NONE, Down),
+            (KeyCode::Char('k'), KeyModifiers::NONE, Up),
+            (KeyCode::Up, KeyModifiers::NONE, Up),
+            (KeyCode::Char('f'), KeyModifiers::CONTROL, PageDown),
+            (KeyCode::Char('b'), KeyModifiers::CONTROL, PageUp),
+            (KeyCode::PageDown, KeyModifiers::NONE, PageDown),
+            (KeyCode::PageUp, KeyModifiers::NONE, PageUp),
+            (KeyCode::Char(' '), KeyModifiers::NONE, PageDown),
+            (KeyCode::Home, KeyModifiers::NONE, Home),
+            (KeyCode::End, KeyModifiers::NONE, End),
+            (KeyCode::Char('|'), KeyModifiers::SHIFT, Visual),
+            (KeyCode::Char('q'), KeyModifiers::NONE, Quit),
+            (KeyCode::Esc, KeyModifiers::NONE, Quit),
+        ] {
+            assert_eq!(pager_action(KeyEvent::new(code, modifiers)), Some(expected));
+        }
+        assert_eq!(
+            pager_action(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::ALT)),
+            None
+        );
+        let release =
+            KeyEvent::new_with_kind(KeyCode::Down, KeyModifiers::NONE, KeyEventKind::Release);
+        assert_eq!(pager_action(release), None);
+    }
+
+    #[test]
+    fn pager_navigation_is_line_based_clamped_and_resize_safe() {
+        use PagerAction::*;
+        assert_eq!(pager_offset(Down, 0, 100, 10), 1);
+        assert_eq!(pager_offset(Up, 1, 100, 10), 0);
+        assert_eq!(pager_offset(PageDown, 1, 100, 10), 11);
+        assert_eq!(pager_offset(PageUp, 11, 100, 10), 1);
+        assert_eq!(pager_offset(End, 0, 100, 10), 90);
+        assert_eq!(pager_offset(Down, 90, 100, 10), 90);
+        assert_eq!(pager_offset(PageDown, 85, 100, 10), 90);
+        assert_eq!(pager_offset(Home, 90, 100, 10), 0);
+        assert_eq!(pager_offset(Up, 0, 100, 10), 0);
+        assert_eq!(pager_offset(PageUp, 1, 100, 10), 0);
+        assert_eq!(pager_offset(Visual, 90, 100, 20), 80);
+        for rows in [0, 1, 5] {
+            assert_eq!(pager_offset(End, 0, rows, 10), 0);
+        }
+        assert_eq!(pager_page_size(0), 1);
+        assert_eq!(pager_page_size(24), 23);
+    }
+
+    #[test]
+    fn pager_disk_index_handles_empty_unterminated_and_chunk_boundary_lines() {
+        use std::io::{Read, Seek, SeekFrom};
+        for text in ["", "one", "one\n", "\none\n\ntwo", "α\nβ\n"] {
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(text.as_bytes()).unwrap();
+            let mut index = PagerIndex::new(&mut file).unwrap();
+            let expected = text.split_inclusive('\n').collect::<Vec<_>>();
+            assert_eq!(index.rows, expected.len());
+            for (row, line) in expected.iter().enumerate() {
+                file.seek(SeekFrom::Start(index.offset(row).unwrap()))
+                    .unwrap();
+                let mut actual = vec![0; line.len()];
+                file.read_exact(&mut actual).unwrap();
+                assert_eq!(actual, line.as_bytes());
+            }
+        }
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&vec![b'x'; 64 * 1024 - 1]).unwrap();
+        file.write_all(b"\nlast\n").unwrap();
+        let mut index = PagerIndex::new(&mut file).unwrap();
+        assert_eq!(index.rows, 2);
+        assert_eq!(index.offset(1).unwrap(), 64 * 1024);
+    }
+
+    #[test]
+    fn visual_receives_a_private_full_output_copy_and_quoted_arguments() {
+        use std::os::unix::fs::PermissionsExt;
+        let original = b"first\nsecond\nlast without newline";
+        let copy = pager_output_copy(|file| file.write_all(original)).unwrap();
+        let path = copy.path().to_owned();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(fs::read(&path).unwrap(), original);
+        let command =
+            visual_command("'editor with spaces' --flag 'arg with spaces'", &path).unwrap();
+        assert_eq!(command.get_program(), "editor with spaces");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![
+                std::ffi::OsStr::new("--flag"),
+                std::ffi::OsStr::new("arg with spaces"),
+                path.as_os_str(),
+            ]
+        );
+        assert!(visual_command("'unterminated", &path).is_err());
+        assert!(visual_command(" ", &path).is_err());
+        fs::write(&path, "edited").unwrap();
+        assert_eq!(original, b"first\nsecond\nlast without newline");
+        drop(copy);
+        assert!(!path.exists());
+    }
+
+    #[test]
     fn foreground_retry_errors_are_logged_once_per_attempt() {
         let mut display = ForegroundDisplay::default();
         let status = format!(
@@ -1662,6 +2199,24 @@ mod startup_tests {
         fs::remove_file(&path).unwrap();
         assert!(read_startup_commands(&path).unwrap().is_empty());
     }
+    #[test]
+    fn startup_file_is_reported_with_json_escaping_and_acknowledged() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let path = PathBuf::from("/tmp/home with spaces/\"quoted\"/.xferrc");
+        let expected = path.clone();
+        let server = std::thread::spawn(move || {
+            let mut reader = BufReader::new(server);
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            let json = request.strip_prefix("STARTUP_FILE ").unwrap();
+            assert_eq!(serde_json::from_str::<PathBuf>(json).unwrap(), expected);
+            reader.get_mut().write_all(b"STARTUP_FILE_OK\n").unwrap();
+        });
+        report_startup_file(&mut client, &mut reader, &path).unwrap();
+        server.join().unwrap();
+    }
+
     fn typed(code: KeyCode, modifiers: KeyModifiers) -> Event {
         Event::Key(KeyEvent::new(code, modifiers))
     }
@@ -1963,6 +2518,38 @@ mod startup_tests {
     }
 
     #[test]
+    fn shell_escapes_are_local_and_record_the_original_command_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let history = directory.path().join("history");
+        let result = directory.path().join("result with spaces");
+        let command = format!(
+            "!printf '%s' 'some thing' | grep 'some thing' > {}",
+            shlex::try_quote(result.to_str().unwrap()).unwrap()
+        );
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        assert!(dispatch_attached_command(
+            &mut client,
+            &mut reader,
+            &command,
+            history.to_str(),
+            &mut Typeahead::default(),
+        )
+        .unwrap());
+        assert_eq!(fs::read_to_string(&result).unwrap(), "some thing\n");
+        assert_eq!(fs::read_to_string(history).unwrap(), format!("{command}\n"));
+        // No IPC request or daemon job for a local shell command.
+        server.set_nonblocking(true).unwrap();
+        let mut byte = [0];
+        assert_eq!(
+            std::io::Read::read(&mut server, &mut byte)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
     fn empty_command_does_not_send_anything_to_daemon() {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         let mut reader = BufReader::new(client.try_clone().unwrap());
@@ -1980,6 +2567,32 @@ mod startup_tests {
         let mut byte = [0];
         let error = std::io::Read::read(&mut server, &mut byte).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn passwords_use_a_separate_json_request_not_command_text() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            let mut reader = BufReader::new(server);
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            let json = request.strip_prefix("CONNECT_PASSWORD ").unwrap();
+            let credentials: xfer::credentials::PasswordConnect =
+                serde_json::from_str(json).unwrap();
+            assert_eq!(credentials.target, "server with spaces");
+            assert_eq!(
+                credentials.password.expose(),
+                "secret \"quotes\" \\ slashes"
+            );
+            assert_eq!(request.lines().count(), 1);
+        });
+        send_connection_password(
+            &mut client,
+            "server with spaces".into(),
+            xfer::credentials::Password::new("secret \"quotes\" \\ slashes".into()),
+        )
+        .unwrap();
+        worker.join().unwrap();
     }
 
     #[test]

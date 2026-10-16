@@ -314,6 +314,8 @@ mod tests {
 
     fn directory(name: &str) -> Content {
         Content::Directory(DirectoryInfo {
+            unix: None,
+            size: None,
             name: name.into(),
             modified: None,
         })
@@ -379,6 +381,7 @@ mod tests {
                 created: None,
             }),
             Content::File(FileInfo {
+                unix: None,
                 name: "photos.txt".into(),
                 size: Some(1),
                 modified: None,

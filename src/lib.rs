@@ -2,6 +2,16 @@
 
 use std::{io, path::PathBuf};
 
+/// Per-user directory shared by settings and bookmarks.
+pub fn config_dir() -> PathBuf {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("xfer")
+}
+
 /// Private, per-user runtime directory used for daemon sockets and discovery files.
 pub fn runtime_dir() -> io::Result<PathBuf> {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
@@ -65,7 +75,12 @@ pub fn instances() -> std::io::Result<Vec<Instance>> {
 pub mod backend;
 pub mod bookmarks;
 pub mod cache;
+pub mod credentials;
 pub mod daemon_server;
 pub mod error;
 pub mod listing;
+pub mod local_shell;
+pub mod s3;
+pub mod sftp;
+pub mod ssh_askpass;
 pub mod transfer;

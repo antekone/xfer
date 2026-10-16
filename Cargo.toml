@@ -9,7 +9,7 @@ default-run = "xfer"
 [dependencies]
 anyhow = "1"
 crossterm = "0.28"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "process", "io-util", "net"] }
 tokio-util = "0.7"
 async-trait = "0.1"
 aws-config = "1"
@@ -28,6 +28,11 @@ tower-service = "0.3"
 unicode-width = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["std", "serde"] }
 libc = "0.2"
+openssh-sftp-client = "0.15.10"
+futures-util = "0.3"
+percent-encoding = "2"
+tempfile = "3"
+zeroize = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

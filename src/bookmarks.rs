@@ -25,6 +25,8 @@ pub struct Bookmark {
     pub api: Option<String>,
     pub override_host: Option<String>,
     pub override_port: Option<u16>,
+    #[serde(default)]
+    pub password_interactive: bool,
 }
 
 impl Bookmark {
@@ -50,11 +52,7 @@ impl Bookmark {
 }
 
 pub fn default_path() -> PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("xfer/bookmarks.toml")
+    crate::config_dir().join("bookmarks.toml")
 }
 
 pub fn load(path: &Path) -> Result<BTreeMap<String, Bookmark>> {
@@ -71,6 +69,9 @@ pub fn load(path: &Path) -> Result<BTreeMap<String, Bookmark>> {
         )
     })?;
     for (name, entry) in &entries {
+        if entry.password_interactive && entry.protocol != "sftp" {
+            bail!("bookmark {name}: password_interactive is only supported for sftp");
+        }
         if entry.access_key.is_some() != entry.secret_key.is_some() {
             bail!("bookmark {name}: accessKey and secretKey must be provided together");
         }
@@ -116,6 +117,15 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
         assert!(load(&path).unwrap().contains_key("minio"));
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn interactive_password_is_opt_in() {
+        let values: BTreeMap<String, Bookmark> = toml::from_str(
+            "[server]\ntype = 'sftp'\nurl = 'sftp://user@host'\npassword_interactive = true\n[agent]\ntype = 'sftp'\nurl = 'sftp://alias'\n",
+        ).unwrap();
+        assert!(values["server"].password_interactive);
+        assert!(!values["agent"].password_interactive);
     }
 
     #[test]
