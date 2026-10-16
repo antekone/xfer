@@ -56,12 +56,20 @@ pub struct OutputStore {
     bytes: u64,
 }
 impl OutputStore {
-    fn new(id: JobId) -> Self {
+    pub(crate) fn new(id: JobId) -> Self {
         let base = std::env::var_os("XDG_CACHE_HOME")
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
             .unwrap_or_else(|| PathBuf::from("."));
-        let path = base.join("xfer/jobs").join(format!("{id}.log"));
+        // Job IDs are local to a daemon; separate instances must never overwrite each other's output.
+        let path = base
+            .join("xfer/jobs")
+            .join(std::process::id().to_string())
+            .join(format!("{id}-{}.log", {
+                static NEXT_SPOOL: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(1);
+                NEXT_SPOOL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            }));
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
@@ -78,6 +86,35 @@ impl OutputStore {
                 self.bytes += line.len() as u64 + 1;
             }
         }
+    }
+    fn reset(&mut self) -> Result<()> {
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&self.path)?;
+        self.bytes = 0;
+        Ok(())
+    }
+    pub fn write_line(&mut self, line: &str) -> Result<()> {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        writeln!(file, "{line}")?;
+        self.bytes += line.len() as u64 + 1;
+        Ok(())
+    }
+    pub fn read_bytes(&self, offset: u64) -> Result<Vec<u8>> {
+        let mut file = match OpenOptions::new().read(true).open(&self.path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        file.seek(SeekFrom::Start(offset))?;
+        let mut bytes = Vec::new();
+        file.take(64 * 1024).read_to_end(&mut bytes)?;
+        Ok(bytes)
     }
     pub fn read_chunk(&self, offset: u64, limit: usize) -> (u64, String) {
         let mut data = vec![0; limit.min(64 * 1024)];
@@ -140,6 +177,104 @@ impl JobManager {
             tx,
             rx,
         }
+    }
+
+    pub fn start_operation<F>(&mut self, title: String, operation: F) -> JobId
+    where
+        F: std::future::Future<Output = Result<String>> + Send + 'static,
+    {
+        self.start_output_operation(title, move |_| operation)
+    }
+
+    pub fn start_output_operation<F, Fut>(&mut self, title: String, operation: F) -> JobId
+    where
+        F: FnOnce(OutputStore) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<String>> + Send + 'static,
+    {
+        self.start_task(title, move |output, _| operation(output))
+    }
+
+    /// Replayable, read-only operations. Partial attempt output is discarded so
+    /// retrying a paginated listing never duplicates already written entries.
+    pub fn start_retrying_operation<F, Fut>(&mut self, title: String, mut operation: F) -> JobId
+    where
+        F: FnMut(OutputStore) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<String>> + Send + 'static,
+    {
+        self.start_task(title, move |mut output, progress| async move {
+            let mut delay = Duration::from_secs(3);
+            let mut attempt = 1u64;
+            loop {
+                let _ = progress.send(Progress::Indeterminate {
+                    message: format!("attempt {attempt}: working"),
+                });
+                match operation(output.clone()).await {
+                    Ok(message) => return Ok(message),
+                    Err(error) => {
+                        let _ = progress.send(Progress::Indeterminate {
+                            message: format!(
+                                "attempt {attempt} failed: {error}; retrying in {}s",
+                                delay.as_secs()
+                            ),
+                        });
+                        // Do not accumulate failure logs indefinitely in memory or on disk.
+                        output.reset()?;
+                        time::sleep(delay).await;
+                        delay = (delay * 2).min(Duration::from_secs(30));
+                        attempt = attempt.saturating_add(1);
+                    }
+                }
+            }
+        })
+    }
+
+    fn start_task<F, Fut>(&mut self, title: String, operation: F) -> JobId
+    where
+        F: FnOnce(OutputStore, watch::Sender<Progress>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<String>> + Send + 'static,
+    {
+        let id = self.next_id;
+        self.next_id += 1;
+        let output = OutputStore::new(id);
+        let task_output = output.clone();
+        let (progress_tx, progress) = watch::channel(Progress::Indeterminate {
+            message: "working".into(),
+        });
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let events = self.tx.clone();
+        let handle = tokio::spawn(async move {
+            let operation = operation(task_output, progress_tx.clone());
+            let (state, message) = tokio::select! {
+                biased;
+                _ = task_cancel.cancelled() => (JobState::Cancelled, "operation cancelled".to_owned()),
+                result = operation => match result { Ok(message) => (JobState::Completed, message), Err(error) => (JobState::Failed, error.to_string()) },
+            };
+            let _ = progress_tx.send(Progress::Indeterminate {
+                message: message.clone(),
+            });
+            let _ = events.send(JobEvent {
+                id,
+                event: JobEventKind::Output(message),
+            });
+            let _ = events.send(JobEvent {
+                id,
+                event: JobEventKind::Finished(state),
+            });
+        });
+        self.jobs.insert(
+            id,
+            Job {
+                id,
+                title,
+                state: JobState::Running,
+                cancel,
+                progress,
+                output,
+                _handle: handle,
+            },
+        );
+        id
     }
 
     pub fn start_demo(&mut self, title: String, known_total: bool) -> JobId {
@@ -254,11 +389,13 @@ impl SettingValue {
         }
     }
 }
+#[derive(Clone)]
 pub struct Setting {
     pub default: SettingValue,
     pub value: SettingValue,
     pub doc: &'static str,
 }
+#[derive(Clone)]
 pub struct Settings {
     pub values: HashMap<String, Setting>,
 }
@@ -274,9 +411,12 @@ impl Settings {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let (name, value) = line.rsplit_once(':').ok_or_else(|| {
-                anyhow::anyhow!("{}:{}: expected `name: value`", path.display(), line_no + 1)
-            })?;
+            let (name, value) = line
+                .split_once(": ")
+                .or_else(|| line.rsplit_once(':'))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("{}:{}: expected `name: value`", path.display(), line_no + 1)
+                })?;
             self.set(name.trim(), value.trim())
                 .map_err(|e| anyhow::anyhow!("{}:{}: {e}", path.display(), line_no + 1))?;
         }
@@ -322,56 +462,15 @@ impl Settings {
         Ok(())
     }
 }
-pub trait Backend {
-    fn register_settings(&self, settings: &mut Settings);
-    fn initialize(&self, _settings: &Settings) -> Result<()>;
-}
-pub struct Sftp;
-pub struct S3;
-pub struct Smb;
-impl Backend for Sftp {
-    fn register_settings(&self, s: &mut Settings) {
-        s.register(
-            "sftp:connect-timeout",
-            SettingValue::Int(30),
-            "SFTP connection timeout (seconds)",
-        );
-    }
-    fn initialize(&self, _: &Settings) -> Result<()> {
-        Ok(())
-    }
-}
-impl Backend for S3 {
-    fn register_settings(&self, s: &mut Settings) {
-        s.register(
-            "s3:region",
-            SettingValue::Text("us-east-1".into()),
-            "Default S3 region",
-        );
-    }
-    fn initialize(&self, _: &Settings) -> Result<()> {
-        Ok(())
-    }
-}
-impl Backend for Smb {
-    fn register_settings(&self, s: &mut Settings) {
-        s.register(
-            "smb:max-credits",
-            SettingValue::Int(32),
-            "Maximum SMB credits",
-        );
-    }
-    fn initialize(&self, _: &Settings) -> Result<()> {
-        Ok(())
-    }
-}
+pub use crate::backend::{Backend, Sftp, Smb, S3};
 
 /// Authoritative daemon state. Clients interact with it through IPC and do not
 /// own jobs, connections, or backend configuration.
 pub struct Daemon {
     pub settings: Settings,
     pub jobs: JobManager,
-    _backends: Vec<Box<dyn Backend + Send + Sync>>,
+    backends: HashMap<String, std::sync::Arc<dyn Backend>>,
+    connection: std::sync::Arc<tokio::sync::Mutex<Option<Box<dyn crate::backend::Connection>>>>,
 }
 
 impl Daemon {
@@ -387,10 +486,23 @@ impl Daemon {
             SettingValue::Text(default_history_path()),
             "Client history path; session or /dev/null disables persistence",
         );
-        let backends: Vec<Box<dyn Backend + Send + Sync>> =
-            vec![Box::new(Sftp), Box::new(S3), Box::new(Smb)];
+        let backends: Vec<Box<dyn Backend>> = vec![Box::new(Sftp), Box::new(S3), Box::new(Smb)];
         for backend in &backends {
             backend.register_settings(&mut settings);
+        }
+        settings.register(
+            "bookmarks:file",
+            SettingValue::Text(crate::bookmarks::default_path().display().to_string()),
+            "TOML bookmarks file",
+        );
+        settings.register(
+            "ui:auto-pager",
+            SettingValue::Bool(true),
+            "Use pager for long output",
+        );
+        settings.load_file(std::path::Path::new("xfer.conf"))?;
+        if let Some(path) = std::env::var_os("XFER_CONFIG") {
+            settings.load_file(std::path::Path::new(&path))?;
         }
         for backend in &backends {
             backend.initialize(&settings)?;
@@ -398,7 +510,16 @@ impl Daemon {
         Ok(Self {
             settings,
             jobs: JobManager::new(),
-            _backends: backends,
+            backends: backends
+                .into_iter()
+                .map(|backend| {
+                    (
+                        backend.protocol().to_owned(),
+                        std::sync::Arc::<dyn Backend>::from(backend as Box<dyn Backend>),
+                    )
+                })
+                .collect(),
+            connection: Default::default(),
         })
     }
 
@@ -411,15 +532,64 @@ impl Daemon {
             .any(|job| job.state == JobState::Running)
     }
 
+    fn connect(&mut self, target: &str) -> Result<JobId> {
+        let bookmark = if target.contains("://") {
+            None
+        } else {
+            Some(
+                crate::bookmarks::load(std::path::Path::new(
+                    self.settings.text("bookmarks:file").unwrap(),
+                ))?
+                .remove(target)
+                .ok_or_else(|| anyhow::anyhow!("unknown bookmark: {target}"))?,
+            )
+        };
+        let token = bookmark
+            .as_ref()
+            .map(|value| value.protocol.as_str())
+            .or_else(|| target.split_once("://").map(|(token, _)| token))
+            .unwrap_or("");
+        let backend = self
+            .backends
+            .get(token)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no backend for protocol: {token}"))?;
+        let options = crate::backend::ConnectOptions {
+            target: target.to_owned(),
+            bookmark,
+            settings: self.settings.clone(),
+        };
+        let connection = self.connection.clone();
+        Ok(self
+            .jobs
+            .start_retrying_operation(format!("connect {target}"), move |_| {
+                let connection = connection.clone();
+                let backend = backend.clone();
+                let options = options.clone();
+                async move {
+                    // Serialize changes per attempt; the lock is released during backoff.
+                    let mut active = connection.lock().await;
+                    let new = backend.connect(options).await?;
+                    let message = format!("connected {}", new.protocol());
+                    *active = Some(new);
+                    Ok(message)
+                }
+            }))
+    }
+
     pub fn command(&mut self, line: &str) -> Vec<String> {
         self.jobs.poll();
         let mut words = line.split_whitespace();
         match words.next() {
             Some("help") => vec![
                 "Commands:".into(),
-                "  connect <url>       connect (demo job)".into(),
-                "  get <path>          transfer (demo job)".into(),
-                "  mirror <path>       mirror (demo job)".into(),
+                "  connect <url|name>  connect using a protocol or bookmark".into(),
+                "  open <url|name>     alias for connect".into(),
+                "  disconnect          release active backend connection".into(),
+                "  close               alias for disconnect".into(),
+                "  ls [prefix]         list buckets or selected bucket contents".into(),
+                "  bookmark            list bookmark aliases, URLs and buckets".into(),
+                "  bookmark edit       edit TOML bookmarks using VISUAL/EDITOR".into(),
                 "  jobs                list daemon jobs".into(),
                 "  cancel <job-id>     cancel a job".into(),
                 "  show [setting]      show daemon settings".into(),
@@ -427,10 +597,94 @@ impl Daemon {
                 "  detach              detach this client".into(),
                 "  exit                detach; daemon remains only while jobs run".into(),
             ],
-            Some("connect" | "get" | "mirror") => {
-                let command = line.split_whitespace().next().unwrap();
-                let id = self.jobs.start_demo(line.to_owned(), command != "connect");
+            Some("bookmark") => match words.next() {
+                None => match crate::bookmarks::load(std::path::Path::new(
+                    self.settings.text("bookmarks:file").unwrap(),
+                )) {
+                    Ok(entries) if entries.is_empty() => vec!["no bookmarks".into()],
+                    Ok(entries) => entries
+                        .into_iter()
+                        .map(|(alias, bookmark)| bookmark.summary(&alias))
+                        .collect(),
+                    Err(error) => vec![error.to_string()],
+                },
+                Some("edit") => {
+                    let path = std::path::Path::new(self.settings.text("bookmarks:file").unwrap());
+                    match crate::bookmarks::prepare_for_editor(path) {
+                        Ok(()) => vec![format!("BOOKMARK_EDIT {}", path.display())],
+                        Err(error) => vec![format!("cannot prepare bookmarks: {error}")],
+                    }
+                }
+                Some("reload") => match crate::bookmarks::load(std::path::Path::new(
+                    self.settings.text("bookmarks:file").unwrap(),
+                )) {
+                    Ok(_) => vec!["bookmarks validated; connections use the latest file".into()],
+                    Err(error) => vec![error.to_string()],
+                },
+                _ => vec!["usage: bookmark [edit | reload]".into()],
+            },
+            Some("connect" | "open") => match words.next() {
+                Some(target) => match self.connect(target) {
+                    Ok(id) => vec![format!("JOB {id}")],
+                    Err(error) => vec![error.to_string()],
+                },
+                None => vec!["usage: connect <protocol://target | bookmark>".into()],
+            },
+            Some("ls") => {
+                let path = words.next().unwrap_or("").to_owned();
+                if words.next().is_some() {
+                    return vec!["usage: ls [prefix]".into()];
+                }
+                let connection = self.connection.clone();
+                let id =
+                    self.jobs
+                        .start_retrying_operation(format!("ls {path}"), move |mut output| {
+                            let connection = connection.clone();
+                            let path = path.clone();
+                            async move {
+                                let active = connection.lock().await;
+                                let active = active.as_ref().ok_or_else(|| {
+                                    anyhow::anyhow!("not connected; use connect first")
+                                })?;
+                                let count = active.list(&path, &mut output).await?;
+                                Ok(format!("listed {count} entries"))
+                            }
+                        });
                 vec![format!("JOB {id}")]
+            }
+            Some("disconnect" | "close") => {
+                let connection = self.connection.clone();
+                let id = self.jobs.start_operation("disconnect".into(), async move {
+                    let previous = connection.lock().await.take();
+                    match previous {
+                        Some(value) => {
+                            let token = value.protocol();
+                            value.disconnect().await?;
+                            Ok(format!("disconnected {token}"))
+                        }
+                        None => Ok("not connected".into()),
+                    }
+                });
+                vec![format!("JOB {id}")]
+            }
+            Some("get" | "mirror") => vec!["file transfers are not implemented yet".into()],
+            Some("read-output") => {
+                let id = words.next().and_then(|value| value.parse().ok());
+                let offset = words
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0);
+                match id.and_then(|id| self.jobs.jobs.get(&id)) {
+                    Some(job) => match job.output.read_bytes(offset) {
+                        Ok(bytes) => vec![format!(
+                            "CHUNK {} {}",
+                            offset + bytes.len() as u64,
+                            serde_json::to_string(&bytes).unwrap()
+                        )],
+                        Err(error) => vec![format!("cannot read job output: {error}")],
+                    },
+                    None => vec!["no such job".into()],
+                }
             }
             Some("output") => {
                 let id = words.next().and_then(|value| value.parse().ok());
@@ -448,6 +702,26 @@ impl Daemon {
                     None => vec!["no such job".into()],
                 }
             }
+            Some("ack-output") => match words.next().and_then(|value| value.parse().ok()) {
+                Some(id) => match self.jobs.jobs.get(&id) {
+                    Some(job) if job.state == JobState::Running => {
+                        vec!["cannot acknowledge output of a running job".into()]
+                    }
+                    Some(job) => match fs::remove_file(job.output.path()) {
+                        Ok(()) => {
+                            self.jobs.jobs.remove(&id);
+                            vec!["output acknowledged".into()]
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            self.jobs.jobs.remove(&id);
+                            vec!["output acknowledged".into()]
+                        }
+                        Err(error) => vec![format!("cannot remove output spool: {error}")],
+                    },
+                    None => vec!["no such job".into()],
+                },
+                None => vec!["usage: ack-output <job-id>".into()],
+            },
             Some("status") => match words
                 .next()
                 .and_then(|value| value.parse().ok())
@@ -511,5 +785,181 @@ impl Daemon {
             },
             _ => vec!["unknown daemon command".into()],
         }
+    }
+}
+
+#[cfg(test)]
+mod backend_tests {
+    use super::*;
+    use crate::backend::{ConnectOptions, Connection};
+    use async_trait::async_trait;
+
+    struct FakeBackend;
+    struct FakeConnection;
+    #[async_trait]
+    impl Connection for FakeConnection {
+        fn protocol(&self) -> &'static str {
+            "fake"
+        }
+    }
+    #[async_trait]
+    impl Backend for FakeBackend {
+        fn protocol(&self) -> &'static str {
+            "fake"
+        }
+        fn register_settings(&self, _: &mut Settings) {}
+        async fn connect(&self, _: ConnectOptions) -> Result<Box<dyn Connection>> {
+            Ok(Box::new(FakeConnection))
+        }
+    }
+    async fn finish(daemon: &mut Daemon) {
+        for _ in 0..100 {
+            if !daemon.has_running_jobs() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("job failed to finish");
+    }
+    #[tokio::test(start_paused = true)]
+    async fn retry_backoff_caps_at_30_seconds_and_cancels_during_wait() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let mut jobs = JobManager::new();
+        let count = Arc::new(AtomicUsize::new(0));
+        let attempts = count.clone();
+        let id = jobs.start_retrying_operation("retry".into(), move |_| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async { anyhow::bail!("offline") }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        for delay in [3, 6, 12, 24, 30, 30] {
+            let previous = count.load(Ordering::SeqCst);
+            time::advance(Duration::from_secs(delay - 1)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(count.load(Ordering::SeqCst), previous);
+            time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(count.load(Ordering::SeqCst), previous + 1);
+        }
+        jobs.cancel(id);
+        tokio::task::yield_now().await;
+        jobs.poll();
+        assert_eq!(jobs.jobs[&id].state, JobState::Cancelled);
+        let previous = count.load(Ordering::SeqCst);
+        time::advance(Duration::from_secs(120)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(count.load(Ordering::SeqCst), previous);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_discards_partial_listing_output_before_success() {
+        let mut jobs = JobManager::new();
+        let mut attempt = 0;
+        let id = jobs.start_retrying_operation("ls".into(), move |mut output| {
+            attempt += 1;
+            let current = attempt;
+            async move {
+                if current == 1 {
+                    output.write_line("partial listing")?;
+                    anyhow::bail!("interrupted");
+                }
+                output.write_line("complete listing")?;
+                Ok("done".to_owned())
+            }
+        });
+        tokio::task::yield_now().await;
+        time::advance(Duration::from_secs(3)).await;
+        tokio::task::yield_now().await;
+        jobs.poll();
+        assert_eq!(jobs.jobs[&id].state, JobState::Completed);
+        assert_eq!(
+            jobs.jobs[&id].output.read_all(),
+            vec!["complete listing", "done"]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_in_flight_retry_operation_is_immediate() {
+        let mut jobs = JobManager::new();
+        let id = jobs.start_retrying_operation("blocked".into(), |_| async {
+            std::future::pending::<Result<String>>().await
+        });
+        tokio::task::yield_now().await;
+        jobs.cancel(id);
+        tokio::task::yield_now().await;
+        jobs.poll();
+        assert_eq!(jobs.jobs[&id].state, JobState::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn acknowledging_failed_output_removes_job_and_spool() {
+        let mut daemon = Daemon::bootstrap().unwrap();
+        let id = daemon
+            .jobs
+            .start_operation("failure".into(), async { anyhow::bail!("test failure") });
+        assert_eq!(
+            daemon.command(&format!("ack-output {id}")),
+            vec!["cannot acknowledge output of a running job"]
+        );
+        finish(&mut daemon).await;
+        let path = daemon.jobs.jobs[&id].output.path().to_owned();
+        assert!(path.exists());
+        assert_eq!(
+            daemon.command(&format!("ack-output {id}")),
+            vec!["output acknowledged"]
+        );
+        assert!(!daemon.jobs.jobs.contains_key(&id));
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn close_releases_active_connection() {
+        let mut daemon = Daemon::bootstrap().unwrap();
+        *daemon.connection.lock().await = Some(Box::new(FakeConnection));
+        assert!(daemon.command("close")[0].starts_with("JOB "));
+        finish(&mut daemon).await;
+        assert!(daemon.connection.lock().await.is_none());
+        // Closing an already closed connection is harmless.
+        assert!(daemon.command("close")[0].starts_with("JOB "));
+        finish(&mut daemon).await;
+        assert!(daemon.connection.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn open_is_an_alias_for_connect() {
+        let mut daemon = Daemon::bootstrap().unwrap();
+        daemon
+            .backends
+            .insert("fake".into(), std::sync::Arc::new(FakeBackend));
+        assert!(daemon.command("open fake://host")[0].starts_with("JOB "));
+        finish(&mut daemon).await;
+        assert_eq!(
+            daemon.connection.lock().await.as_ref().unwrap().protocol(),
+            "fake"
+        );
+        assert_eq!(daemon.command("open"), daemon.command("connect"));
+    }
+
+    #[tokio::test]
+    async fn protocol_dispatch_and_disconnect_are_backend_independent() {
+        let mut daemon = Daemon::bootstrap().unwrap();
+        daemon
+            .backends
+            .insert("fake".into(), std::sync::Arc::new(FakeBackend));
+        assert!(daemon.command("connect fake://host")[0].starts_with("JOB "));
+        finish(&mut daemon).await;
+        assert_eq!(
+            daemon.connection.lock().await.as_ref().unwrap().protocol(),
+            "fake"
+        );
+        // Unknown protocols must not replace the working connection.
+        assert!(daemon.command("connect unknown://host")[0].contains("no backend"));
+        daemon.command("disconnect");
+        finish(&mut daemon).await;
+        assert!(daemon.connection.lock().await.is_none());
     }
 }

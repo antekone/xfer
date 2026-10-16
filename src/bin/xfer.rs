@@ -381,14 +381,27 @@ fn read_attached_command(
             KeyCode::Tab => {
                 let matches = if !command.contains(char::is_whitespace) {
                     [
-                        "connect", "get", "mirror", "jobs", "cancel", "show", "set", "help",
+                        "connect",
+                        "open",
+                        "disconnect",
+                        "close",
+                        "bookmark",
+                        "ls",
+                        "get",
+                        "mirror",
+                        "jobs",
+                        "cancel",
+                        "show",
+                        "set",
+                        "help",
                         "detach",
+                        "exit",
                     ]
                     .into_iter()
                     .filter(|name| name.starts_with(&command))
                     .map(str::to_owned)
                     .collect::<Vec<_>>()
-                } else if command == "show" || command.starts_with("show ") {
+                } else if command.starts_with("show ") || command.starts_with("set ") {
                     stream.write_all(
                         b"COMMAND show
 ",
@@ -408,7 +421,7 @@ fn read_attached_command(
                             choices.push(name.to_owned());
                         }
                     }
-                    let prefix = command.strip_prefix("show").unwrap().trim();
+                    let prefix = command.split_once(' ').unwrap().1.trim();
                     choices
                         .into_iter()
                         .filter(|name| name.starts_with(prefix))
@@ -418,7 +431,11 @@ fn read_attached_command(
                 };
                 if matches.len() == 1 {
                     command = if command.contains(char::is_whitespace) {
-                        format!("show {}", matches[0])
+                        format!(
+                            "{} {}",
+                            command.split_whitespace().next().unwrap(),
+                            matches[0]
+                        )
                     } else {
                         matches[0].clone()
                     };
@@ -441,12 +458,216 @@ fn read_attached_command(
     }
 }
 
+struct LocalOutput(std::path::PathBuf);
+impl Drop for LocalOutput {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+struct PagerTerminal;
+impl Drop for PagerTerminal {
+    fn drop(&mut self) {
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, cursor::Show);
+        let _ = disable_raw_mode();
+    }
+}
+
+fn display_job_output(
+    stream: &mut UnixStream,
+    reader: &mut BufReader<UnixStream>,
+    id: u64,
+) -> Result<()> {
+    use std::io::{Seek, SeekFrom};
+    // Keep client memory bounded too: receive at most 64 KiB at a time.
+    let path = std::env::temp_dir().join(format!(
+        "xfer-output-{}-{id}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    ));
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(&path)?;
+    let _cleanup = LocalOutput(path);
+    let mut offset = 0;
+    let mut rows = 0usize;
+    loop {
+        stream.write_all(format!("COMMAND read-output {id} {offset}\n").as_bytes())?;
+        let mut response = String::new();
+        if reader.read_line(&mut response)? == 0 {
+            anyhow::bail!("daemon disconnected");
+        }
+        let chunk = response
+            .strip_prefix("OUTPUT CHUNK ")
+            .ok_or_else(|| anyhow::anyhow!("invalid output response"))?;
+        let (next, bytes) = chunk
+            .trim()
+            .split_once(' ')
+            .ok_or_else(|| anyhow::anyhow!("invalid output chunk"))?;
+        let next: u64 = next.parse()?;
+        let bytes: Vec<u8> = serde_json::from_str(bytes)?;
+        response.clear();
+        if reader.read_line(&mut response)? == 0 || response.trim() != "DONE" {
+            anyhow::bail!("incomplete output response");
+        }
+        if bytes.is_empty() {
+            break;
+        }
+        if next != offset + bytes.len() as u64 {
+            anyhow::bail!("invalid output offset");
+        }
+        rows += bytes.iter().filter(|&&byte| byte == b'\n').count();
+        file.write_all(&bytes)?;
+        offset = next;
+    }
+    stream.write_all(b"COMMAND show ui:auto-pager\n")?;
+    let mut response = String::new();
+    reader.read_line(&mut response)?;
+    let auto_pager = response.starts_with("OUTPUT ui:auto-pager: true");
+    response.clear();
+    reader.read_line(&mut response)?;
+    file.seek(SeekFrom::Start(0))?;
+    let (_, height) = crossterm::terminal::size().unwrap_or((80, 24));
+    if !auto_pager || rows < height.saturating_sub(1) as usize {
+        std::io::copy(&mut file, &mut io::stdout())?;
+        io::stdout().flush()?;
+        return Ok(());
+    }
+    enable_raw_mode()?;
+    let _terminal = PagerTerminal;
+    execute!(io::stdout(), EnterAlternateScreen, cursor::Hide)?;
+    let mut page_offsets = vec![0];
+    let mut page = 0;
+    loop {
+        let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
+        let mut input = BufReader::new(&mut file);
+        input.seek(SeekFrom::Start(page_offsets[page]))?;
+        execute!(io::stdout(), cursor::MoveTo(0, 0), Clear(ClearType::All))?;
+        for _ in 0..height.saturating_sub(1) {
+            let mut line = String::new();
+            if input.read_line(&mut line)? == 0 {
+                break;
+            }
+            let visible = line
+                .trim_end_matches(['\r', '\n'])
+                .chars()
+                .take(width.saturating_sub(1) as usize)
+                .collect::<String>();
+            print!("{visible}\r\n");
+        }
+        let next = input.stream_position()?;
+        let end = next >= offset;
+        execute!(io::stdout(), cursor::MoveTo(0, height.saturating_sub(1)))?;
+        let label = format!(
+            "-- page {}{}; Space/PgDn next, PgUp previous, q exit --",
+            page + 1,
+            if end { " (end)" } else { "" }
+        );
+        print!(
+            "{}",
+            label
+                .chars()
+                .take(width.saturating_sub(1) as usize)
+                .collect::<String>()
+        );
+        io::stdout().flush()?;
+        if let Event::Key(key) = event::read()? {
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => break,
+                KeyCode::Char(' ') | KeyCode::PageDown | KeyCode::Down if !end => {
+                    page_offsets.truncate(page + 1);
+                    page_offsets.push(next);
+                    page += 1;
+                }
+                KeyCode::PageUp | KeyCode::Up => page = page.saturating_sub(1),
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Never let an in-place status wrap: clearing only the current line cannot
+/// erase wrapped rows. Full errors are emitted once as ordinary scrollback.
+fn fit_status_line(text: &str, terminal_width: u16) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let limit = terminal_width.saturating_sub(1) as usize;
+    let clean = text
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>();
+    if clean
+        .chars()
+        .map(|ch| ch.width().unwrap_or(0))
+        .sum::<usize>()
+        <= limit
+    {
+        return clean;
+    }
+    if limit == 0 {
+        return String::new();
+    }
+    let mut used = 0;
+    let mut clipped = String::new();
+    for ch in clean.chars() {
+        let width = ch.width().unwrap_or(0);
+        if used + width > limit - 1 {
+            break;
+        }
+        clipped.push(ch);
+        used += width;
+    }
+    clipped.push('…');
+    clipped
+}
+
+#[derive(Default)]
+struct ForegroundDisplay {
+    previous_status: Option<String>,
+    previous_line: Option<String>,
+}
+impl ForegroundDisplay {
+    fn update(&mut self, status: &str, terminal_width: u16) -> String {
+        let retry = status
+            .split_once(" failed: ")
+            .and_then(|(attempt, message)| {
+                message
+                    .rsplit_once("; retrying in ")
+                    .map(|(_, delay)| format!("{attempt}; retrying in {delay}"))
+            });
+        let mut output = String::new();
+        if self.previous_status.as_deref() != Some(status) && retry.is_some() {
+            output.push_str(&format!("\r\x1b[2K{status}\r\n"));
+            self.previous_line = None;
+        }
+        let line = fit_status_line(
+            &format!(
+                "{}  (^C cancel, ^Z background)",
+                retry.as_deref().unwrap_or(status)
+            ),
+            terminal_width,
+        );
+        if self.previous_line.as_deref() != Some(&line) {
+            output.push_str(&format!("\r\x1b[2K{line}"));
+            self.previous_line = Some(line);
+        }
+        self.previous_status = Some(status.to_owned());
+        output
+    }
+}
+
 fn foreground_job(
     stream: &mut UnixStream,
     reader: &mut BufReader<UnixStream>,
     id: u64,
 ) -> Result<()> {
     enable_raw_mode()?;
+    let mut display = ForegroundDisplay::default();
     loop {
         stream.write_all(format!("COMMAND status {id}\n").as_bytes())?;
         let mut line = String::new();
@@ -458,8 +679,41 @@ fn foreground_job(
             .to_owned();
         line.clear();
         reader.read_line(&mut line)?;
-        print!("\r\x1b[2K{status}  (^C cancel, ^Z background)");
-        io::stdout().flush()?;
+        let state = status.split_whitespace().nth(1);
+        if matches!(state, Some("Completed" | "Cancelled" | "Failed")) || status == "no such job" {
+            print!("\r\x1b[2K{status}");
+            io::stdout().flush()?;
+            disable_raw_mode()?;
+            println!();
+            if status != "no such job" {
+                display_job_output(stream, reader, id)?;
+                stream.write_all(format!("COMMAND ack-output {id}\n").as_bytes())?;
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line)? == 0 {
+                        anyhow::bail!("daemon disconnected");
+                    }
+                    if line.trim() == "DONE" {
+                        break;
+                    }
+                    let response = line.strip_prefix("OUTPUT ").unwrap_or(&line).trim();
+                    if response != "output acknowledged" {
+                        eprintln!("{response}");
+                    }
+                }
+            }
+            return Ok(());
+        }
+        let width = crossterm::terminal::size()
+            .map(|(width, _)| width)
+            .ok()
+            .filter(|width| *width > 0)
+            .unwrap_or(80);
+        let redraw = display.update(&status, width);
+        if !redraw.is_empty() {
+            print!("{redraw}");
+            io::stdout().flush()?;
+        }
         if event::poll(Duration::from_millis(150))? {
             if let Event::Key(key) = event::read()? {
                 match (key.code, key.modifiers) {
@@ -482,14 +736,109 @@ fn foreground_job(
                 }
             }
         }
-        if status.contains("Completed") || status.contains("Cancelled") || status.contains("Failed")
+    }
+}
+
+/// Shared execution path for rc lines and interactive commands.
+fn dispatch_attached_command(
+    stream: &mut UnixStream,
+    reader: &mut BufReader<UnixStream>,
+    command: &str,
+    history_file: Option<&str>,
+) -> Result<bool> {
+    if command.trim().is_empty() {
+        return Ok(true);
+    }
+    let mut line = String::new();
+    if matches!(command.trim(), "detach" | "exit") {
+        stream.write_all(b"DETACH\n")?;
+        return Ok(false);
+    }
+    if command.trim() == "bg" {
+        println!("all jobs are already in the background");
+        return Ok(true);
+    }
+    if let Some(id) = command
+        .trim()
+        .strip_prefix("fg ")
+        .and_then(|value| value.trim().parse().ok())
+    {
+        foreground_job(stream, reader, id)?;
+        return Ok(true);
+    }
+    if command.trim() == "fg" {
+        println!("usage: fg <job-id>");
+        return Ok(true);
+    }
+    if !command.trim().is_empty() {
+        append_history(history_file, command);
+    }
+    stream.write_all(format!("COMMAND {command}\n").as_bytes())?;
+    let mut foreground = None;
+    let mut edit_bookmarks = None;
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            anyhow::bail!("daemon disconnected");
+        }
+        if line.trim() == "DONE" {
+            break;
+        }
+        if let Some(id) = line
+            .strip_prefix("OUTPUT JOB ")
+            .and_then(|value| value.trim().parse().ok())
         {
-            // Output retention is acknowledged by the pager/output view, not by foregrounding.
-            disable_raw_mode()?;
-            println!();
-            return Ok(());
+            foreground = Some(id);
+            continue; // JOB is IPC control information, not user-visible output.
+        }
+        if let Some(path) = line.strip_prefix("OUTPUT BOOKMARK_EDIT ") {
+            edit_bookmarks = Some(path.trim_end_matches(['\r', '\n']).to_owned());
+        } else {
+            print!("{}", line.strip_prefix("OUTPUT ").unwrap_or(&line));
         }
     }
+    if let Some(path) = edit_bookmarks {
+        let editor = std::env::var("VISUAL")
+            .or_else(|_| std::env::var("EDITOR"))
+            .unwrap_or_else(|_| "vi".into());
+        match shlex::split(&editor).filter(|args| !args.is_empty()) {
+            Some(args) => match Command::new(&args[0]).args(&args[1..]).arg(&path).status() {
+                Ok(status) if status.success() => {
+                    stream.write_all(b"COMMAND bookmark reload\n")?;
+                    loop {
+                        line.clear();
+                        if reader.read_line(&mut line)? == 0 {
+                            anyhow::bail!("daemon disconnected");
+                        }
+                        if line.trim() == "DONE" {
+                            break;
+                        }
+                        print!("{}", line.strip_prefix("OUTPUT ").unwrap_or(&line));
+                    }
+                }
+                Ok(status) => eprintln!("editor exited with {status}"),
+                Err(error) => eprintln!("cannot run editor: {error}"),
+            },
+            None => eprintln!("invalid VISUAL/EDITOR command"),
+        }
+    }
+    if let Some(id) = foreground {
+        foreground_job(stream, reader, id)?;
+    }
+    Ok(true)
+}
+
+fn read_startup_commands(path: &std::path::Path) -> Result<Vec<String>> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(anyhow::anyhow!("read {}: {error}", path.display())),
+    };
+    Ok(text
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+        .map(str::to_owned)
+        .collect())
 }
 
 fn attach(args: &[String]) -> Result<()> {
@@ -526,6 +875,26 @@ fn attach(args: &[String]) -> Result<()> {
     if line.trim() != "ATTACHED" {
         anyhow::bail!("attach failed: {}", line.trim());
     }
+    // Claim startup exactly once per daemon, not on every later attach.
+    stream.write_all(b"STARTUP\n")?;
+    line.clear();
+    if reader.read_line(&mut line)? == 0 {
+        anyhow::bail!("daemon disconnected");
+    }
+    match line.trim() {
+        "RUN_STARTUP" => {
+            if let Some(home) = std::env::var_os("HOME") {
+                for command in read_startup_commands(&PathBuf::from(home).join(".xferrc"))? {
+                    // Configuration commands are not interactive history entries.
+                    if !dispatch_attached_command(&mut stream, &mut reader, &command, None)? {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        "STARTUP_DONE" => {}
+        response => anyhow::bail!("invalid startup response: {response}"),
+    }
     // The daemon owns the configured history location; the client only reads/appends it.
     stream.write_all(b"COMMAND show ui:history-file\n")?;
     line.clear();
@@ -547,47 +916,9 @@ fn attach(args: &[String]) -> Result<()> {
     while let Some(command) =
         read_attached_command(&mut stream, &mut reader, &selected.id, &mut history)?
     {
-        if matches!(command.trim(), "detach" | "exit") {
-            stream.write_all(b"DETACH\n")?;
-            break;
-        }
-        if command.trim() == "bg" {
-            println!("all jobs are already in the background");
-            continue;
-        }
-        if let Some(id) = command
-            .trim()
-            .strip_prefix("fg ")
-            .and_then(|value| value.trim().parse().ok())
+        if !dispatch_attached_command(&mut stream, &mut reader, &command, history_file.as_deref())?
         {
-            foreground_job(&mut stream, &mut reader, id)?;
-            continue;
-        }
-        if command.trim() == "fg" {
-            println!("usage: fg <job-id>");
-            continue;
-        }
-        if !command.trim().is_empty() {
-            append_history(history_file.as_deref(), &command);
-        }
-        stream.write_all(format!("COMMAND {command}\n").as_bytes())?;
-        let mut foreground = None;
-        loop {
-            line.clear();
-            reader.read_line(&mut line)?;
-            if line.trim() == "DONE" {
-                break;
-            }
-            if let Some(id) = line
-                .strip_prefix("OUTPUT JOB ")
-                .and_then(|value| value.trim().parse().ok())
-            {
-                foreground = Some(id);
-            }
-            print!("{}", line.strip_prefix("OUTPUT ").unwrap_or(&line));
-        }
-        if let Some(id) = foreground {
-            foreground_job(&mut stream, &mut reader, id)?;
+            break;
         }
     }
     Ok(())
@@ -851,5 +1182,91 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             }
             _ => {}
         },
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+    #[test]
+    fn foreground_retry_errors_are_logged_once_per_attempt() {
+        let mut display = ForegroundDisplay::default();
+        let status = format!(
+            "[1] Running attempt 1 failed: {}; retrying in 3s",
+            "long error ".repeat(30)
+        );
+        let first = display.update(&status, 80);
+        assert_eq!(first.matches("long error").count(), 30);
+        assert!(first.contains("retrying in 3s"));
+        for _ in 0..30 {
+            assert!(display.update(&status, 80).is_empty());
+        }
+        let resized = display.update(&status, 50);
+        assert!(!resized.contains("long error"));
+        let next = status.replace("attempt 1", "attempt 2").replace("3s", "6s");
+        assert!(display.update(&next, 80).contains("attempt 2 failed"));
+        assert!(display.update(&next, 80).is_empty());
+    }
+
+    #[test]
+    fn status_lines_do_not_wrap_even_with_wide_unicode() {
+        for width in [0, 1, 2, 10, 80] {
+            let line = fit_status_line("status 界界界\nretry", width);
+            assert!(
+                unicode_width::UnicodeWidthStr::width(line.as_str())
+                    <= width.saturating_sub(1) as usize
+            );
+            assert!(!line.contains('\n'));
+        }
+    }
+
+    #[test]
+    fn startup_file_is_line_oriented_and_ignores_comments() {
+        let path = std::env::temp_dir().join(format!("xfer-rc-test-{}", std::process::id()));
+        fs::write(
+            &path,
+            "# startup\n\nset s3:region eu-west-1\r\n  # comment\nshow s3:region\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_startup_commands(&path).unwrap(),
+            vec!["set s3:region eu-west-1", "show s3:region"]
+        );
+        fs::remove_file(&path).unwrap();
+        assert!(read_startup_commands(&path).unwrap().is_empty());
+    }
+    #[test]
+    fn empty_command_does_not_send_anything_to_daemon() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        for command in ["", " ", "\t  "] {
+            assert!(dispatch_attached_command(&mut client, &mut reader, command, None).unwrap());
+        }
+        server.set_nonblocking(true).unwrap();
+        let mut byte = [0];
+        let error = std::io::Read::read(&mut server, &mut byte).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn startup_and_interactive_commands_share_dispatch() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            let mut read = BufReader::new(server.try_clone().unwrap());
+            let mut server = server;
+            let mut request = String::new();
+            read.read_line(&mut request).unwrap();
+            assert_eq!(request, "COMMAND set s3:region eu-west-1\n");
+            server.write_all(b"OUTPUT region changed\nDONE\n").unwrap();
+        });
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        assert!(dispatch_attached_command(
+            &mut client,
+            &mut reader,
+            "set s3:region eu-west-1",
+            None
+        )
+        .unwrap());
+        worker.join().unwrap();
     }
 }

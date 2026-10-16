@@ -62,4 +62,6 @@ pub fn instances() -> std::io::Result<Vec<Instance>> {
     result.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(result)
 }
+pub mod backend;
+pub mod bookmarks;
 pub mod daemon_server;

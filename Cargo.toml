@@ -2,6 +2,7 @@
 name = "xfer"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.94"
 description = "Event-driven terminal transfer client scaffold"
 default-run = "xfer"
 
@@ -10,3 +11,22 @@ anyhow = "1"
 crossterm = "0.28"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tokio-util = "0.7"
+async-trait = "0.1"
+aws-config = "1"
+aws-sdk-s3 = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+shlex = "1"
+url = "2"
+serde_json = "1"
+aws-smithy-http-client = { version = "1", features = ["hyper-014"] }
+hyper-rustls = "0.24"
+rustls = { version = "0.21", features = ["dangerous_configuration"] }
+
+hyper = { version = "0.14", features = ["client", "tcp"] }
+tower-service = "0.3"
+unicode-width = "0.2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+rcgen = "0.13"

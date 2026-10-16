@@ -50,6 +50,7 @@ pub async fn run() -> Result<()> {
 
     let attached = Arc::new(AtomicBool::new(false));
     let shutdown = Arc::new(AtomicBool::new(false));
+    let startup_claimed = Arc::new(AtomicBool::new(false));
     let daemon = Arc::new(Mutex::new(crate::core::Daemon::bootstrap()?));
     eprintln!("xferd listening on {}", socket.display());
     while !shutdown.load(Ordering::Acquire) {
@@ -62,6 +63,7 @@ pub async fn run() -> Result<()> {
             Err(error) => return Err(error.into()),
         };
         let lease = attached.clone();
+        let startup_claimed = startup_claimed.clone();
         let shutdown = shutdown.clone();
         let daemon = daemon.clone();
         let runtime = tokio::runtime::Handle::current();
@@ -101,6 +103,15 @@ pub async fn run() -> Result<()> {
                 match reader.read_line(&mut request) {
                     Ok(0) | Err(_) => break,
                     Ok(_) if request.trim() == "DETACH" => break,
+                    Ok(_) if request.trim() == "STARTUP" => {
+                        let response: &[u8] = if startup_claimed.swap(true, Ordering::AcqRel) {
+                            b"STARTUP_DONE\n"
+                        } else {
+                            b"RUN_STARTUP\n"
+                        };
+                        let _ = writer.write_all(response);
+                        let _ = writer.flush();
+                    }
                     Ok(_) if request.starts_with("COMMAND ") => {
                         let response = daemon
                             .lock()
