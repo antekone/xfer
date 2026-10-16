@@ -1608,8 +1608,6 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 [[package]]
 name = "openssh-sftp-client"
 version = "0.15.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73359fbcced018722f66982d1367236c66acd716b6c52b6310bb64d257c9cce5"
 dependencies = [
  "bytes",
  "derive_destructure2",
@@ -1627,8 +1625,6 @@ dependencies = [
 [[package]]
 name = "openssh-sftp-client-lowlevel"
 version = "0.7.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b6b40abdd96f7cbc7773486ba276956bf5360dff60a6ba94307187659f7728a"
 dependencies = [
  "awaitable",
  "bytes",
@@ -1644,8 +1640,6 @@ dependencies = [
 [[package]]
 name = "openssh-sftp-error"
 version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12a702f18f0595b4578b21fd120ae7aa45f4298a8b28ddcb2397ace6f5a8251a"
 dependencies = [
  "awaitable-error",
  "openssh-sftp-protocol-error",
@@ -1657,8 +1651,6 @@ dependencies = [
 [[package]]
 name = "openssh-sftp-protocol"
 version = "0.25.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2a9349d08c847adbb89ff16c507ef5876c05c317ffcb5fd992986db26bc69b3"
 dependencies = [
  "bitflags",
  "num-derive",
@@ -1672,8 +1664,6 @@ dependencies = [
 [[package]]
 name = "openssh-sftp-protocol-error"
 version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42b54df62ccfd9a7708a83a9d60c46293837e478f9f4c0829360dcfa60ede8d2"
 dependencies = [
  "serde",
  "thiserror",

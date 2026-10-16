@@ -98,11 +98,13 @@ numeric server UID/GID, UTC modification time, and exact byte size, for example:
 -rw-r-----       1000       1001 [2026-10-16 13:22:00 UTC]       4096  notes.txt
 ```
 
-SFTP v3 provides numeric owner/group IDs, not account names; xfer never resolves
-remote IDs using the local account database. Missing attributes are shown as `-`
-(or `??????????` for an unknown mode). Directory sizes are the server's directory
-attribute, not a recursive total. Symlink entries retain their own metadata, even
-when their target is a directory offered by completion.
+SFTP v3 provides numeric owner/group IDs. When a server supplies the optional,
+implementation-defined `longname` listing text in the conventional `ls -l` form,
+xfer displays its owner and group names; it otherwise displays numeric IDs. xfer
+never resolves remote IDs using the local account database. Missing attributes are
+shown as `-` (or `??????????` for an unknown mode). Directory sizes are the
+server's directory attribute, not a recursive total. Symlink entries retain their
+own metadata, even when their target is a directory offered by completion.
 
 For agent/key authentication, use `open sftp://user@host` or a bookmark without
 `password_interactive`. Encrypted private keys should be loaded into `ssh-agent`.

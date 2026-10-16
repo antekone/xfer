@@ -37,11 +37,17 @@ pub struct FileInfo {
 
 /// Numeric server-side ownership and POSIX mode (file type plus permission bits).
 /// These IDs must not be resolved using the client's unrelated account database.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnixMetadata {
     pub mode: Option<u32>,
     pub uid: Option<u32>,
     pub gid: Option<u32>,
+    /// Best-effort server-provided owner name, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// Best-effort server-provided group name, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -84,8 +90,20 @@ pub fn render(content: &Content) -> String {
 
 pub fn render_with_options(content: &Content, options: DisplayOptions) -> String {
     let (name, date, size, directory, unix) = match content {
-        Content::Directory(info) => (&info.name, info.modified, info.size, true, info.unix),
-        Content::File(info) => (&info.name, info.modified, info.size, false, info.unix),
+        Content::Directory(info) => (
+            &info.name,
+            info.modified,
+            info.size,
+            true,
+            info.unix.as_ref(),
+        ),
+        Content::File(info) => (
+            &info.name,
+            info.modified,
+            info.size,
+            false,
+            info.unix.as_ref(),
+        ),
         Content::Bucket(info) => (&info.name, info.created, None, true, None),
         Content::Comment(info) => return format!("# {}", printable(&info.text)),
     };
@@ -108,11 +126,15 @@ pub fn render_with_options(content: &Content, options: DisplayOptions) -> String
         Some(unix) => format!(
             "{} {:>10} {:>10} {basic}",
             format_mode(unix.mode),
-            unix.uid
-                .map(|id| id.to_string())
+            unix.owner
+                .as_deref()
+                .map(printable)
+                .or_else(|| unix.uid.map(|id| id.to_string()))
                 .unwrap_or_else(|| "-".into()),
-            unix.gid
-                .map(|id| id.to_string())
+            unix.group
+                .as_deref()
+                .map(printable)
+                .or_else(|| unix.gid.map(|id| id.to_string()))
                 .unwrap_or_else(|| "-".into())
         ),
         None => basic,
@@ -269,6 +291,26 @@ mod tests {
     }
 
     #[test]
+    fn server_owner_group_names_override_ids_and_are_sanitized() {
+        let entry = Content::File(FileInfo {
+            name: "notes.txt".into(),
+            size: Some(1),
+            modified: None,
+            unix: Some(UnixMetadata {
+                mode: Some(0o100644),
+                uid: Some(1000),
+                gid: Some(1001),
+                owner: Some("alice".into()),
+                group: Some("ops\x1b".into()),
+            }),
+        });
+        let line = render(&entry);
+        assert!(line.contains("alice"));
+        assert!(line.contains("ops\\u{1b}"));
+        assert!(!line.contains('\x1b'));
+    }
+
+    #[test]
     fn unknown_metadata_is_not_fabricated() {
         let missing = render(&Content::File(FileInfo {
             unix: None,
@@ -306,6 +348,8 @@ mod tests {
                 mode: Some(0o100640),
                 uid: Some(1000),
                 gid: Some(1001),
+                owner: None,
+                group: None,
             }),
         });
         let line = render(&entry);

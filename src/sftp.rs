@@ -536,7 +536,13 @@ async fn operation<T>(
     };
     Err(permanent(message))
 }
-fn record(name: String, metadata: &MetaData, directory: bool) -> Content {
+fn record(
+    name: String,
+    metadata: &MetaData,
+    directory: bool,
+    owner: Option<String>,
+    group: Option<String>,
+) -> Content {
     let modified = metadata
         .modified()
         .and_then(|t| chrono::DateTime::from_timestamp(t.into_raw() as i64, 0));
@@ -550,6 +556,8 @@ fn record(name: String, metadata: &MetaData, directory: bool) -> Content {
         }),
         uid: metadata.uid(),
         gid: metadata.gid(),
+        owner,
+        group,
     });
     if directory {
         Content::Directory(DirectoryInfo {
@@ -567,6 +575,35 @@ fn record(name: String, metadata: &MetaData, directory: bool) -> Content {
         })
     }
 }
+/// Extract owner and group from the conventional SFTP v3 longname form.
+/// The field is server-defined, so only accept an ls-like mode and link-count
+/// prefix; numeric SFTP attributes remain the fallback when this fails.
+fn owner_group_from_longname(longname: &[u8]) -> (Option<String>, Option<String>) {
+    let Ok(longname) = std::str::from_utf8(longname) else {
+        return (None, None);
+    };
+    let mut fields = longname.split_ascii_whitespace();
+    let Some(mode) = fields.next() else {
+        return (None, None);
+    };
+    let Some(links) = fields.next() else {
+        return (None, None);
+    };
+    if mode.len() != 10
+        || !matches!(
+            mode.as_bytes()[0],
+            b'-' | b'd' | b'l' | b'p' | b's' | b'b' | b'c'
+        )
+        || links.parse::<u64>().is_err()
+    {
+        return (None, None);
+    }
+    let (Some(owner), Some(group)) = (fields.next(), fields.next()) else {
+        return (None, None);
+    };
+    (Some(owner.to_owned()), Some(group.to_owned()))
+}
+
 fn remote_file(metadata: &MetaData) -> Result<RemoteFile> {
     if !metadata.file_type().is_some_and(|kind| kind.is_file()) {
         return Err(permanent("expected a regular remote file"));
@@ -714,7 +751,7 @@ async fn list_on(sftp: &Client, path: &str, output: &mut dyn ListingSink) -> Res
             return Err(permanent("not a remote directory"));
         }
         let name = path.rsplit('/').next().unwrap_or(path).to_owned();
-        output.emit_file(record(name, &metadata, false))?;
+        output.emit_file(record(name, &metadata, false, None, None))?;
         return Ok(1);
     }
     let dir = operation(sftp.fs().open_dir(&path)).await?;
@@ -754,7 +791,8 @@ async fn list_on(sftp: &Client, path: &str, output: &mut dyn ListingSink) -> Res
                 Err(_) => {} // A broken/unreadable symlink is still a valid listing entry.
             }
         }
-        output.emit(record(name.to_owned(), &metadata, directory))?;
+        let (owner, group) = owner_group_from_longname(entry.longname());
+        output.emit(record(name.to_owned(), &metadata, directory, owner, group))?;
         count += 1;
     }
     Ok(count)
@@ -1171,6 +1209,16 @@ mod tests {
     }
 
     #[test]
+    fn longname_owner_group_is_best_effort() {
+        assert_eq!(
+            owner_group_from_longname(b"-rw-r--r-- 1 alice developers 83 Dec 01 17:12 ip6.txt"),
+            (Some("alice".into()), Some("developers".into()))
+        );
+        assert_eq!(owner_group_from_longname(b"not an ls line"), (None, None));
+        assert_eq!(owner_group_from_longname(b"\xff"), (None, None));
+    }
+
+    #[test]
     fn ssh_command_is_subsystem_only_and_verifies_host_keys() {
         let target = Target::parse("sftp://user@example.org:2222").unwrap();
         let command = target.command(Path::new("ssh"), 5, false);
@@ -1227,7 +1275,7 @@ mod tests {
             .len(200000)
             .time(time, time)
             .create();
-        let Content::File(file) = record("file.txt".into(), &metadata, false) else {
+        let Content::File(file) = record("file.txt".into(), &metadata, false, None, None) else {
             panic!("expected file");
         };
         assert_eq!(file.size, Some(200000));
@@ -1237,7 +1285,9 @@ mod tests {
             Some(UnixMetadata {
                 mode: Some(0o100640),
                 uid: Some(1234),
-                gid: Some(5678)
+                gid: Some(5678),
+                owner: None,
+                group: None,
             })
         );
 
@@ -1250,7 +1300,9 @@ mod tests {
                 .len(size)
                 .time(time, time)
                 .create();
-            let Content::Directory(directory) = record("photos".into(), &metadata, true) else {
+            let Content::Directory(directory) =
+                record("photos".into(), &metadata, true, None, None)
+            else {
                 panic!("expected directory");
             };
             assert_eq!(directory.size, Some(size));
