@@ -34,8 +34,8 @@ s3:region: us-east-1
 smb:max-credits: 32
 ```
 
-S3 and SFTP support connect, navigation, listing and downloads. Uploads, mirroring,
-and SMB operations are not implemented yet.
+S3 and SFTP support connect, navigation, listing and downloads. SFTP also supports
+uploads with `put`; S3 uploads, mirroring, and SMB operations are not implemented yet.
 
 ## Command history
 

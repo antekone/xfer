@@ -14,6 +14,7 @@ pub(crate) mod connect;
 pub(crate) mod get;
 pub(crate) mod ls;
 pub(crate) mod output;
+pub(crate) mod put;
 pub(crate) mod shell;
 pub(crate) mod status;
 
@@ -177,6 +178,7 @@ pub static COMMANDS: &[&dyn Command] = &[
     &LCD,
     &ls::Ls,
     &get::Get,
+    &put::Put,
     &cat::Cat,
     &bookmark::Bookmark,
     &status::Status,

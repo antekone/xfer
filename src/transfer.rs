@@ -345,6 +345,41 @@ pub async fn get(
     ))
 }
 
+/// Matches a filename using wildmat's `*` (any sequence) and `?` (one
+/// character) operators. Other characters are literals.
+pub fn wildmat(pattern: &str, name: &str) -> bool {
+    let pattern = pattern.chars().collect::<Vec<_>>();
+    let name = name.chars().collect::<Vec<_>>();
+    let mut previous = vec![false; name.len() + 1];
+    previous[0] = true;
+    for token in pattern {
+        let mut current = vec![false; name.len() + 1];
+        match token {
+            '*' => {
+                current[0] = previous[0];
+                for index in 1..=name.len() {
+                    current[index] = previous[index] || current[index - 1];
+                }
+            }
+            '?' => {
+                for index in 1..=name.len() {
+                    current[index] = previous[index - 1];
+                }
+            }
+            literal => {
+                for index in 1..=name.len() {
+                    current[index] = previous[index - 1] && name[index - 1] == literal;
+                }
+            }
+        }
+        previous = current;
+    }
+    previous[name.len()]
+}
+pub fn has_wildmat(value: &str) -> bool {
+    value.contains(['*', '?'])
+}
+
 pub fn safe_name(name: &str) -> String {
     name.chars()
         .flat_map(|ch| {
@@ -360,6 +395,15 @@ pub fn safe_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wildmat_supports_star_question_and_unicode() {
+        assert!(wildmat("*.txt", "notes.txt"));
+        assert!(wildmat("?.txt", "é.txt"));
+        assert!(wildmat("a*?", "abcd"));
+        assert!(!wildmat("?.txt", "two.txt"));
+        assert!(!wildmat("*.txt", "notes.md"));
+    }
     use async_trait::async_trait;
     use std::sync::{
         atomic::{AtomicU64, Ordering},

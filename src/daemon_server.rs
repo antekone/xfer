@@ -160,18 +160,23 @@ pub async fn run() -> Result<()> {
                     Ok(_)
                         if request.starts_with("COMPLETE_CD ")
                             || request.starts_with("COMPLETE_LS ")
-                            || request.starts_with("COMPLETE_GET ") =>
+                            || request.starts_with("COMPLETE_GET ")
+                            || request.starts_with("COMPLETE_BOOKMARK ") =>
                     {
                         let result = match serde_json::from_str::<String>(
                             request.split_once(' ').unwrap().1.trim(),
                         ) {
                             Ok(input) => {
                                 // Do not hold the daemon-state mutex over network I/O.
-                                let future = daemon
-                                    .lock()
-                                    .expect("daemon state poisoned")
-                                    .path_completion(input, request.starts_with("COMPLETE_CD "));
-                                runtime.block_on(future)
+                                let daemon = daemon.lock().expect("daemon state poisoned");
+                                if request.starts_with("COMPLETE_BOOKMARK ") {
+                                    daemon.bookmark_completion(&input)
+                                } else {
+                                    runtime.block_on(daemon.path_completion(
+                                        input,
+                                        request.starts_with("COMPLETE_CD "),
+                                    ))
+                                }
                             }
                             Err(_) => Err(anyhow::anyhow!("invalid completion request")),
                         };

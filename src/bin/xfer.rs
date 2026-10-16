@@ -773,11 +773,27 @@ impl PagerDisplay {
     }
 }
 
+/// Leave pager mode, then append its final frame to the normal terminal buffer.
+/// This preserves earlier commands in scrollback while leaving the last page visible.
+fn write_pager_frame(out: &mut impl Write, rows: &[String]) -> io::Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    out.write_all(b"\r\n")?;
+    for (index, row) in rows.iter().enumerate() {
+        out.write_all(row.as_bytes())?;
+        if index + 1 != rows.len() {
+            out.write_all(b"\r\n")?;
+        }
+    }
+    out.flush()
+}
+
 fn page_output_file(file: &mut fs::File) -> Result<()> {
     use std::io::{Seek, SeekFrom};
     let mut index = PagerIndex::new(file)?;
     enable_raw_mode()?;
-    let _terminal = PagerTerminal;
+    let terminal = PagerTerminal;
     execute!(io::stdout(), EnterAlternateScreen, cursor::Hide)?;
     let mut offset = 0;
     let mut notice = None;
@@ -818,6 +834,10 @@ fn page_output_file(file: &mut fs::File) -> Result<()> {
             }
         }
     }
+    // Restore the normal buffer before emitting output, otherwise the frame
+    // disappears with the alternate screen.
+    drop(terminal);
+    write_pager_frame(&mut io::stdout(), &display.rows)?;
     Ok(())
 }
 
@@ -1522,6 +1542,13 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod startup_tests {
     use super::*;
+    #[test]
+    fn pager_frame_is_appended_without_erasing_scrollback() {
+        let mut output = Vec::new();
+        write_pager_frame(&mut output, &["first".into(), "last".into()]).unwrap();
+        assert_eq!(output, b"\r\nfirst\r\nlast");
+    }
+
     #[test]
     fn pager_repaints_changed_rows_without_clearing_or_newlines() {
         let mut display = PagerDisplay::default();

@@ -31,6 +31,13 @@ pub trait Connection: Send + Sync {
         ))
         .into())
     }
+    async fn upload(&self, _local: &std::path::Path, _path: &str, _overwrite: bool) -> Result<()> {
+        Err(NonRetryableError(format!(
+            "file uploads are not implemented for {}",
+            self.protocol()
+        ))
+        .into())
+    }
     async fn download(
         &self,
         _path: &str,

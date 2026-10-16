@@ -13,7 +13,9 @@ use futures_util::StreamExt;
 use openssh_sftp_client::{metadata::MetaData, Sftp as Client, SftpOptions};
 use percent_encoding::percent_decode_str;
 use std::{
+    fs::File,
     future::Future,
+    io::Read,
     io::SeekFrom,
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
@@ -32,6 +34,9 @@ pub struct Sftp;
 
 fn permanent(message: impl Into<String>) -> anyhow::Error {
     NonRetryableError(message.into()).into()
+}
+fn local_error(path: &Path, error: impl std::fmt::Display) -> anyhow::Error {
+    permanent(format!("local file {}: {error}", path.display()))
 }
 
 #[derive(Debug, PartialEq)]
@@ -713,6 +718,12 @@ impl Connection for SftpConnection {
         .await;
         lease.finish(result)
     }
+    async fn upload(&self, local: &Path, path: &str, overwrite: bool) -> Result<()> {
+        let path = self.resolve_listing_path(path)?;
+        let lease = self.acquire().await?;
+        let result = upload_on(&lease.session.sftp, local, &path, overwrite).await;
+        lease.finish(result)
+    }
     async fn download(
         &self,
         path: &str,
@@ -796,6 +807,29 @@ async fn list_on(sftp: &Client, path: &str, output: &mut dyn ListingSink) -> Res
         count += 1;
     }
     Ok(count)
+}
+
+async fn upload_on(sftp: &Client, local: &Path, remote: &str, overwrite: bool) -> Result<()> {
+    let mut input = File::open(local).map_err(|error| local_error(local, error))?;
+    let mut options = sftp.options();
+    options.write(true);
+    if overwrite {
+        options.create(true).truncate(true);
+    } else {
+        options.create_new(true);
+    }
+    let mut output = operation(options.open(remote)).await?;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = input
+            .read(&mut buffer)
+            .map_err(|error| local_error(local, error))?;
+        if read == 0 {
+            break;
+        }
+        operation(output.write_all(&buffer[..read])).await?;
+    }
+    operation(output.close()).await
 }
 
 async fn download_on(

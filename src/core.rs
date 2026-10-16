@@ -620,7 +620,7 @@ impl Daemon {
         settings.register(
             "xfer:clobber",
             SettingValue::Bool(false),
-            "Allow get to overwrite existing local files (get -c resumes independently)",
+            "Allow get to overwrite local files and put to overwrite remote files",
         );
         crate::commands::ls::register_settings(&mut settings);
         crate::cache::CacheOptions::register(&mut settings);
@@ -702,6 +702,19 @@ impl Daemon {
 
     pub fn session_info(&self) -> SessionInfo {
         self.session.lock().expect("session state poisoned").clone()
+    }
+
+    pub fn bookmark_completion(&self, input: &str) -> Result<crate::cache::PathCompletion> {
+        let bookmarks = crate::bookmarks::load(std::path::Path::new(
+            self.settings.text("bookmarks:file").unwrap(),
+        ))?;
+        Ok(crate::cache::PathCompletion {
+            candidates: bookmarks
+                .into_keys()
+                .filter(|name| name.starts_with(input))
+                .collect(),
+            truncated: false,
+        })
     }
 
     pub fn path_completion(

@@ -4,7 +4,9 @@ mod sort;
 use super::{Command, CommandContext, CommandResult, Completion, Handler, ParserContext};
 use crate::{
     core::{Daemon, SettingValue, Settings},
-    listing::{Content, DisplayOptions},
+    error::NonRetryableError,
+    listing::{Content, DisplayOptions, ListingSink},
+    transfer::{has_wildmat, wildmat},
 };
 use anyhow::{bail, Result};
 use std::cmp::Ordering;
@@ -158,12 +160,25 @@ fn execute_lines(app: &mut Daemon, parser: &ParserContext<'_>) -> Vec<String> {
                     let active = active.as_ref().ok_or_else(|| {
                         crate::error::NonRetryableError("not connected; use connect first".into())
                     })?;
-                    let target = snapshot_listing_path(
-                        active.as_ref(),
-                        args.path.as_deref().unwrap_or(""),
-                        &snapshot,
-                    )?;
-                    active.list(&target, &mut listing).await?;
+                    let path = args.path.as_deref().unwrap_or("");
+                    if has_wildmat(path) {
+                        let target = snapshot_listing_path(active.as_ref(), "", &snapshot)?;
+                        let mut selected = WildmatListing {
+                            pattern: path,
+                            inner: &mut listing,
+                            matches: 0,
+                        };
+                        active.list(&target, &mut selected).await?;
+                        if selected.matches == 0 {
+                            return Err(NonRetryableError(format!(
+                                "no remote files match {path:?}"
+                            ))
+                            .into());
+                        }
+                    } else {
+                        let target = snapshot_listing_path(active.as_ref(), path, &snapshot)?;
+                        active.list(&target, &mut listing).await?;
+                    }
                 }
                 listing.write_to(&mut output).await?;
                 // Successful ls output contains items only, not a summary/footer.
@@ -171,6 +186,26 @@ fn execute_lines(app: &mut Daemon, parser: &ParserContext<'_>) -> Vec<String> {
             }
         });
     vec![format!("JOB {id}")]
+}
+
+struct WildmatListing<'a> {
+    pattern: &'a str,
+    inner: &'a mut dyn ListingSink,
+    matches: usize,
+}
+impl ListingSink for WildmatListing<'_> {
+    fn emit(&mut self, content: Content) -> Result<()> {
+        let name = match &content {
+            Content::File(file) => Some(file.name.as_str()),
+            Content::Directory(directory) => Some(directory.name.trim_end_matches('/')),
+            Content::Bucket(_) | Content::Comment(_) => None,
+        };
+        if name.is_some_and(|name| wildmat(self.pattern, name)) {
+            self.matches += 1;
+            self.inner.emit(content)?;
+        }
+        Ok(())
+    }
 }
 
 fn execute(context: &mut CommandContext<'_>, parser: &ParserContext<'_>) -> Result<CommandResult> {
@@ -225,6 +260,29 @@ mod tests {
             file("beta", Some(50)),
             file("zero", Some(0)),
         ]
+    }
+
+    #[test]
+    fn wildcard_listing_keeps_matching_files_and_directories() {
+        struct Collected(Vec<Content>);
+        impl ListingSink for Collected {
+            fn emit(&mut self, content: Content) -> Result<()> {
+                self.0.push(content);
+                Ok(())
+            }
+        }
+        let mut collected = Collected(Vec::new());
+        let mut selected = WildmatListing {
+            pattern: "*.txt",
+            inner: &mut collected,
+            matches: 0,
+        };
+        selected.emit(file("one.txt", None)).unwrap();
+        selected.emit(directory("folder.txt", None)).unwrap();
+        selected.emit(file("two.md", None)).unwrap();
+        assert_eq!(selected.matches, 2);
+        assert_eq!(attributes(&collected.0[0]).0, "one.txt");
+        assert_eq!(attributes(&collected.0[1]).0, "folder.txt");
     }
 
     #[tokio::test(start_paused = true)]

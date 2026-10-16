@@ -1,5 +1,5 @@
 //! Connection setup, bookmarks, credentials and retried backend initialization.
-use super::{Command, CommandContext, CommandResult, Handler, ParserContext};
+use super::{Command, CommandContext, CommandResult, Completion, Handler, ParserContext};
 use crate::core::{Daemon, JobId, SessionInfo};
 use anyhow::{bail, Result};
 
@@ -10,6 +10,12 @@ impl Command for Connect {
     }
     fn handler(&self) -> Handler {
         execute
+    }
+    fn completion(&self) -> Completion {
+        Completion::RemotePath {
+            request: "COMPLETE_BOOKMARK",
+            multiple_arguments: false,
+        }
     }
     fn help(&self) -> Option<(&'static str, &'static str)> {
         Some(("connect <url|name>", "connect using a protocol or bookmark"))
