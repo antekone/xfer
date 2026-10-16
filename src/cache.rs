@@ -85,6 +85,10 @@ impl DirectoryCache {
         self.entries.push_back(entry);
         Some(snapshot)
     }
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes = 0;
+    }
     fn invalidate(&mut self, path: &str) {
         if let Some(index) = self.entries.iter().position(|entry| entry.path == path) {
             self.bytes -= self.entries.remove(index).unwrap().snapshot.bytes;
@@ -260,6 +264,12 @@ impl Connection for CachedConnection {
     async fn stat_file(&self, path: &str) -> Result<crate::transfer::RemoteFile> {
         self.inner.stat_file(path).await
     }
+    async fn upload(&self, local: &std::path::Path, path: &str, overwrite: bool) -> Result<()> {
+        self.cache.lock().unwrap().clear();
+        let result = self.inner.upload(local, path, overwrite).await;
+        self.cache.lock().unwrap().clear();
+        result
+    }
     async fn download(
         &self,
         path: &str,
@@ -274,6 +284,15 @@ impl Connection for CachedConnection {
     }
     async fn change_directory(&mut self, path: &str) -> Result<()> {
         self.inner.change_directory(path).await
+    }
+    async fn create_directory(&self, path: &str, parents: bool) -> Result<()> {
+        // -p can change multiple ancestors, including through symlink aliases.
+        // Invalidate before awaiting so partial failure/cancellation cannot leave
+        // old completions behind. The daemon serializes connection operations.
+        self.cache.lock().unwrap().clear();
+        let result = self.inner.create_directory(path, parents).await;
+        self.cache.lock().unwrap().clear();
+        result
     }
     async fn disconnect(self: Box<Self>) -> Result<()> {
         self.inner.disconnect().await
@@ -346,6 +365,16 @@ mod tests {
             } else {
                 format!("/{path}/")
             })
+        }
+        async fn create_directory(&self, path: &str, _parents: bool) -> Result<()> {
+            self.contents
+                .lock()
+                .unwrap()
+                .push(directory(&format!("{}/", path.trim_matches('/'))));
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(crate::error::NonRetryableError("partial mkdir failure".into()).into());
+            }
+            Ok(())
         }
         async fn list(&self, _path: &str, output: &mut dyn ListingSink) -> Result<u64> {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -492,6 +521,42 @@ mod tests {
             vec!["../", "new/"]
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn mkdir_forwards_and_invalidates_completion_cache_even_after_partial_failure() {
+        let (connection, calls, _, fail) = connection();
+        assert!(connection
+            .complete_directories("new")
+            .await
+            .unwrap()
+            .candidates
+            .is_empty());
+        connection.create_directory("/new/", false).await.unwrap();
+        assert_eq!(
+            connection
+                .complete_directories("new")
+                .await
+                .unwrap()
+                .candidates,
+            vec!["new/"]
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        fail.store(true, Ordering::SeqCst);
+        assert!(connection
+            .create_directory("/partial/", true)
+            .await
+            .is_err());
+        fail.store(false, Ordering::SeqCst);
+        assert_eq!(
+            connection
+                .complete_directories("part")
+                .await
+                .unwrap()
+                .candidates,
+            vec!["partial/"]
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test(start_paused = true)]

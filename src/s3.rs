@@ -1,4 +1,6 @@
 //! S3 backend, including AWS client configuration, routing, and diagnostics.
+mod mkdir;
+
 use crate::{
     backend::{Backend, ConnectOptions, Connection},
     core::{SettingValue, Settings},
@@ -213,6 +215,9 @@ impl Connection for S3Connection {
     }
     fn pwd(&self) -> Result<String> {
         Ok(self.location.path())
+    }
+    async fn create_directory(&self, path: &str, parents: bool) -> Result<()> {
+        self.mkdir(path, parents).await
     }
     async fn change_directory(&mut self, path: &str) -> Result<()> {
         let target = self.location.resolve(path);
@@ -1007,6 +1012,18 @@ mod connection_tests {
     async fn download_client(
         responses: Vec<(&'static str, &'static [u8])>,
     ) -> (S3Connection, tokio::sync::oneshot::Receiver<Vec<String>>) {
+        http_client(
+            responses
+                .into_iter()
+                .map(|(headers, body)| (headers.into(), body.into()))
+                .collect(),
+        )
+        .await
+    }
+
+    pub(super) async fn http_client(
+        responses: Vec<(String, Vec<u8>)>,
+    ) -> (S3Connection, tokio::sync::oneshot::Receiver<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let (send, receive) = tokio::sync::oneshot::channel();
@@ -1028,7 +1045,7 @@ mod connection_tests {
                 }
                 requests.push(request);
                 socket.write_all(headers.as_bytes()).unwrap();
-                socket.write_all(body).unwrap();
+                socket.write_all(&body).unwrap();
             }
             let _ = send.send(requests);
         });

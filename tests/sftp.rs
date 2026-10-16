@@ -69,6 +69,7 @@ case "$*" in *test-secret*) exit 91;; esac
 if env | grep -q test-secret; then exit 92; fi
 printf '%s\n' "$$" >> "$TEST_SSH_PIDS"
 case "$*" in
+    *readonly.invalid*) exec {server} -R -d "$TEST_REMOTE_ROOT";;
     *silent.invalid*) exit 42;;
     *stderr.invalid*) echo 'subsystem request failed on channel 0' >&2; exit 255;;
     *noexpand.invalid*) exec {server} -P expand-path -d "$TEST_REMOTE_ROOT";;
@@ -248,8 +249,19 @@ fn interactive_password_sftp_navigation_listing_completion_and_resumed_download(
     let fields = file_line.split_whitespace().collect::<Vec<_>>();
     let metadata = fs::metadata(daemon.remote().join("hello world.txt")).unwrap();
     assert_eq!(fields[0], "-rw-r-----");
-    assert_eq!(fields[1], metadata.uid().to_string());
-    assert_eq!(fields[2], metadata.gid().to_string());
+    // The fixture's server runs locally, so host ls is a valid reference for
+    // server-provided owner/group names. Production never resolves IDs locally.
+    let reference = Command::new("ls")
+        .args(["-ld", "--"])
+        .arg(daemon.remote().join("hello world.txt"))
+        .env("LC_ALL", "C")
+        .output()
+        .unwrap();
+    assert!(reference.status.success());
+    let reference = String::from_utf8(reference.stdout).unwrap();
+    let reference = reference.split_whitespace().collect::<Vec<_>>();
+    assert!(fields[1] == reference[2] || fields[1] == metadata.uid().to_string());
+    assert!(fields[2] == reference[3] || fields[2] == metadata.gid().to_string());
     assert_eq!(&fields[3..7], &["[2009-02-13", "23:31:30", "UTC]", "18"]);
     let link_line = listing
         .lines()
@@ -681,6 +693,317 @@ fn cat_reads_remote_files_as_exact_bytes_and_recovers_a_dead_transport() {
     assert!(daemon
         .command("status")
         .contains(&format!("CWD: {}/photos/", daemon.remote().display())));
+    let response = daemon.command("close");
+    daemon.finish(response, true);
+}
+
+#[test]
+fn mkdir_creates_remote_directories_parents_and_refreshes_completion_after_reconnect() {
+    fn complete(daemon: &mut Daemon, path: &str) -> Vec<String> {
+        writeln!(
+            daemon.stream,
+            "COMPLETE_CD {}",
+            serde_json::to_string(path).unwrap()
+        )
+        .unwrap();
+        let response = daemon.line();
+        let result: xfer::cache::PathCompletion =
+            serde_json::from_str(response.strip_prefix("COMPLETION ").unwrap()).unwrap();
+        result.candidates
+    }
+    let Some(mut daemon) = Daemon::start() else {
+        return;
+    };
+    daemon.connect("test-secret", true);
+    let before = daemon.command("status");
+    let local = before
+        .iter()
+        .find(|line| line.starts_with("Local CWD:"))
+        .unwrap()
+        .clone();
+    let cwd = before
+        .iter()
+        .find(|line| line.starts_with("CWD:"))
+        .unwrap()
+        .clone();
+    assert!(complete(&mut daemon, "sing").is_empty());
+    let response = daemon.command("mkdir single second");
+    assert_eq!(daemon.finish(response, true), vec!["OFFSET 0"]);
+    assert!(daemon.remote().join("single").is_dir());
+    assert!(daemon.remote().join("second").is_dir());
+    assert_eq!(complete(&mut daemon, "sing"), vec!["single/"]);
+    for command in [
+        "mkdir single",
+        "mkdir absent/child",
+        "mkdir -p 'hello world.txt'",
+        "mkdir -p 'hello world.txt/child'",
+    ] {
+        let response = daemon.command(command);
+        assert!(!daemon.finish(response, false).is_empty());
+    }
+    assert!(!daemon.remote().join("absent").exists());
+    assert_eq!(
+        fs::read(daemon.remote().join("hello world.txt")).unwrap(),
+        b"hello remote world"
+    );
+    let response = daemon.command("mkdir -p tree/multiple/subdirs/at/once 'dir with spaces/child'");
+    daemon.finish(response, true);
+    assert!(daemon
+        .remote()
+        .join("tree/multiple/subdirs/at/once")
+        .is_dir());
+    assert!(daemon.remote().join("dir with spaces/child").is_dir());
+    let response = daemon.command("mkdir -p tree/multiple/subdirs/at/once . /");
+    daemon.finish(response, true);
+    assert!(complete(&mut daemon, "photos/thr").is_empty());
+    let response = daemon.command("mkdir -p 'linked photos/through-link/nested'");
+    daemon.finish(response, true);
+    assert!(daemon.remote().join("photos/through-link/nested").is_dir());
+    assert_eq!(
+        complete(&mut daemon, "photos/thr"),
+        vec!["photos/through-link/"]
+    );
+    std::os::unix::fs::symlink("missing-target", daemon.remote().join("broken")).unwrap();
+    let response = daemon.command("mkdir -p broken/child");
+    daemon.finish(response, false);
+    assert!(!daemon.remote().join("missing-target").exists());
+    let absolute = daemon.remote().join("absolute/child");
+    let response = daemon.command(&format!(
+        "mkdir -p {}",
+        shlex::try_quote(absolute.to_str().unwrap()).unwrap()
+    ));
+    daemon.finish(response, true);
+    assert!(absolute.is_dir());
+    let status = daemon.command("status");
+    assert!(status.contains(&local));
+    assert!(status.contains(&cwd));
+    let response = daemon.command("cd photos");
+    daemon.finish(response, true);
+    let response = daemon.command("mkdir -- -literal");
+    daemon.finish(response, true);
+    assert!(daemon.remote().join("photos/-literal").is_dir());
+    let response = daemon.command("mkdir -p ../siblings/child");
+    daemon.finish(response, true);
+    assert!(daemon.remote().join("siblings/child").is_dir());
+    let pids = fs::read_to_string(daemon.root.path().join("ssh-pids")).unwrap();
+    let pid = pids.lines().last().unwrap().parse::<i32>().unwrap();
+    // SAFETY: terminate only the private transport created by this fixture.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+    let response = daemon.command("mkdir -p recovered/deep");
+    daemon.finish(response, true);
+    assert!(daemon.remote().join("photos/recovered/deep").is_dir());
+    assert!(!daemon.remote().join("recovered").exists());
+    let status = daemon.command("status");
+    assert!(status.contains(&format!("CWD: {}/photos/", daemon.remote().display())));
+    assert!(status.contains(&local));
+    let response = daemon.command("close");
+    daemon.finish(response, true);
+}
+
+#[test]
+fn mkdir_rejects_permission_failures_but_parents_accepts_existing_readonly_directories() {
+    let Some(mut daemon) = Daemon::start() else {
+        return;
+    };
+    let response = daemon.command("open sftp://readonly.invalid");
+    daemon.finish(response, true);
+    for command in ["mkdir blocked", "mkdir -p blocked/child"] {
+        let response = daemon.command(command);
+        let output = daemon.finish(response, false).join("\n");
+        assert!(output.contains("permission denied"), "{output}");
+    }
+    assert!(!daemon.remote().join("blocked").exists());
+    let response = daemon.command("mkdir -p photos");
+    daemon.finish(response, true);
+    let response = daemon.command("close");
+    daemon.finish(response, true);
+}
+
+#[test]
+fn local_cwd_query_tracks_lcd_and_symlink_resolution_without_changing_remote_cwd() {
+    fn local_cwd(daemon: &mut Daemon) -> PathBuf {
+        writeln!(daemon.stream, "LOCAL_CWD").unwrap();
+        let response = daemon.line();
+        serde_json::from_str(response.strip_prefix("LOCAL_CWD ").unwrap()).unwrap()
+    }
+    let Some(mut daemon) = Daemon::start() else {
+        return;
+    };
+    daemon.connect("test-secret", true);
+    let remote = format!("CWD: {}/", daemon.remote().display());
+    let selected = daemon.root.path().join("Pobrane 'local' 日本語");
+    fs::create_dir(&selected).unwrap();
+    let alias = daemon.root.path().join("Downloads");
+    std::os::unix::fs::symlink(&selected, &alias).unwrap();
+    let selected = selected.canonicalize().unwrap();
+    assert_eq!(
+        daemon.command(&format!(
+            "lcd {}",
+            shlex::try_quote(alias.to_str().unwrap()).unwrap()
+        )),
+        vec![format!("Local CWD: {}", selected.display())]
+    );
+    assert_eq!(local_cwd(&mut daemon), selected);
+    assert!(daemon.command("lcd missing")[0].starts_with("cannot change local directory"));
+    assert_eq!(local_cwd(&mut daemon), selected);
+    assert!(daemon.command("status").contains(&remote));
+    daemon.command("lcd ..");
+    assert_eq!(
+        local_cwd(&mut daemon),
+        daemon.root.path().canonicalize().unwrap()
+    );
+    assert!(daemon.command("status").contains(&remote));
+    let response = daemon.command("close");
+    daemon.finish(response, true);
+}
+
+#[test]
+fn lcd_completion_reads_fresh_local_directories_even_without_a_remote_connection() {
+    fn complete(daemon: &mut Daemon, path: &str) -> xfer::cache::PathCompletion {
+        writeln!(
+            daemon.stream,
+            "COMPLETE_LCD {}",
+            serde_json::to_string(path).unwrap()
+        )
+        .unwrap();
+        let response = daemon.line();
+        serde_json::from_str(response.strip_prefix("COMPLETION ").unwrap()).unwrap()
+    }
+    let Some(mut daemon) = Daemon::start() else {
+        return;
+    };
+    let local = daemon.root.path().join("local");
+    fs::create_dir_all(local.join("photo album 日本語")).unwrap();
+    fs::create_dir(local.join(".private")).unwrap();
+    fs::write(local.join("photo.txt"), b"not a directory").unwrap();
+    std::os::unix::fs::symlink("photo album 日本語", local.join("linked photos")).unwrap();
+    fs::create_dir_all(daemon.root.path().join("home/Downloads/nested")).unwrap();
+    daemon.command(&format!(
+        "lcd {}",
+        shlex::try_quote(local.to_str().unwrap()).unwrap()
+    ));
+    assert_eq!(
+        complete(&mut daemon, "pho").candidates,
+        vec!["photo album 日本語/"]
+    );
+    assert_eq!(
+        complete(&mut daemon, "").candidates,
+        vec!["linked photos/", "photo album 日本語/"]
+    );
+    assert_eq!(
+        complete(&mut daemon, "~/Do").candidates,
+        vec!["~/Downloads/"]
+    );
+    assert_eq!(complete(&mut daemon, "~").candidates, vec!["~/"]);
+    assert_eq!(complete(&mut daemon, ".pri").candidates, vec![".private/"]);
+    assert!(complete(&mut daemon, "new").candidates.is_empty());
+    fs::create_dir(local.join("new directory")).unwrap();
+    assert_eq!(
+        complete(&mut daemon, "new").candidates,
+        vec!["new directory/"]
+    );
+    assert!(daemon.command("jobs").is_empty());
+    daemon.connect("test-secret", true);
+    // The server has photos/, but lcd must still use the local filesystem.
+    assert_eq!(
+        complete(&mut daemon, "pho").candidates,
+        vec!["photo album 日本語/"]
+    );
+    writeln!(daemon.stream, "COMPLETE_LCD \"missing/\"").unwrap();
+    assert!(daemon.line().starts_with("COMPLETION_ERROR "));
+    assert!(daemon
+        .command("status")
+        .contains(&format!("CWD: {}/", daemon.remote().display())));
+    daemon.command("lcd ~/Downloads");
+    assert_eq!(complete(&mut daemon, "ne").candidates, vec!["nested/"]);
+    let response = daemon.command("close");
+    daemon.finish(response, true);
+}
+
+#[test]
+fn put_completion_is_local_file_only_and_selected_files_upload_from_local_cwd() {
+    fn complete(daemon: &mut Daemon, input: &str) -> Vec<String> {
+        writeln!(
+            daemon.stream,
+            "COMPLETE_PUT {}",
+            serde_json::to_string(input).unwrap()
+        )
+        .unwrap();
+        let response = daemon.line();
+        let completion: xfer::cache::PathCompletion =
+            serde_json::from_str(response.strip_prefix("COMPLETION ").unwrap()).unwrap();
+        completion.candidates
+    }
+    let Some(mut daemon) = Daemon::start() else {
+        return;
+    };
+    let local = daemon.root.path().join("local files");
+    fs::create_dir_all(local.join("photo directory")).unwrap();
+    let data = b"local\0\xfffile bytes";
+    fs::write(local.join("photo album 日本語.txt"), data).unwrap();
+    fs::write(local.join("-dash"), b"literal dash").unwrap();
+    std::os::unix::fs::symlink("photo album 日本語.txt", local.join("photo link")).unwrap();
+    fs::create_dir_all(daemon.root.path().join("home/Downloads")).unwrap();
+    fs::write(
+        daemon.root.path().join("home/Downloads/home.txt"),
+        b"home file",
+    )
+    .unwrap();
+    daemon.command(&format!(
+        "lcd {}",
+        shlex::try_quote(local.to_str().unwrap()).unwrap()
+    ));
+    let file = complete(&mut daemon, "pho");
+    assert_eq!(file, vec!["photo album 日本語.txt"]);
+    assert_eq!(
+        complete(&mut daemon, ""),
+        vec!["./-dash", "photo album 日本語.txt"]
+    );
+    assert!(daemon.command("jobs").is_empty());
+    let home = complete(&mut daemon, "~/Downloads/ho");
+    assert_eq!(home, vec!["~/Downloads/home.txt"]);
+    daemon.connect("test-secret", true);
+    // Prime remote completion to verify upload invalidates its old snapshot.
+    writeln!(daemon.stream, "COMPLETE_GET \"photo album\"").unwrap();
+    let response = daemon.line();
+    let old: xfer::cache::PathCompletion =
+        serde_json::from_str(response.strip_prefix("COMPLETION ").unwrap()).unwrap();
+    assert!(old.candidates.is_empty());
+    let response = daemon.command(&format!(
+        "put {} {}",
+        shlex::try_quote(&file[0]).unwrap(),
+        shlex::try_quote(&home[0]).unwrap()
+    ));
+    daemon.finish(response, true);
+    assert_eq!(fs::read(daemon.remote().join(&file[0])).unwrap(), data);
+    assert_eq!(
+        fs::read(daemon.remote().join("home.txt")).unwrap(),
+        b"home file"
+    );
+    writeln!(daemon.stream, "COMPLETE_GET \"photo album\"").unwrap();
+    let response = daemon.line();
+    let updated: xfer::cache::PathCompletion =
+        serde_json::from_str(response.strip_prefix("COMPLETION ").unwrap()).unwrap();
+    assert_eq!(updated.candidates, file);
+    assert_eq!(complete(&mut daemon, "-da"), vec!["-dash"]);
+    let response = daemon.command("put -- -dash");
+    daemon.finish(response, true);
+    assert_eq!(
+        fs::read(daemon.remote().join("-dash")).unwrap(),
+        b"literal dash"
+    );
+    let other = daemon.root.path().join("other local");
+    fs::create_dir(&other).unwrap();
+    fs::write(other.join("alternate.txt"), b"data").unwrap();
+    daemon.command(&format!(
+        "lcd {}",
+        shlex::try_quote(other.to_str().unwrap()).unwrap()
+    ));
+    assert!(complete(&mut daemon, "pho").is_empty());
+    assert_eq!(complete(&mut daemon, "alt"), vec!["alternate.txt"]);
+    assert!(daemon
+        .command("status")
+        .contains(&format!("CWD: {}/", daemon.remote().display())));
     let response = daemon.command("close");
     daemon.finish(response, true);
 }

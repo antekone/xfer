@@ -1,14 +1,18 @@
 //! Client-side Bash escapes with live terminal I/O, never daemon jobs.
 use anyhow::{Context, Result};
 use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 
-fn bash_command(source: &str) -> Command {
+fn bash_command(source: &str, directory: &Path) -> Command {
     let mut command = Command::new("bash");
     // Pass the source intact: Bash owns quoting, expansion, redirects, pipelines.
     command
         .arg("-c")
         .arg(source)
+        // Set only the child's directory. Never interpolate it into Bash source
+        // or chdir the client/daemon processes (configuration paths stay stable).
+        .current_dir(directory)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -75,9 +79,9 @@ impl Drop for TerminalGuard {
     }
 }
 
-pub fn run(source: &str) -> Result<ExitStatus> {
+pub fn run(source: &str, directory: &Path) -> Result<ExitStatus> {
     let _terminal = TerminalGuard::new().context("prepare terminal for local Bash command")?;
-    let mut command = bash_command(source);
+    let mut command = bash_command(source, directory);
     // SAFETY: only async-signal-safe libc operations run between fork and exec.
     unsafe {
         command.pre_exec(|| {
@@ -92,7 +96,9 @@ pub fn run(source: &str) -> Result<ExitStatus> {
             Ok(())
         });
     }
-    command.status().context("run installed bash")
+    command
+        .status()
+        .with_context(|| format!("run installed bash in {directory:?}"))
 }
 
 #[cfg(test)]
@@ -100,7 +106,8 @@ mod tests {
     use super::*;
     #[test]
     fn bash_handles_pipelines_quoting_expansion_and_both_output_streams() {
-        let output = bash_command("printf '%s\\n' \"$XFER_SHELL_TEST\" 'other' | grep 'some thing'; printf 'problem\\n' >&2; exit 7")
+        let directory = tempfile::tempdir().unwrap();
+        let output = bash_command("printf '%s\\n' \"$XFER_SHELL_TEST\" 'other' | grep 'some thing'; printf 'problem\\n' >&2; exit 7", directory.path())
             .env("XFER_SHELL_TEST", "some thing")
             .stdout(Stdio::piped()).stderr(Stdio::piped()).output().unwrap();
         assert_eq!(output.stdout, b"some thing\n");
@@ -108,17 +115,55 @@ mod tests {
         assert_eq!(output.status.code(), Some(7));
     }
     #[test]
-    fn bash_runs_in_the_callers_directory_and_cd_does_not_change_it() {
-        let directory = tempfile::tempdir().unwrap();
-        let output = bash_command("pwd; cd /; pwd")
-            .current_dir(directory.path())
+    fn bash_uses_selected_local_directory_without_changing_the_parent_or_persisting_cd() {
+        let parent = std::env::current_dir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().canonicalize().unwrap();
+        let output = bash_command("pwd; cd /; pwd", &directory)
             .stdout(Stdio::piped())
             .output()
             .unwrap();
         assert!(output.status.success());
         assert_eq!(
             String::from_utf8(output.stdout).unwrap(),
-            format!("{}\n/\n", directory.path().display())
+            format!("{}\n/\n", directory.display())
         );
+        assert_eq!(std::env::current_dir().unwrap(), parent);
+        let output = bash_command("pwd", &directory)
+            .stdout(Stdio::piped())
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("{}\n", directory.display())
+        );
+    }
+
+    #[test]
+    fn quoted_unicode_directory_names_are_not_interpreted_as_shell_source() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("photo 'album'; 日本語");
+        std::fs::create_dir(&directory).unwrap();
+        let output = bash_command("printf contents | cat > 'local file'; pwd", &directory)
+            .stdout(Stdio::piped())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            std::fs::read(directory.join("local file")).unwrap(),
+            b"contents"
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("{}\n", directory.canonicalize().unwrap().display())
+        );
+    }
+
+    #[test]
+    fn deleted_local_directory_is_an_error_not_a_fallback_to_client_cwd() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(bash_command("pwd", &directory.path().join("missing"))
+            .output()
+            .is_err());
     }
 }

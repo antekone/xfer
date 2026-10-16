@@ -88,8 +88,9 @@ fn common_completion_prefix(choices: &[String]) -> &str {
 fn path_completion_context(command: &str) -> Option<(String, String, String)> {
     let command = command.trim_start();
     let verb = command.split_whitespace().next()?;
-    let Completion::RemotePath { request, .. } = commands::completion_for(verb) else {
-        return None;
+    let request = match commands::completion_for(verb) {
+        Completion::RemotePath { request, .. } | Completion::LocalPath { request, .. } => request,
+        _ => return None,
     };
     let argument = command.strip_prefix(verb)?.trim_start();
     let mut tokens = shlex::split(argument)
@@ -172,7 +173,7 @@ fn complete_path_command(
         }
         if result.truncated {
             complete_set = false;
-            notices.push("completion listing limited to cached entries".to_owned());
+            notices.push("completion listing limited; type a longer prefix".to_owned());
         }
     } else if let Some(json) = response.strip_prefix("COMPLETION_ERROR ") {
         let error: String = serde_json::from_str(json)?;
@@ -217,7 +218,10 @@ fn complete_command(
 ) -> Result<Vec<String>> {
     let verb = command.split_whitespace().next().unwrap_or("");
     let completion = commands::completion_for(verb);
-    if matches!(completion, Completion::RemotePath { .. }) && command.contains(char::is_whitespace)
+    if matches!(
+        completion,
+        Completion::RemotePath { .. } | Completion::LocalPath { .. }
+    ) && command.contains(char::is_whitespace)
     {
         return complete_path_command(stream, reader, command);
     }
@@ -1189,6 +1193,30 @@ fn send_connection_password(
     Ok(())
 }
 
+/// Read daemon state for every shell escape, not a stale attach-time snapshot.
+fn read_local_directory(
+    stream: &mut UnixStream,
+    reader: &mut BufReader<UnixStream>,
+) -> Result<PathBuf> {
+    stream.write_all(b"LOCAL_CWD\n")?;
+    let mut response = String::new();
+    if reader.read_line(&mut response)? == 0 {
+        anyhow::bail!("daemon disconnected");
+    }
+    if let Some(error) = response.strip_prefix("LOCAL_CWD_ERROR ") {
+        let error: String = serde_json::from_str(error.trim())?;
+        anyhow::bail!("cannot read Local CWD: {error}");
+    }
+    let value = response.strip_prefix("LOCAL_CWD ").ok_or_else(|| {
+        anyhow::anyhow!("daemon cannot report Local CWD; restart it with the updated xfer")
+    })?;
+    let directory: PathBuf = serde_json::from_str(value.trim())?;
+    if !directory.is_absolute() {
+        anyhow::bail!("daemon returned a non-absolute Local CWD");
+    }
+    Ok(directory)
+}
+
 struct AttachedCommandContext<'a> {
     stream: &'a mut UnixStream,
     reader: &'a mut BufReader<UnixStream>,
@@ -1201,6 +1229,10 @@ impl ClientApp for AttachedCommandContext<'_> {
     }
     fn foreground(&mut self, id: u64) -> Result<()> {
         foreground_job(self.stream, self.reader, id, self.typeahead)
+    }
+    fn run_shell(&mut self, source: &str) -> Result<std::process::ExitStatus> {
+        let directory = read_local_directory(self.stream, self.reader)?;
+        xfer::local_shell::run(source, &directory)
     }
 }
 
@@ -1917,7 +1949,11 @@ mod startup_tests {
     fn complete_with_candidates(command: &str, candidates: &[&str], truncated: bool) -> String {
         let (mut client, server) = UnixStream::pair().unwrap();
         let candidates = candidates.iter().map(|value| value.to_string()).collect();
-        let expected = if command.starts_with("ls ") {
+        let expected = if command.starts_with("lcd ") {
+            "COMPLETE_LCD "
+        } else if command.starts_with("put ") {
+            "COMPLETE_PUT "
+        } else if command.starts_with("ls ") {
             "COMPLETE_LS "
         } else if command.starts_with("get ") || command.starts_with("cat ") {
             "COMPLETE_GET "
@@ -1949,6 +1985,84 @@ mod startup_tests {
     }
 
     #[test]
+    fn put_completion_uses_local_files_and_preserves_prior_filenames_and_flags() {
+        for (input, head, path) in [
+            ("put ", "put", ""),
+            ("put first.txt pho", "put first.txt", "pho"),
+            ("put -- -fi", "put --", "-fi"),
+            ("put ~/Downloads/fi", "put", "~/Downloads/fi"),
+        ] {
+            assert_eq!(
+                path_completion_context(input).unwrap(),
+                (head.into(), path.into(), "COMPLETE_PUT".into())
+            );
+        }
+        assert!(path_completion_context("put -bad file").is_none());
+        assert!(path_completion_context("put -bad").is_none());
+        assert_eq!(
+            shlex::split(&complete_with_candidates(
+                "put 'first file' pho",
+                &["photo album 日本語.txt"],
+                false
+            ))
+            .unwrap(),
+            vec!["put", "first file", "photo album 日本語.txt"]
+        );
+        assert_eq!(
+            shlex::split(&complete_with_candidates(
+                "put -- -fi",
+                &["-file name"],
+                false
+            ))
+            .unwrap(),
+            vec!["put", "--", "-file name"]
+        );
+        assert_eq!(
+            complete_with_candidates("put pho", &["photo1", "photo2"], true),
+            "put pho"
+        );
+    }
+
+    #[test]
+    fn lcd_completion_routes_to_local_filesystem_and_quotes_unicode_and_space_names() {
+        for (input, path) in [
+            ("lcd ", ""),
+            ("lcd ~/Do", "~/Do"),
+            ("lcd ../pho", "../pho"),
+            ("lcd 'photo alb", "photo alb"),
+            ("lcd /tmp/pho", "/tmp/pho"),
+        ] {
+            assert_eq!(
+                path_completion_context(input).unwrap(),
+                ("lcd".into(), path.into(), "COMPLETE_LCD".into())
+            );
+        }
+        assert!(path_completion_context("lcd two arguments").is_none());
+        assert_eq!(
+            shlex::split(&complete_with_candidates(
+                "lcd 'photo a",
+                &["photo album 日本語/"],
+                false
+            ))
+            .unwrap(),
+            vec!["lcd", "photo album 日本語/"]
+        );
+        assert_eq!(
+            shlex::split(&complete_with_candidates(
+                "lcd ~/Do",
+                &["~/Downloads/"],
+                false
+            ))
+            .unwrap(),
+            vec!["lcd", "~/Downloads/"]
+        );
+        assert_eq!(
+            complete_with_candidates("lcd pho", &["photo album/", "photos/"], true),
+            "lcd pho"
+        );
+    }
+
+    #[test]
     fn get_completion_preserves_continue_flag_and_prior_filenames() {
         assert_eq!(
             path_completion_context("get -c first.txt pho").unwrap(),
@@ -1973,6 +2087,90 @@ mod startup_tests {
             vec!["get", "-c", "first.txt", "photo album.jpg"]
         );
     }
+    #[test]
+    fn local_directory_lookup_reads_fresh_json_state_and_leaves_following_responses_intact() {
+        let directories = vec![
+            PathBuf::from("/tmp/Pobrane"),
+            PathBuf::from("/tmp/photo 'album'\n日本語"),
+        ];
+        let expected = directories.clone();
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            let mut reader = BufReader::new(server.try_clone().unwrap());
+            for directory in directories {
+                let mut request = String::new();
+                reader.read_line(&mut request).unwrap();
+                assert_eq!(request, "LOCAL_CWD\n");
+                writeln!(
+                    server,
+                    "LOCAL_CWD {}",
+                    serde_json::to_string(&directory).unwrap()
+                )
+                .unwrap();
+            }
+            writeln!(server, "SENTINEL").unwrap();
+        });
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        for directory in expected {
+            assert_eq!(
+                read_local_directory(&mut client, &mut reader).unwrap(),
+                directory
+            );
+        }
+        let mut remaining = String::new();
+        reader.read_line(&mut remaining).unwrap();
+        assert_eq!(remaining, "SENTINEL\n");
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn local_directory_lookup_errors_never_fall_back_to_the_clients_startup_directory() {
+        for response in [
+            "",
+            "ERROR unknown request\n",
+            "LOCAL_CWD not-json\n",
+            "LOCAL_CWD \"relative/path\"\n",
+            "LOCAL_CWD_ERROR \"unavailable\"\n",
+        ] {
+            let (mut client, mut server) = UnixStream::pair().unwrap();
+            let worker = std::thread::spawn(move || {
+                let mut request = String::new();
+                BufReader::new(server.try_clone().unwrap())
+                    .read_line(&mut request)
+                    .unwrap();
+                assert_eq!(request, "LOCAL_CWD\n");
+                write!(server, "{response}").unwrap();
+            });
+            let mut reader = BufReader::new(client.try_clone().unwrap());
+            assert!(
+                read_local_directory(&mut client, &mut reader).is_err(),
+                "{response:?}"
+            );
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn mkdir_completion_preserves_parent_flag_multiple_operands_and_quoted_names() {
+        assert_eq!(
+            path_completion_context("mkdir -p first second/sub").unwrap(),
+            (
+                "mkdir -p first".into(),
+                "second/sub".into(),
+                "COMPLETE_CD".into()
+            )
+        );
+        let completed =
+            complete_with_candidates("mkdir -p 'first dir' pho", &["photo album/"], false);
+        assert_eq!(
+            shlex::split(&completed).unwrap(),
+            vec!["mkdir", "-p", "first dir", "photo album/"]
+        );
+        assert!(path_completion_context("mkdir -x path").is_none());
+        assert!(path_completion_context("mkdir -p").is_none());
+        assert_eq!(path_completion_context("mkdir -- -p").unwrap().1, "-p");
+    }
+
     #[test]
     fn cat_completion_handles_multiple_quoted_paths_and_literal_dash_names() {
         assert_eq!(
@@ -2186,6 +2384,20 @@ mod startup_tests {
     fn completion_at_the_caret_preserves_later_arguments_and_uses_the_renamed_setting() {
         for (text, before, expected_request, response, expected) in [
             (
+                "put 'photo old.txt' later.txt",
+                "put 'pho",
+                "COMPLETE_PUT \"pho\"\n",
+                "COMPLETION {\"candidates\":[\"photo album.txt\"],\"truncated\":false}\n",
+                "put 'photo album.txt' later.txt",
+            ),
+            (
+                "lcd 'photo old'",
+                "lcd 'pho",
+                "COMPLETE_LCD \"pho\"\n",
+                "COMPLETION {\"candidates\":[\"photo album/\"],\"truncated\":false}\n",
+                "lcd 'photo album/'",
+            ),
+            (
                 "get -c 'photo album' second.txt",
                 "get -c 'pho",
                 "COMPLETE_GET \"pho\"\n",
@@ -2224,15 +2436,36 @@ mod startup_tests {
     }
 
     #[test]
-    fn shell_escapes_are_local_and_record_the_original_command_once() {
+    fn shell_escapes_use_local_cwd_and_record_the_original_command_once() {
         let directory = tempfile::tempdir().unwrap();
+        let selected = directory.path().canonicalize().unwrap();
         let history = directory.path().join("history");
         let result = directory.path().join("result with spaces");
+        let pwd = directory.path().join("pwd");
         let command = format!(
-            "!printf '%s' 'some thing' | grep 'some thing' > {}",
+            "!pwd > {}; printf '%s' 'some thing' | grep 'some thing' > {}",
+            shlex::try_quote(pwd.to_str().unwrap()).unwrap(),
             shlex::try_quote(result.to_str().unwrap()).unwrap()
         );
         let (mut client, mut server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let expected = selected.clone();
+        let worker = std::thread::spawn(move || {
+            let mut request = String::new();
+            BufReader::new(server.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            assert_eq!(request, "LOCAL_CWD\n");
+            writeln!(
+                server,
+                "LOCAL_CWD {}",
+                serde_json::to_string(&expected).unwrap()
+            )
+            .unwrap();
+            server
+        });
         let mut reader = BufReader::new(client.try_clone().unwrap());
         assert!(dispatch_attached_command(
             &mut client,
@@ -2243,8 +2476,13 @@ mod startup_tests {
         )
         .unwrap());
         assert_eq!(fs::read_to_string(&result).unwrap(), "some thing\n");
+        assert_eq!(
+            fs::read_to_string(pwd).unwrap(),
+            format!("{}\n", selected.display())
+        );
         assert_eq!(fs::read_to_string(history).unwrap(), format!("{command}\n"));
-        // No IPC request or daemon job for a local shell command.
+        // Only directory metadata is requested; Bash source never goes to the daemon.
+        let mut server = worker.join().unwrap();
         server.set_nonblocking(true).unwrap();
         let mut byte = [0];
         assert_eq!(

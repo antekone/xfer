@@ -128,6 +128,27 @@ pub async fn run() -> Result<()> {
                         }
                         let _ = writer.flush();
                     }
+                    Ok(_) if request.trim() == "LOCAL_CWD" => {
+                        let result = serde_json::to_string(
+                            &daemon
+                                .lock()
+                                .expect("daemon state poisoned")
+                                .local_directory,
+                        );
+                        match result {
+                            Ok(path) => {
+                                let _ = writeln!(writer, "LOCAL_CWD {path}");
+                            }
+                            Err(error) => {
+                                let _ = writeln!(
+                                    writer,
+                                    "LOCAL_CWD_ERROR {}",
+                                    serde_json::to_string(&error.to_string()).unwrap()
+                                );
+                            }
+                        }
+                        let _ = writer.flush();
+                    }
                     Ok(_) if request.starts_with("LOCAL_CWD ") => {
                         let result = serde_json::from_str::<String>(request[10..].trim())
                             .map_err(anyhow::Error::from)
@@ -161,11 +182,30 @@ pub async fn run() -> Result<()> {
                         if request.starts_with("COMPLETE_CD ")
                             || request.starts_with("COMPLETE_LS ")
                             || request.starts_with("COMPLETE_GET ")
-                            || request.starts_with("COMPLETE_BOOKMARK ") =>
+                            || request.starts_with("COMPLETE_BOOKMARK ")
+                            || request.starts_with("COMPLETE_LCD ")
+                            || request.starts_with("COMPLETE_PUT ") =>
                     {
                         let result = match serde_json::from_str::<String>(
                             request.split_once(' ').unwrap().1.trim(),
                         ) {
+                            Ok(input)
+                                if request.starts_with("COMPLETE_LCD ")
+                                    || request.starts_with("COMPLETE_PUT ") =>
+                            {
+                                let directory = daemon
+                                    .lock()
+                                    .expect("daemon state poisoned")
+                                    .local_directory
+                                    .clone();
+                                // Local filesystem only, independent of the backend and its
+                                // connection lock. Re-read each time, using fresh Local CWD.
+                                if request.starts_with("COMPLETE_PUT ") {
+                                    crate::local_path::complete_files(&directory, &input)
+                                } else {
+                                    crate::local_path::complete_directories(&directory, &input)
+                                }
+                            }
                             Ok(input) => {
                                 // Do not hold the daemon-state mutex over network I/O.
                                 let daemon = daemon.lock().expect("daemon state poisoned");

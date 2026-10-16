@@ -5,7 +5,6 @@ use crate::{
     credentials::Password,
 };
 use anyhow::{bail, Result};
-use std::path::PathBuf;
 
 pub(crate) mod bookmark;
 pub(crate) mod cat;
@@ -14,6 +13,7 @@ pub(crate) mod connect;
 pub(crate) mod du;
 pub(crate) mod get;
 pub(crate) mod ls;
+pub(crate) mod mkdir;
 pub(crate) mod output;
 pub(crate) mod put;
 pub(crate) mod shell;
@@ -30,6 +30,10 @@ pub enum Completion {
     None,
     Settings,
     RemotePath {
+        request: &'static str,
+        multiple_arguments: bool,
+    },
+    LocalPath {
         request: &'static str,
         multiple_arguments: bool,
     },
@@ -79,6 +83,7 @@ impl<'a> ParserContext<'a> {
 pub trait ClientApp {
     fn detach(&mut self) -> Result<()>;
     fn foreground(&mut self, id: crate::core::JobId) -> Result<()>;
+    fn run_shell(&mut self, source: &str) -> Result<std::process::ExitStatus>;
 }
 
 pub enum CommandContext<'a> {
@@ -160,6 +165,9 @@ pub trait Command: Sync {
         match self.completion() {
             Completion::RemotePath {
                 multiple_arguments, ..
+            }
+            | Completion::LocalPath {
+                multiple_arguments, ..
             } => multiple_arguments || arguments.is_empty(),
             _ => false,
         }
@@ -178,6 +186,7 @@ pub static COMMANDS: &[&dyn Command] = &[
     &PWD,
     &LCD,
     &ls::Ls,
+    &mkdir::Mkdir,
     &du::Du,
     &get::Get,
     &put::Put,
@@ -368,14 +377,20 @@ static PWD: SmallCommand = small(
     Some(("pwd", "print backend working directory")),
     pwd,
 );
-static LCD: SmallCommand = small(
-    &["lcd"],
-    Some((
-        "lcd [directory]",
-        "change daemon local download directory (default: home)",
-    )),
-    lcd,
-);
+static LCD: SmallCommand = SmallCommand {
+    completion: Completion::LocalPath {
+        request: "COMPLETE_LCD",
+        multiple_arguments: false,
+    },
+    ..small(
+        &["lcd"],
+        Some((
+            "lcd [directory]",
+            "change local directory for transfers and Bash (default: home)",
+        )),
+        lcd,
+    )
+};
 static JOBS: SmallCommand = small(&["jobs"], Some(("jobs", "list daemon jobs")), jobs);
 static CANCEL: SmallCommand = small(
     &["cancel"],
@@ -482,21 +497,8 @@ fn lcd(context: &mut CommandContext<'_>, parser: &ParserContext<'_>) -> Result<C
         [path] if !path.is_empty() => path.as_str(),
         _ => return Ok(vec!["usage: lcd [directory]".into()].into()),
     };
-    let home = || {
-        std::env::var_os("HOME")
-            .filter(|home| !home.is_empty())
-            .map(PathBuf::from)
-            .ok_or_else(|| anyhow::anyhow!("cannot resolve local home directory: HOME is not set"))
-    };
-    let path = if path == "~" {
-        home()?
-    } else if let Some(relative) = path.strip_prefix("~/") {
-        home()?.join(relative.trim_start_matches('/'))
-    } else {
-        PathBuf::from(path)
-    };
     let app = context.daemon()?;
-    let path = app.local_directory.join(path);
+    let path = crate::local_path::resolve(&app.local_directory, path)?;
     app.set_local_directory(path)
         .map_err(|error| anyhow::anyhow!("cannot change local directory: {error}"))?;
     Ok(vec![format!("Local CWD: {}", app.local_directory.display())].into())
@@ -649,6 +651,14 @@ mod tests {
         assert_eq!(completion_for("show"), Completion::Settings);
         assert_eq!(completion_for("set"), Completion::Settings);
         assert_eq!(
+            completion_for("lcd"),
+            Completion::LocalPath {
+                request: "COMPLETE_LCD",
+                multiple_arguments: false
+            }
+        );
+
+        assert_eq!(
             completion_for("cd"),
             Completion::RemotePath {
                 request: "COMPLETE_CD",
@@ -747,6 +757,7 @@ mod tests {
     struct MockClient {
         detached: bool,
         foreground: Vec<u64>,
+        shell_sources: Vec<String>,
     }
     impl ClientApp for MockClient {
         fn detach(&mut self) -> Result<()> {
@@ -756,6 +767,11 @@ mod tests {
         fn foreground(&mut self, id: u64) -> Result<()> {
             self.foreground.push(id);
             Ok(())
+        }
+        fn run_shell(&mut self, source: &str) -> Result<std::process::ExitStatus> {
+            use std::os::unix::process::ExitStatusExt;
+            self.shell_sources.push(source.into());
+            Ok(std::process::ExitStatus::from_raw(0))
         }
     }
     fn client_command(client: &mut MockClient, line: &str) -> CommandResult {
@@ -789,6 +805,22 @@ mod tests {
                 .unwrap()
                 .record_history());
         }
+    }
+
+    #[test]
+    fn shell_uses_client_adapter_and_preserves_the_entire_bash_source() {
+        let mut client = MockClient::default();
+        let source = " printf '%s\\n' 'a | b' | grep a > 'some file'; echo \"$PWD\"  ";
+        assert_eq!(
+            client_command(&mut client, &format!("!{source}")),
+            CommandResult::Output(Vec::new())
+        );
+        assert_eq!(client.shell_sources, vec![source]);
+        assert_eq!(
+            client_command(&mut client, "!  "),
+            CommandResult::Output(vec!["usage: !<bash command>".into()])
+        );
+        assert_eq!(client.shell_sources.len(), 1);
     }
 
     #[test]

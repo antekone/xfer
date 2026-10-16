@@ -702,6 +702,12 @@ impl Connection for SftpConnection {
         self.cwd = lease.finish(result)?;
         Ok(())
     }
+    async fn create_directory(&self, path: &str, parents: bool) -> Result<()> {
+        let path = normalize(&self.cwd, path);
+        let lease = self.acquire().await?;
+        let result = mkdir_on(&lease.session.sftp, &path, parents).await;
+        lease.finish(result)
+    }
     async fn list(&self, path: &str, output: &mut dyn ListingSink) -> Result<u64> {
         let path = self.resolve_listing_path(path)?;
         let lease = self.acquire().await?;
@@ -753,6 +759,35 @@ impl Connection for SftpConnection {
             Err(_) => Err(permanent("SFTP close timed out")),
         }
     }
+}
+
+async fn mkdir_on(sftp: &Client, path: &str, parents: bool) -> Result<()> {
+    if !parents {
+        return operation(sftp.fs().create_dir(path)).await;
+    }
+    let mut ancestor = String::new();
+    for component in path.split('/').filter(|part| !part.is_empty()) {
+        ancestor.push('/');
+        ancestor.push_str(component);
+        match operation(sftp.fs().create_dir(&ancestor)).await {
+            Ok(()) => {}
+            Err(error) if error.is::<TransportError>() => return Err(error),
+            Err(error) => {
+                // SFTP v3 often reports only Failure for an existing entry.
+                // Follow symlinks and accept only a verified directory;
+                // unreadable/missing paths and file collisions remain errors.
+                match operation(sftp.fs().metadata(&ancestor)).await {
+                    Ok(metadata) if metadata.file_type().is_some_and(|kind| kind.is_dir()) => {}
+                    Ok(_) => {
+                        return Err(permanent(format!("not a remote directory: {ancestor:?}")))
+                    }
+                    Err(error) if error.is::<TransportError>() => return Err(error),
+                    Err(_) => return Err(error),
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn list_on(sftp: &Client, path: &str, output: &mut dyn ListingSink) -> Result<u64> {

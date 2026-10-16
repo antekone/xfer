@@ -37,6 +37,48 @@ smb:max-credits: 32
 S3 and SFTP support connect, navigation, listing and downloads. SFTP also supports
 uploads with `put`; S3 uploads, mirroring, and SMB operations are not implemented yet.
 
+## Creating remote directories
+
+`mkdir [-p] [--] <directories...>` creates remote directories on SFTP or directory
+markers on S3:
+
+```text
+mkdir downloads
+mkdir -p multiple/subdirs/at/once
+mkdir -p 'photo album/originals' archive/2026
+mkdir -- -directory
+```
+
+Paths are relative to remote `pwd`, or absolute when starting with `/`; neither
+remote CWD nor Local CWD changes. `-p` (also `--parents`) creates missing ancestors
+and accepts existing directories. Without it, missing parents and existing
+destinations are errors. SFTP accepts symlinks to directories with `-p` but rejects
+file collisions. Permission failures remain errors; successful commands are
+silent. TAB completes existing directories, including after `-p` and earlier
+operands.
+
+Creation runs as a cancellable job and refreshes the completion cache. `-p` can
+safely retry after a transport failure using the normal backoff/reconnect policy.
+Plain `mkdir` is not automatically replayed by the job: if the server creates the
+directory but its reply is lost, inspect the result before retrying. Errors stop
+at the first failed operand; directories already created are not rolled back.
+
+S3 directories are virtual prefixes. New directories are zero-byte objects whose
+keys end in `/`; `mkdir -p a/b/c` creates `a/`, `a/b/`, and `a/b/c/` when missing.
+Prefixes already containing objects count as existing directories and are left
+untouched with `-p`, without adding unnecessary markers. A bare object `a` and a
+directory `a/` are distinct and may coexist; creating the latter never replaces
+the former. Absolute S3 paths start with `/bucket/`. Buckets must already exist:
+`mkdir` never creates buckets, and `mkdir -p /existing-bucket/` only validates it.
+
+S3 requires `s3:ListBucket` and, for new markers, `s3:PutObject` permissions. Marker
+writes use `If-None-Match: *` to prevent overwriting any existing trailing-slash
+object, including concurrent creations. The endpoint must support conditional
+PutObject; xfer does not fall back to unconditional writes. Existence checks for
+implicit prefixes are not atomic with concurrent writers, but existing objects
+are never replaced. Invalid requests, access denial, and missing buckets fail
+without entering an endless retry loop.
+
 ## Remote directory usage
 
 `du [paths...]` recursively lists the byte total for each remote directory,
@@ -78,7 +120,7 @@ private Unix socket. There is no separate `xferd` binary.
 ## Local shell commands
 
 Start a line with `!` to run the rest verbatim using the installed `bash -c`, locally
-in the attached client's working directory:
+in **Local CWD** (the directory selected with `lcd`):
 
 ```text
 !pwd
@@ -93,7 +135,12 @@ Bash handles quoting, variables, redirection and pipelines. Input, stdout and st
 are attached directly to the terminal, so editors work and output is not paged or
 captured as a daemon job. Ctrl-C interrupts the local command without exiting xfer.
 A failure reports the exit status and returns to the prompt. Each invocation is a
-separate shell: `!cd ...` and `!export ...` do not change xfer's directory/environment.
+separate shell: `!cd ...` and `!export ...` do not change xfer's Local CWD or environment.
+The client fetches Local CWD from the daemon for every invocation, so `lcd` takes
+effect immediately for `!pwd`, relative file paths, redirects, and local editors.
+Only the child Bash process changes directory; configuration paths and xfer's own
+process CWD remain unchanged. If Local CWD has been deleted or cannot be entered,
+the command reports an error rather than falling back to the startup directory.
 The original `!` line follows normal command history rules; rc lines use the same
 execution path without being added to history. A bare `!` prints usage.
 
@@ -554,6 +601,31 @@ Contents are emitted verbatim, including terminal control sequences: only displa
 trusted files. Ordinary terminal newline processing still applies. If the final
 byte is not a newline, the interactive UI puts its next prompt on a separate line.
 
+## Uploads and local file completion
+
+`put [--] <files...>` uploads regular local files to the current remote SFTP
+directory. Local relative paths use Local CWD (selected with `lcd`); absolute
+paths and literal `~/...` paths are also accepted.
+
+TAB completes **regular local files only**, for each operand, including after
+`--`. It reads Local CWD afresh, independent of the remote connection, and works
+before connecting. Directory names, final symlinks, and special files are not
+suggested, matching upload preflight. For nested paths, type the parent directory
+prefix before completing the filename. Spaces and Unicode are quoted safely,
+hidden files require a `.` prefix, and completion at the caret preserves later
+arguments.
+
+```text
+put report.txt
+put 'first file.txt' second.txt
+put ~/Downloads/report.txt
+put -- -filename
+```
+
+Uploads preserve each basename on the server. Successful uploads invalidate the
+remote completion cache so new files are visible immediately. S3 uploads remain
+unsupported; S3 directory markers from `mkdir` are separate from file uploads.
+
 ## Downloads
 
 ```text
@@ -570,12 +642,22 @@ working directory**, preserving each basename (`photos/image.jpg` becomes
 such as `/bucket/path/file` also work. The client initializes the daemon's local
 directory from its own CWD on each attach. `status` shows Local CWD.
 
-`lcd [directory]` changes this local directory for subsequent downloads. Relative
+`lcd [directory]` changes this local directory for subsequent downloads, uploads,
+and `!` shell commands. Relative
 paths resolve against the previous Local CWD; absolute paths, `..`, quoted names
 with spaces, and `~`/`~/...` are supported. With no argument, `lcd` selects the
 daemon's `$HOME`. The directory must already exist; errors leave Local CWD
-unchanged. This does not change the remote CWD, attached client's directory (used
-by `!` commands), or process-wide CWD used for configuration paths.
+unchanged. Symlinks are resolved to their physical destination, so a `Downloads`
+symlink may display its target directory instead. This does not change remote CWD
+or the client/daemon process-wide CWD used for configuration paths.
+
+TAB completes local directories against the current Local CWD, not remote `pwd`
+or the client's startup directory. Relative, absolute, `../`, and `~/` paths,
+quoted spaces, Unicode, and symlinks to directories work. Files and broken links
+are not suggested; hidden directories are suggested when the filename prefix
+starts with `.`. Completion reads the filesystem afresh and works disconnected.
+Matching results are bounded; incomplete sets are marked and do not auto-extend
+the command to a potentially misleading common prefix.
 
 ```text
 lcd ~/Downloads
@@ -631,7 +713,7 @@ Help and command-name completion sort names alphabetically, including aliases.
 Small commands (`help`, `lcd`, `pwd`, `show`, `set`, jobs, and client session controls) are
 grouped in `commands.rs` using `SmallCommand`, which implements `Command`. Larger
 handlers live in dedicated modules under `src/commands/`: `connect.rs`, `cat.rs`, `get.rs`,
-`ls.rs`, `cd.rs`, `bookmark.rs`, `status.rs`, `output.rs`, and `shell.rs`.
+`ls.rs`, `mkdir.rs`, `cd.rs`, `bookmark.rs`, `status.rs`, `output.rs`, and `shell.rs`.
 
 Each implementation provides `names()` (canonical name and aliases) and
 `handler()`, returning a function with this signature:

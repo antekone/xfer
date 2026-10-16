@@ -80,6 +80,7 @@ pub mod credentials;
 pub mod daemon_server;
 pub mod error;
 pub mod listing;
+mod local_path;
 pub mod local_shell;
 pub mod s3;
 pub mod sftp;

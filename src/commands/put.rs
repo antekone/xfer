@@ -1,5 +1,5 @@
 //! Upload local files to the current remote directory.
-use super::{Command, CommandContext, CommandResult, Handler, ParserContext};
+use super::{Command, CommandContext, CommandResult, Completion, Handler, ParserContext};
 use crate::{
     error::NonRetryableError,
     transfer::{backoff, has_wildmat, safe_name, wildmat, TransferProgress},
@@ -26,8 +26,25 @@ impl Command for Put {
             "upload local files to the remote directory",
         ))
     }
+    fn completion(&self) -> Completion {
+        Completion::LocalPath {
+            request: "COMPLETE_PUT",
+            multiple_arguments: true,
+        }
+    }
+    fn accepts_path_completion(&self, arguments: &[String], path: &str) -> bool {
+        parse_files(arguments.iter()).is_ok()
+            && (!path.starts_with('-') || arguments.iter().any(|word| word == "--"))
+    }
 }
 fn args(words: impl Iterator<Item = impl AsRef<str>>) -> Result<Vec<String>> {
+    let files = parse_files(words)?;
+    if files.is_empty() {
+        bail!("usage: put [--] <files...>");
+    }
+    Ok(files)
+}
+fn parse_files(words: impl Iterator<Item = impl AsRef<str>>) -> Result<Vec<String>> {
     let mut files = Vec::new();
     let mut options = true;
     for word in words {
@@ -39,9 +56,6 @@ fn args(words: impl Iterator<Item = impl AsRef<str>>) -> Result<Vec<String>> {
             }
             file => files.push(file.to_owned()),
         }
-    }
-    if files.is_empty() {
-        bail!("usage: put [--] <files...>");
     }
     Ok(files)
 }
@@ -89,7 +103,7 @@ fn plans(files: Vec<String>, directory: &Path) -> Result<Vec<Plan>> {
     let mut names = HashSet::new();
     let mut plans = Vec::new();
     for input in files {
-        let local = directory.join(&input);
+        let local = crate::local_path::resolve(directory, &input)?;
         let metadata = fs::symlink_metadata(&local)
             .map_err(|e| NonRetryableError(format!("local file {}: {e}", local.display())))?;
         if !metadata.file_type().is_file() {
@@ -188,6 +202,32 @@ mod tests {
             .to_string()
             .contains("unknown put option"));
         assert!(args(std::iter::empty::<&str>()).is_err());
+    }
+
+    #[test]
+    fn completion_uses_local_files_for_every_operand_and_honors_end_of_options() {
+        assert_eq!(
+            Put.completion(),
+            Completion::LocalPath {
+                request: "COMPLETE_PUT",
+                multiple_arguments: true
+            }
+        );
+        for (arguments, path, valid) in [
+            (vec![], "", true),
+            (vec!["first file"], "second", true),
+            (vec!["--", "-first"], "-second", true),
+            (vec![], "-bad", false),
+            (vec!["-bad"], "file", false),
+        ] {
+            assert_eq!(
+                Put.accepts_path_completion(
+                    &arguments.into_iter().map(String::from).collect::<Vec<_>>(),
+                    path
+                ),
+                valid
+            );
+        }
     }
 
     #[test]

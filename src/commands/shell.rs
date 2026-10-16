@@ -1,6 +1,6 @@
 //! Local Bash escapes. Bash receives untouched source and owns the terminal.
 use super::{Command, CommandContext, CommandResult, ExecutionSite, Handler, ParserContext};
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 
 pub(super) struct Shell;
 impl Command for Shell {
@@ -14,7 +14,7 @@ impl Command for Shell {
         ExecutionSite::Client
     }
     fn help(&self) -> Option<(&'static str, &'static str)> {
-        Some(("!<command>", "run local Bash command"))
+        Some(("!<command>", "run local Bash command in Local CWD"))
     }
 }
 
@@ -26,7 +26,10 @@ fn execute(context: &mut CommandContext<'_>, parser: &ParserContext<'_>) -> Resu
     if source.trim().is_empty() {
         return Ok(vec!["usage: !<bash command>".into()].into());
     }
-    let status = crate::local_shell::run(source).context("cannot run local command")?;
+    let status = context
+        .client()?
+        .run_shell(source)
+        .map_err(|error| anyhow::anyhow!("cannot run local command: {error:#}"))?;
     if !status.success() {
         bail!("bash exited with {status}");
     }

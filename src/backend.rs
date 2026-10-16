@@ -65,6 +65,11 @@ pub trait Connection: Send + Sync {
     async fn change_directory(&mut self, _path: &str) -> Result<()> {
         Err(NonRetryableError(format!("cd is not implemented for {}", self.protocol())).into())
     }
+    /// Create a remote directory; parents allows existing directories and creates
+    /// missing ancestors. Implementations must not change the working directory.
+    async fn create_directory(&self, _path: &str, _parents: bool) -> Result<()> {
+        Err(NonRetryableError(format!("mkdir is not implemented for {}", self.protocol())).into())
+    }
     async fn complete_directories(&self, _input: &str) -> Result<crate::cache::PathCompletion> {
         bail!(
             "directory completion is not available for {}",
