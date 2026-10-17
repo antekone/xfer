@@ -29,13 +29,7 @@ use zeroize::{Zeroize, Zeroizing};
 // ------------------------------------------------------------------------------------------------
 
 fn default_history_path() -> String {
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".local/state"))
-        })
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    base.join("xfer/history").display().to_string()
+    crate::state_dir().join("history").display().to_string()
 }
 
 /// Lightweight committed session state: safe to query while a job owns the

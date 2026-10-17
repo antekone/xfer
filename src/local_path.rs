@@ -9,16 +9,9 @@ use std::{
 const MAX_CANDIDATES: usize = 2048;
 const MAX_BYTES: usize = 1024 * 1024;
 
-fn home() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-}
 fn resolve_with_home(base: &Path, input: &str, home: Option<&Path>) -> Result<PathBuf> {
     let path = if input == "~" || input.starts_with("~/") {
-        let home = home.ok_or_else(|| {
-            anyhow::anyhow!("cannot resolve local home directory: HOME is not set")
-        })?;
+        let home = home.ok_or_else(|| anyhow::anyhow!("cannot determine local home directory"))?;
         home.join(
             input
                 .strip_prefix("~/")
@@ -31,13 +24,13 @@ fn resolve_with_home(base: &Path, input: &str, home: Option<&Path>) -> Result<Pa
     Ok(base.join(path))
 }
 pub(crate) fn resolve(base: &Path, input: &str) -> Result<PathBuf> {
-    resolve_with_home(base, input, home().as_deref())
+    resolve_with_home(base, input, crate::home_dir().as_deref())
 }
 pub(crate) fn complete_directories(base: &Path, input: &str) -> Result<PathCompletion> {
-    complete_with_home(base, input, home().as_deref())
+    complete_with_home(base, input, crate::home_dir().as_deref())
 }
 pub(crate) fn complete_files(base: &Path, input: &str) -> Result<PathCompletion> {
-    complete(base, input, home().as_deref(), Kind::Files)
+    complete(base, input, crate::home_dir().as_deref(), Kind::Files)
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {

@@ -1488,8 +1488,8 @@ fn attach(id: Option<&str>) -> Result<()> {
     }
     match line.trim() {
         "RUN_STARTUP" => {
-            if let Some(home) = std::env::var_os("HOME") {
-                let path = std::path::absolute(PathBuf::from(home).join(".xferrc"))?;
+            if let Some(home) = xfer::home_dir() {
+                let path = std::path::absolute(home.join(".xferrc"))?;
                 let commands = read_startup_commands(&path)?;
                 if !commands.is_empty() {
                     report_startup_file(&mut stream, &mut reader, &path)?;

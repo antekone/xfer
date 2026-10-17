@@ -21,10 +21,35 @@ Try `help`, `open <bookmark>`, `ls`, `get <filename>`, `jobs`, and `status`.
 
 ## Configuration
 
-`$XDG_CONFIG_HOME/xfer/xfer.conf` (normally `~/.config/xfer/xfer.conf`) is read
-first; `XFER_CONFIG`, if set, is read afterward and overrides it. Missing files
-are ignored; `status` marks them as not loaded. The working directory is not
-searched for configuration. The format is `name: value`, including namespaced keys:
+`xfer.conf` in the per-user application config directory is read first;
+`XFER_CONFIG`, if set, is read afterward and overrides it. Missing files are
+ignored; `status` marks them as not loaded. The working directory is not
+searched for configuration.
+
+Directory lookup is centralized in `src/paths.rs` using the cross-platform
+`directories` crate. Default locations are:
+
+| Platform | Configuration | Cache / job spools | State / history |
+|---|---|---|---|
+| Linux | `~/.config/xfer` | `~/.cache/xfer` | `~/.local/state/xfer` |
+| macOS | `~/Library/Application Support/xfer` | `~/Library/Caches/xfer` | `~/Library/Application Support/xfer` |
+| Windows | `%APPDATA%\xfer\config` | `%LOCALAPPDATA%\xfer\cache` | `%LOCALAPPDATA%\xfer\data` |
+
+Absolute `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, and `XDG_STATE_HOME` values override
+these roots on any platform, with `xfer` appended. Empty or relative XDG values
+are ignored. On Linux, unset XDG variables use the defaults above; an unset or
+empty `HOME` falls back to the OS account database. Windows uses Known Folders,
+not the presence of Unix environment variables. Home-relative paths (`~`, `lcd`,
+and `~/.xferrc`) use the same native home-directory lookup.
+
+Daemon sockets/discovery files use `$XDG_RUNTIME_DIR/xfer/instances` when that
+variable is absolute, otherwise `<state-directory>/instances`. Newly created
+runtime directories are private (0700 on Unix); no paths fall back to the process
+working directory. Raw `cat` contents still use private temporary spools.
+This is portable directory discovery, not a complete Windows port: IPC, local
+shell/process handling, and other parts still contain Unix/Linux-specific code.
+
+The configuration format is `name: value`, including namespaced keys:
 
 ```text
 ssl:skip-validation: false
@@ -325,10 +350,11 @@ with normal transport retries; it does not change the remote working directory.
 
 ## Command history
 
-`ui:history-file` defaults to `$XDG_STATE_HOME/xfer/history` (or
-`~/.local/state/xfer/history`). Set it to `session` to retain history only
-while the process runs, or `/dev/null` to disable history entirely. Set it in
-`~/.config/xfer/xfer.conf` before startup, for example:
+`ui:history-file` defaults to `history` in the application state directory
+listed above (`$XDG_STATE_HOME/xfer/history` or `~/.local/state/xfer/history`
+on Linux). Set it to `session` to retain history only while the process runs,
+or `/dev/null` on Unix to disable history entirely. Set it in the application
+config directory's `xfer.conf` before startup, for example:
 
 ```text
 ui:history-file: session
@@ -471,9 +497,10 @@ login/session to close: disconnect drops the SDK client.
 
 ### Bookmarks
 
-Use TOML, not a custom DSL. Default file:
-`$XDG_CONFIG_HOME/xfer/bookmarks.toml` or `~/.config/xfer/bookmarks.toml`.
-Override with `bookmarks:file` in `xfer.conf`/`XFER_CONFIG` or `set`.
+Use TOML, not a custom DSL. The default is `bookmarks.toml` in the application
+config directory listed above (`$XDG_CONFIG_HOME/xfer/bookmarks.toml` or
+`~/.config/xfer/bookmarks.toml` on Linux). Override with `bookmarks:file` in
+`xfer.conf`/`XFER_CONFIG` or `set`.
 
 `type` is optional when the URL scheme identifies the backend: `sftp`, `s3`,
 `smb`, `dav`, `davs`, `webdav`, or `webdavs`. Plain `http`/`https` is shared by

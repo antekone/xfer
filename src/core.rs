@@ -52,13 +52,9 @@ pub struct OutputStore {
 }
 impl OutputStore {
     pub(crate) fn new(id: JobId) -> Self {
-        let base = std::env::var_os("XDG_CACHE_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
-            .unwrap_or_else(|| PathBuf::from("."));
         // Job IDs are local to a daemon; separate instances must never overwrite each other's output.
-        let path = base
-            .join("xfer/jobs")
+        let path = crate::cache_dir()
+            .join("jobs")
             .join(std::process::id().to_string())
             .join(format!("{id}-{}.log", {
                 static NEXT_SPOOL: std::sync::atomic::AtomicU64 =
