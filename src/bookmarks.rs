@@ -11,7 +11,7 @@ use std::{
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Bookmark {
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default)]
     pub protocol: String,
     pub url: String,
     #[serde(rename = "accessKey")]
@@ -55,6 +55,44 @@ impl Bookmark {
     }
 }
 
+/// Backends inferred from the URL scheme when `type` is omitted. Plain
+/// `http`/`https` is genuinely ambiguous: S3-compatible endpoints and WebDAV
+/// servers share it. Every valid S3-over-HTTPS bookmark carries `bucket` (or
+/// `accessKey`), so those fields select S3 and everything else selects WebDAV.
+/// An explicit `type` always wins; backend validation then rejects mismatches.
+fn infer_protocol(name: &str, bookmark: &Bookmark) -> Result<String> {
+    let Some((scheme, _)) = bookmark.url.split_once("://") else {
+        bail!("bookmark {name}: url has no scheme; set type explicitly");
+    };
+    Ok(match scheme.to_ascii_lowercase().as_str() {
+        "sftp" => "sftp",
+        "s3" => "s3",
+        "smb" => "smb",
+        "dav" | "davs" | "webdav" | "webdavs" => "webdav",
+        "http" | "https" => {
+            if bookmark.bucket.is_some() || bookmark.access_key.is_some() {
+                "s3"
+            } else {
+                "webdav"
+            }
+        }
+        _ => bail!("bookmark {name}: unknown url scheme {scheme:?}; set type explicitly"),
+    }
+    .to_owned())
+}
+
+/// Bookmarks can carry credentials in the URL or dedicated fields, so any
+/// debug output must use the same redaction as listings.
+impl std::fmt::Debug for Bookmark {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Bookmark")
+            .field("protocol", &self.protocol)
+            .field("summary", &self.summary(""))
+            .finish()
+    }
+}
+
 pub fn default_path() -> PathBuf {
     crate::config_dir().join("bookmarks.toml")
 }
@@ -73,6 +111,12 @@ pub fn load(path: &Path) -> Result<BTreeMap<String, Bookmark>> {
             path.display()
         )
     })?;
+    let mut entries = entries;
+    for (name, entry) in entries.iter_mut() {
+        if entry.protocol.trim().is_empty() {
+            entry.protocol = infer_protocol(name, entry)?;
+        }
+    }
     for (name, entry) in &entries {
         if entry.password_interactive
             && !matches!(entry.protocol.as_str(), "sftp" | "smb" | "webdav")
@@ -180,6 +224,30 @@ mod tests {
                 assert!(!summary.contains(secret));
             }
         }
+    }
+
+    #[test]
+    fn missing_type_is_inferred_from_the_url_scheme_and_fields() {
+        let text = "[a]\nurl='sftp://host'\n[b]\nurl='S3://bucket'\n[c]\nurl='smb://host/share'\n[d]\nurl='davs://host/files/'\n[e]\nurl='https://localhost:9000'\nbucket='archive'\naccessKey='k'\nsecretKey='s'\n[f]\nurl='https://dav.example.com/files/'\n";
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("bookmarks.toml");
+        fs::write(&file, text).unwrap();
+        let entries = load(&file).unwrap();
+        assert_eq!(entries["a"].protocol, "sftp");
+        assert_eq!(entries["b"].protocol, "s3");
+        assert_eq!(entries["c"].protocol, "smb");
+        assert_eq!(entries["d"].protocol, "webdav");
+        assert_eq!(entries["e"].protocol, "s3");
+        assert_eq!(entries["f"].protocol, "webdav");
+        // Scheme detection stays textual; later backend validation rejects
+        // invalid URLs such as queries and fragments.
+        fs::write(&file, "[g]\nurl='https://host?query'\n").unwrap();
+        assert_eq!(load(&file).unwrap()["g"].protocol, "webdav");
+        fs::write(&file, "[h]\nurl='weird'\n").unwrap();
+        assert!(load(&file)
+            .unwrap_err()
+            .to_string()
+            .contains("set type explicitly"));
     }
 
     #[test]

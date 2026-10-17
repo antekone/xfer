@@ -466,6 +466,13 @@ Use TOML, not a custom DSL. Default file:
 `$XDG_CONFIG_HOME/xfer/bookmarks.toml` or `~/.config/xfer/bookmarks.toml`.
 Override with `bookmarks:file` in `xfer.conf`/`XFER_CONFIG` or `set`.
 
+`type` is optional when the URL scheme identifies the backend: `sftp`, `s3`,
+`smb`, `dav`, `davs`, `webdav`, or `webdavs`. Plain `http`/`https` is shared by
+S3-compatible endpoints and WebDAV, so a `bucket` or `accessKey` field selects
+S3 and any other `http`/`https` bookmark selects WebDAV. An explicit `type`
+always wins and must match the URL scheme. Bookmarks with other schemes (or no
+scheme) require an explicit `type`, which must be a supported backend.
+
 ```toml
 # Local MinIO account. This comment is preserved.
 [minio]
