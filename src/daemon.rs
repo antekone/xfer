@@ -302,18 +302,22 @@ fn verify_spawned_by_client() -> Result<()> {
 pub async fn main() -> Result<()> {
     verify_spawned_by_client()?;
 
-    let (listener, socket, metadata) = bind_socket()?;
+    let daemon = Daemon::bootstrap()?;
+    let mut socket = DaemonSocket::bind_in(&crate::runtime_dir()?)?;
     let shared = Shared {
         attached: Arc::new(AtomicBool::new(false)),
         shutdown: Arc::new(AtomicBool::new(false)),
         startup_claimed: Arc::new(AtomicBool::new(false)),
-        daemon: Arc::new(Mutex::new(Daemon::bootstrap()?)),
+        daemon: Arc::new(Mutex::new(daemon)),
     };
 
-    eprintln!("xfer daemon listening on {}", socket.display());
+    socket.publish()?;
+    // stdout is a private, one-message startup channel to the spawning client.
+    // Announce only after initialization, binding, and atomic publication succeed.
+    socket.announce(&mut std::io::stdout().lock())?;
 
     while !shared.shutdown.load(Ordering::Acquire) {
-        let stream = match listener.accept() {
+        let stream = match socket.listener.accept() {
             Ok((stream, _)) => stream,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(25));
@@ -330,36 +334,87 @@ pub async fn main() -> Result<()> {
         };
         thread::spawn(move || serve_connection(shared, stream, runtime));
     }
-    let _ = fs::remove_file(&socket);
-    let _ = fs::remove_file(&metadata);
     Ok(())
 }
 
-/// Bind the private per-session socket, publish the discovery metadata file, and
-/// lock both down to the current user.
-fn bind_socket() -> Result<(UnixListener, PathBuf, PathBuf)> {
-    let socket = socket_path()?;
-    if socket.exists() {
-        fs::remove_file(&socket)?;
+/// Each daemon owns a freshly allocated private directory, never a PID-only
+/// socket pathname that could belong to another process or PID namespace.
+/// RAII unpublishes discovery metadata before removing the socket directory,
+/// including on initialization/publication/announcement errors.
+struct DaemonSocket {
+    listener: UnixListener,
+    directory: tempfile::TempDir,
+    metadata: Option<PathBuf>,
+    id: String,
+}
+
+impl DaemonSocket {
+    fn bind_in(runtime: &std::path::Path) -> Result<Self> {
+        let directory = tempfile::Builder::new()
+            .prefix(&format!("{}-", std::process::id()))
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir_in(runtime)?;
+        let id = directory
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("invalid daemon directory name")?
+            .to_owned();
+        let path = directory.path().join("s");
+        // bind itself is atomic. Never unlink an existing socket to make room.
+        let listener =
+            UnixListener::bind(&path).with_context(|| format!("bind {}", path.display()))?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        listener.set_nonblocking(true)?;
+        Ok(Self {
+            listener,
+            directory,
+            metadata: None,
+            id,
+        })
     }
 
-    let listener =
-        UnixListener::bind(&socket).with_context(|| format!("bind {}", socket.display()))?;
+    fn description(&self) -> Result<serde_json::Value> {
+        let path = self.directory.path().join("s");
+        let path = path
+            .to_str()
+            .context("daemon socket path must be valid UTF-8")?;
+        Ok(serde_json::json!({
+            "id": self.id,
+            "pid": std::process::id(),
+            "socket": path,
+        }))
+    }
 
-    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
-    listener.set_nonblocking(true)?;
-    let metadata = socket.with_extension("meta");
-    fs::write(
-        &metadata,
-        format!(
-            "id={}\npid={}\nsocket={}\n",
-            std::process::id(),
-            std::process::id(),
-            socket.display()
-        ),
-    )?;
-    fs::set_permissions(&metadata, fs::Permissions::from_mode(0o600))?;
-    Ok((listener, socket, metadata))
+    fn publish(&mut self) -> Result<()> {
+        let runtime = self.directory.path().parent().unwrap();
+        let metadata = runtime.join(format!("{}.meta", self.id));
+        // NamedTempFile starts at 0600; readers see either no metadata or the
+        // whole record. No existing discovery entry may be overwritten.
+        let mut temporary = tempfile::NamedTempFile::new_in(runtime)?;
+        self.announce(&mut temporary)?;
+        temporary
+            .persist_noclobber(&metadata)
+            .map_err(|error| error.error)?;
+        self.metadata = Some(metadata);
+        Ok(())
+    }
+
+    fn announce(&self, writer: &mut impl Write) -> Result<()> {
+        serde_json::to_writer(&mut *writer, &self.description()?)?;
+        writer.write_all(b"\n")?;
+        writer.flush()?;
+        Ok(())
+    }
+}
+
+impl Drop for DaemonSocket {
+    fn drop(&mut self) {
+        if let Some(metadata) = &self.metadata {
+            let _ = fs::remove_file(metadata);
+        }
+        // TempDir removes the socket next; each pathname is unique to us.
+    }
 }
 
 /// One worker thread per client connection: handshake, then serve requests until
@@ -626,24 +681,86 @@ fn handle_command(shared: &Shared, request: &str, writer: &mut UnixStream) {
     let _ = writer.flush();
 }
 
-fn socket_path() -> Result<PathBuf> {
-    let mut args = std::env::args_os().skip(1);
-    if args.next().as_deref() == Some(std::ffi::OsStr::new("--socket")) {
-        return args
-            .next()
-            .map(PathBuf::from)
-            .context("--socket requires a path");
-    }
-    let dir = crate::runtime_dir()?;
-    Ok(dir.join(format!("{}.sock", std::process::id())))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::backend::{ConnectOptions, Connection};
     use crate::commands::cd::snapshot_directory;
     use async_trait::async_trait;
+
+    #[test]
+    fn sockets_are_unique_even_with_the_same_pid_and_metadata_is_complete() {
+        let runtime = tempfile::tempdir().unwrap();
+        let mut first = DaemonSocket::bind_in(runtime.path()).unwrap();
+        let mut second = DaemonSocket::bind_in(runtime.path()).unwrap();
+        assert_ne!(first.id, second.id);
+        first.publish().unwrap();
+        second.publish().unwrap();
+        let first_metadata = first.metadata.clone().unwrap();
+        let first_directory = first.directory.path().to_owned();
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(&first_metadata).unwrap()).unwrap();
+        assert_eq!(metadata, first.description().unwrap());
+        let mut announcement = Vec::new();
+        first.announce(&mut announcement).unwrap();
+        assert_eq!(announcement.last(), Some(&b'\n'));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&announcement).unwrap(),
+            metadata
+        );
+        assert_eq!(
+            fs::metadata(&first_metadata).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&first_directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(first_directory.join("s"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        drop(first);
+        assert!(!first_metadata.exists());
+        assert!(!first_directory.exists());
+        assert!(second.metadata.as_ref().unwrap().exists());
+        assert!(UnixStream::connect(second.directory.path().join("s")).is_ok());
+    }
+
+    #[test]
+    fn metadata_publication_never_overwrites_an_existing_entry() {
+        let runtime = tempfile::tempdir().unwrap();
+        let mut socket = DaemonSocket::bind_in(runtime.path()).unwrap();
+        let metadata = runtime.path().join(format!("{}.meta", socket.id));
+        fs::write(&metadata, "existing entry").unwrap();
+        assert!(socket.publish().is_err());
+        drop(socket);
+        assert_eq!(fs::read_to_string(metadata).unwrap(), "existing entry");
+        assert_eq!(fs::read_dir(runtime.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn failed_readiness_announcement_cleans_up_socket_and_metadata() {
+        struct BrokenPipe;
+        impl Write for BrokenPipe {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let runtime = tempfile::tempdir().unwrap();
+        let mut socket = DaemonSocket::bind_in(runtime.path()).unwrap();
+        socket.publish().unwrap();
+        assert!(socket.announce(&mut BrokenPipe).is_err());
+        drop(socket);
+        assert_eq!(fs::read_dir(runtime.path()).unwrap().count(), 0);
+    }
 
     struct FakeBackend;
     struct FakeConnection;

@@ -1,4 +1,5 @@
 mod cli;
+mod daemon_client;
 mod line_editor;
 
 // ------------------------------------------------------------------------------------------------
@@ -18,7 +19,7 @@ use std::env;
 use std::{
     fs, io,
     io::{BufRead, BufReader, Write},
-    os::unix::{net::UnixStream, process::CommandExt},
+    os::unix::net::UnixStream,
     path::PathBuf,
     process::Command,
     time::{Duration, Instant},
@@ -26,7 +27,17 @@ use std::{
 use xfer::commands::{
     self, ClientApp, CommandContext, CommandResult, Completion, ExecutionSite, ParserContext,
 };
+use xfer::runtime_dir;
 use zeroize::{Zeroize, Zeroizing};
+
+// ------------------------------------------------------------------------------------------------
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct Instance {
+    pub id: String,
+    pub pid: u32,
+    pub socket: PathBuf,
+}
 
 // ------------------------------------------------------------------------------------------------
 
@@ -47,40 +58,285 @@ async fn main() -> Result<()> {
 
 // ------------------------------------------------------------------------------------------------
 
-fn load_history(path: Option<&str>) -> Vec<String> {
-    match path {
-        Some(path) if path != "session" && path != "/dev/null" => fs::read_to_string(path)
-            .map(|data| data.lines().map(str::to_owned).collect())
-            .unwrap_or_default(),
-        _ => Vec::new(),
+fn start_daemon_and_attach() -> Result<()> {
+    let (stream, reader) = daemon_client::start()?;
+    attached_session(stream, reader)
+}
+
+fn attach(id: Option<&str>) -> Result<()> {
+    let all = instances()?;
+    let selected = match id {
+        Some(id) => select_instance(all, id)?,
+        None => {
+            let available = all.into_iter().filter(daemon_ready).collect::<Vec<_>>();
+            if available.len() == 1 {
+                available.into_iter().next().unwrap()
+            } else if available.is_empty() {
+                anyhow::bail!("no detached xfer daemons found")
+            } else {
+                println!("{} detached xfer daemons found:", available.len());
+                for item in available {
+                    println!("{}  pid={}  {}", item.id, item.pid, item.socket.display());
+                }
+                println!("Use: xfer attach <id>");
+                return Ok(());
+            }
+        }
+    };
+    let mut stream = UnixStream::connect(&selected.socket)?;
+    let reader = claim_attachment(&selected, &mut stream, Duration::from_secs(5))?;
+    attached_session(stream, reader)
+}
+
+fn select_instance(instances: Vec<Instance>, id: &str) -> Result<Instance> {
+    if let Some(exact) = instances.iter().find(|instance| instance.id == id) {
+        return Ok(exact.clone());
+    }
+    let mut matches = instances
+        .into_iter()
+        .filter(|instance| instance.id.starts_with(id));
+    let selected = matches
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no daemon matching {id}"))?;
+    if matches.next().is_some() {
+        anyhow::bail!("ambiguous daemon ID {id}; use a longer prefix");
+    }
+    Ok(selected)
+}
+
+/// Claim the lease before treating startup as successful. A fresh child's
+/// lifetime guard stays armed until this handshake completes.
+fn claim_attachment(
+    selected: &Instance,
+    stream: &mut UnixStream,
+    timeout: Duration,
+) -> Result<BufReader<UnixStream>> {
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    stream.write_all(b"ATTACH\n")?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    if line.trim() == "BUSY" {
+        anyhow::bail!("daemon {} is already attached", selected.id);
+    }
+    if line.trim() != "ATTACHED" {
+        anyhow::bail!("attach failed: {}", line.trim());
+    }
+    stream.set_read_timeout(None)?;
+    stream.set_write_timeout(None)?;
+    Ok(reader)
+}
+
+/// Continue on the already claimed connection; fresh startup never enumerates
+/// discovery metadata or resolves an ID prefix a second time.
+fn attached_session(mut stream: UnixStream, mut reader: BufReader<UnixStream>) -> Result<()> {
+    let mut line = String::new();
+    let local_directory = std::env::current_dir()?;
+    let local_directory = local_directory
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("local directory must be valid UTF-8"))?;
+    stream
+        .write_all(format!("LOCAL_CWD {}\n", serde_json::to_string(local_directory)?).as_bytes())?;
+    line.clear();
+    if reader.read_line(&mut line)? == 0 || line.trim() != "LOCAL_CWD_OK" {
+        anyhow::bail!("cannot set daemon local directory: {}", line.trim());
+    }
+    let mut typeahead = Typeahead::default();
+    // Claim startup exactly once per daemon, not on every later attach.
+    stream.write_all(b"STARTUP\n")?;
+    line.clear();
+    if reader.read_line(&mut line)? == 0 {
+        anyhow::bail!("daemon disconnected");
+    }
+    match line.trim() {
+        "RUN_STARTUP" => {
+            if let Some(home) = xfer::home_dir() {
+                let path = std::path::absolute(home.join(".xferrc"))?;
+                let commands = read_startup_commands(&path)?;
+                if !commands.is_empty() {
+                    report_startup_file(&mut stream, &mut reader, &path)?;
+                }
+                for command in commands {
+                    // Configuration commands are not interactive history entries.
+                    if !dispatch_attached_command(
+                        &mut stream,
+                        &mut reader,
+                        &command,
+                        None,
+                        &mut typeahead,
+                    )? {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        "STARTUP_DONE" => {}
+        response => anyhow::bail!("invalid startup response: {response}"),
+    }
+    // The daemon owns the configured history location; the client only reads/appends it.
+    stream.write_all(b"COMMAND show ui:history-file\n")?;
+    line.clear();
+    reader.read_line(&mut line)?;
+    let history_file = line
+        .strip_prefix("OUTPUT ui:history-file: ")
+        .and_then(|value| {
+            value
+                .split_once(" —")
+                .map(|(value, _)| value.trim().to_owned())
+        });
+    line.clear();
+    reader.read_line(&mut line)?; // DONE
+    println!("attached (type `status` for daemon info, `detach` to release it)");
+    let mut history = history_persist_load(history_file.as_deref());
+    loop {
+        let prompt = fetch_session_prompt(&mut stream, &mut reader)?;
+        let Some(command) = read_attached_command(
+            &mut stream,
+            &mut reader,
+            &prompt,
+            &mut history,
+            &mut typeahead,
+        )?
+        else {
+            break;
+        };
+        if !dispatch_attached_command(
+            &mut stream,
+            &mut reader,
+            &command,
+            history_file.as_deref(),
+            &mut typeahead,
+        )? {
+            break;
+        }
+    }
+    Ok(())
+}
+
+// ------------------------------------------------------------------------------------------------
+
+pub fn instances() -> io::Result<Vec<Instance>> {
+    instances_in(&runtime_dir()?)
+}
+
+fn instances_in(directory: &std::path::Path) -> io::Result<Vec<Instance>> {
+    let mut result = Vec::new();
+
+    for entry in fs::read_dir(directory)? {
+        let path = entry?.path();
+        if path.extension().and_then(|v| v.to_str()) != Some("meta") {
+            continue;
+        }
+
+        if let Some(instance) = read_instance(&path) {
+            if instance.socket.exists() {
+                result.push(instance);
+            }
+        }
+        // Enumeration is read-only: a check followed by unlink could delete a
+        // newly published entry. Stale cleanup requires separate coordination.
+    }
+
+    result.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(result)
+}
+
+fn read_instance(path: &std::path::Path) -> Option<Instance> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .ok()?
+        .take(8193)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > 8192 {
+        return None;
+    }
+    let instance = serde_json::from_slice::<Instance>(&bytes)
+        .ok()
+        .or_else(|| {
+            // Keep explicit attach compatible with daemons started before JSON
+            // metadata and per-instance socket directories were introduced.
+            let text = std::str::from_utf8(&bytes).ok()?;
+            let (mut id, mut pid, mut socket) = (None, None, None);
+            for line in text.lines() {
+                if let Some((key, value)) = line.split_once('=') {
+                    match key {
+                        "id" => id = Some(value.to_owned()),
+                        "pid" => pid = value.parse().ok(),
+                        "socket" => socket = Some(PathBuf::from(value)),
+                        _ => {}
+                    }
+                }
+            }
+            Some(Instance {
+                id: id?,
+                pid: pid?,
+                socket: socket?,
+            })
+        })?;
+    if instance.id.is_empty() || instance.pid == 0 || !instance.socket.is_absolute() {
+        return None;
+    }
+    Some(instance)
+}
+
+// ------------------------------------------------------------------------------------------------
+
+fn history_persist_allowed(path: Option<&str>) -> bool {
+    if path == None || path == Some("session") || path == Some("/dev/null") {
+        false
+    } else {
+        true
     }
 }
 
-fn append_history(path: Option<&str>, command: &str) {
-    let Some(path) = path.filter(|path| *path != "session" && *path != "/dev/null") else {
+fn history_persist_load(path: Option<&str>) -> Vec<String> {
+    if !history_persist_allowed(path) {
+        Vec::new()
+    } else {
+        // can_persist_history will check if path is None
+        fs::read_to_string(path.unwrap())
+            .map(|data| data.lines().map(str::to_owned).collect())
+            .unwrap_or_default()
+    }
+}
+
+fn history_persist_append(path: Option<&str>, command: &str) {
+    let trimmed_command = command.trim();
+    if !history_persist_allowed(path) || trimmed_command.len() == 0 {
         return;
-    };
-    let path = PathBuf::from(path);
+    }
+
+    let path = PathBuf::from(path.unwrap());
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
+
     let _ = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
-        .and_then(|mut file| writeln!(file, "{command}"));
+        .and_then(|mut file| writeln!(file, "{trimmed_command}"));
 }
 
-fn daemon_ready(instance: &xfer::Instance) -> bool {
+// ------------------------------------------------------------------------------------------------
+
+fn daemon_ready(instance: &Instance) -> bool {
     let Ok(mut stream) = UnixStream::connect(&instance.socket) else {
         return false;
     };
+
     if stream.write_all(b"PROBE\n").is_err() {
         return false;
     }
+
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line).is_ok() && line.trim() == "READY"
 }
+
+// ------------------------------------------------------------------------------------------------
 
 fn erase_previous_word(command: &mut String) {
     command.truncate(line_editor::previous_word_start(command));
@@ -1281,7 +1537,7 @@ fn dispatch_attached_command(
     };
     let definition = commands::find(&parser);
     if definition.is_none_or(|command| command.record_history_for(&parser)) {
-        append_history(history_file, command);
+        history_persist_append(history_file, command);
     }
     if let Some(definition) = definition.filter(|command| command.site() == ExecutionSite::Client) {
         let mut app = AttachedCommandContext {
@@ -1435,154 +1691,87 @@ fn fetch_session_prompt(
     Ok(session_prompt(&serde_json::from_str(json)?))
 }
 
-fn attach(id: Option<&str>) -> Result<()> {
-    let all = xfer::instances()?;
-    let selected = match id {
-        Some(id) => all
-            .into_iter()
-            .find(|item| item.id.starts_with(id))
-            .ok_or_else(|| anyhow::anyhow!("no daemon matching {id}"))?,
-        None => {
-            let available = all.into_iter().filter(daemon_ready).collect::<Vec<_>>();
-            if available.len() == 1 {
-                available.into_iter().next().unwrap()
-            } else if available.is_empty() {
-                anyhow::bail!("no detached xfer daemons found")
-            } else {
-                println!("{} detached xfer daemons found:", available.len());
-                for item in available {
-                    println!("{}  pid={}  {}", item.id, item.pid, item.socket.display());
-                }
-                println!("Use: xfer attach <id>");
-                return Ok(());
-            }
-        }
-    };
-    let mut stream = UnixStream::connect(&selected.socket)?;
-    stream.write_all(b"ATTACH\n")?;
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
-    if line.trim() == "BUSY" {
-        anyhow::bail!("daemon {} is already attached", selected.id);
-    }
-    if line.trim() != "ATTACHED" {
-        anyhow::bail!("attach failed: {}", line.trim());
-    }
-    let local_directory = std::env::current_dir()?;
-    let local_directory = local_directory
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("local directory must be valid UTF-8"))?;
-    stream
-        .write_all(format!("LOCAL_CWD {}\n", serde_json::to_string(local_directory)?).as_bytes())?;
-    line.clear();
-    if reader.read_line(&mut line)? == 0 || line.trim() != "LOCAL_CWD_OK" {
-        anyhow::bail!("cannot set daemon local directory: {}", line.trim());
-    }
-    let mut typeahead = Typeahead::default();
-    // Claim startup exactly once per daemon, not on every later attach.
-    stream.write_all(b"STARTUP\n")?;
-    line.clear();
-    if reader.read_line(&mut line)? == 0 {
-        anyhow::bail!("daemon disconnected");
-    }
-    match line.trim() {
-        "RUN_STARTUP" => {
-            if let Some(home) = xfer::home_dir() {
-                let path = std::path::absolute(home.join(".xferrc"))?;
-                let commands = read_startup_commands(&path)?;
-                if !commands.is_empty() {
-                    report_startup_file(&mut stream, &mut reader, &path)?;
-                }
-                for command in commands {
-                    // Configuration commands are not interactive history entries.
-                    if !dispatch_attached_command(
-                        &mut stream,
-                        &mut reader,
-                        &command,
-                        None,
-                        &mut typeahead,
-                    )? {
-                        return Ok(());
-                    }
-                }
-            }
-        }
-        "STARTUP_DONE" => {}
-        response => anyhow::bail!("invalid startup response: {response}"),
-    }
-    // The daemon owns the configured history location; the client only reads/appends it.
-    stream.write_all(b"COMMAND show ui:history-file\n")?;
-    line.clear();
-    reader.read_line(&mut line)?;
-    let history_file = line
-        .strip_prefix("OUTPUT ui:history-file: ")
-        .and_then(|value| {
-            value
-                .split_once(" —")
-                .map(|(value, _)| value.trim().to_owned())
-        });
-    line.clear();
-    reader.read_line(&mut line)?; // DONE
-    println!("attached (type `status` for daemon info, `detach` to release it)");
-    let mut history = load_history(history_file.as_deref());
-    loop {
-        let prompt = fetch_session_prompt(&mut stream, &mut reader)?;
-        let Some(command) = read_attached_command(
-            &mut stream,
-            &mut reader,
-            &prompt,
-            &mut history,
-            &mut typeahead,
-        )?
-        else {
-            break;
-        };
-        if !dispatch_attached_command(
-            &mut stream,
-            &mut reader,
-            &command,
-            history_file.as_deref(),
-            &mut typeahead,
-        )? {
-            break;
-        }
-    }
-    Ok(())
-}
-
-fn start_daemon_and_attach() -> Result<()> {
-    let executable = std::env::current_exe()?;
-    let daemon = executable;
-    let child = Command::new(&daemon)
-        .arg("daemon")
-        // Local shell commands share the client's foreground group, but Ctrl-C
-        // there must never signal the session daemon or its background jobs.
-        .process_group(0)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|error| anyhow::anyhow!("start daemon {}: {error}", daemon.display()))?;
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let instance = loop {
-        if let Some(instance) = xfer::instances()?
-            .into_iter()
-            .find(|item| item.pid == child.id())
-        {
-            break instance;
-        }
-        if Instant::now() >= deadline {
-            anyhow::bail!("xferd started but did not publish its socket");
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    };
-    attach(Some(&instance.id))
-}
-
 #[cfg(test)]
 mod startup_tests {
     use super::*;
+
+    #[test]
+    fn attachment_handshake_is_bounded_and_sends_no_session_data_before_acceptance() {
+        let (mut stream, mut peer) = UnixStream::pair().unwrap();
+        let instance = Instance {
+            id: "test".into(),
+            pid: 1,
+            socket: "/unused".into(),
+        };
+        let started = Instant::now();
+        assert!(claim_attachment(&instance, &mut stream, Duration::from_millis(100)).is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        stream.shutdown(std::net::Shutdown::Both).unwrap();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut peer, &mut bytes).unwrap();
+        assert_eq!(bytes, b"ATTACH\n");
+    }
+
+    #[test]
+    fn explicit_attach_rejects_ambiguous_prefixes_and_prefers_exact_ids() {
+        let instance = |id: &str| Instance {
+            id: id.into(),
+            pid: 1,
+            socket: "/unused".into(),
+        };
+        let entries = vec![instance("123-first"), instance("123-second")];
+        assert!(select_instance(entries.clone(), "123")
+            .unwrap_err()
+            .to_string()
+            .contains("ambiguous"));
+        assert_eq!(
+            select_instance(entries.clone(), "123-f").unwrap().id,
+            "123-first"
+        );
+        assert!(select_instance(entries, "missing").is_err());
+        assert_eq!(
+            select_instance(vec![instance("123-longer"), instance("123")], "123")
+                .unwrap()
+                .id,
+            "123"
+        );
+    }
+
+    #[test]
+    fn discovery_reads_json_and_legacy_metadata_but_never_deletes_stale_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("s");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        fs::write(
+            root.path().join("new.meta"),
+            serde_json::json!({"id": "new", "pid": 42, "socket": path}).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("old.meta"),
+            format!("id=old\npid=24\nsocket={}\n", path.display()),
+        )
+        .unwrap();
+        let stale = root.path().join("stale.meta");
+        fs::write(
+            &stale,
+            serde_json::json!({"id": "stale", "pid": 1, "socket": root.path().join("missing")})
+                .to_string(),
+        )
+        .unwrap();
+        fs::write(root.path().join("partial.meta"), "{\"id\":").unwrap();
+        fs::write(root.path().join("oversized.meta"), vec![b'x'; 9000]).unwrap();
+        let instances = instances_in(root.path()).unwrap();
+        assert_eq!(
+            instances
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["new", "old"]
+        );
+        assert!(stale.exists());
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 6);
+    }
     #[test]
     fn pager_frame_is_appended_without_erasing_scrollback() {
         let mut output = Vec::new();

@@ -363,7 +363,7 @@ ui:history-file: session
 
 ## Daemon process
 
-The same `xfer` executable runs the per-session daemon with `xfer --daemon`.
+The same `xfer` executable runs the per-session daemon with `xfer daemon`.
 The binary is a clap-based CLI: `xfer` starts a daemon and attaches, `xfer
 attach [id]` attaches to an existing daemon by instance-ID prefix, `xfer daemon`
 runs only the daemon loop (spawned by the client), and `--help`/`--version` are
@@ -373,8 +373,25 @@ The daemon refuses direct shell execution: it verifies its parent process is the
 same xfer executable (a usability guard, not a security boundary; test harnesses
 override it with the documented environment variable).
 
-Normal `xfer` startup spawns that mode automatically, then attaches through its
-private Unix socket. There is no separate `xferd` binary.
+Normal `xfer` startup spawns that mode automatically. After initialization, the
+daemon publishes its discovery metadata atomically and sends a single JSON
+readiness message on its private stdout pipe. The parent waits up to five
+seconds for readiness, then connects directly to the announced socket; it never
+uses discovery or ID-prefix matching for this initial attachment. On Linux,
+FreeBSD, NetBSD, and OpenBSD it also verifies the kernel-reported socket peer PID
+against the spawned child: `SO_PEERCRED` on Linux/OpenBSD, `LOCAL_PEERCRED` on
+FreeBSD (including the `xucred` version check), and `LOCAL_PEEREID` on NetBSD.
+Unavailable or invalid credentials fail startup on those platforms; matching only
+the peer UID is not sufficient. Failed startups are killed and reaped rather
+than left running after a timeout. The separate parent-executable guard still
+uses Linux `/proc`, so these peer checks alone are not a complete BSD port.
+
+Each daemon binds a socket in its own uniquely allocated private instance
+directory; it never unlinks another instance's socket to make room. Discovery is
+read-only and remains available for `xfer attach`; ambiguous ID prefixes are
+rejected. Legacy discovery metadata is still readable. Normal shutdown removes
+metadata before the socket directory; crash remnants may remain for separately
+coordinated cleanup. There is no separate `xferd` binary.
 
 ## Local shell commands
 

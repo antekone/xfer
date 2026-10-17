@@ -14,6 +14,7 @@ use std::{
 
 struct Daemon {
     child: Child,
+    socket: PathBuf,
     stream: UnixStream,
     reader: BufReader<UnixStream>,
     root: tempfile::TempDir,
@@ -99,7 +100,7 @@ exec {server} -d "$TEST_REMOTE_ROOT"
         )
         .unwrap();
         fs::write(config.join("bookmarks.toml"), "[test]\ntype = 'sftp'\nurl = 'sftp://user@example.invalid'\npassword_interactive = true\n[stall]\ntype = 'sftp'\nurl = 'sftp://user@stall.invalid'\npassword_interactive = true\n").unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_xfer"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_xfer"))
             .arg("daemon")
             .env(xfer::daemon::ALLOW_FOREIGN_PARENT_ENV, "1")
             .env(
@@ -119,13 +120,26 @@ exec {server} -d "$TEST_REMOTE_ROOT"
             .env("TEST_ASKPASS_PATHS", root.path().join("askpass-paths"))
             .env("TEST_SSH_PIDS", root.path().join("ssh-pids"))
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        let socket = root
-            .path()
-            .join(format!("run/xfer/instances/{}.sock", child.id()));
+        let stdout = child.stdout.take().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let result = BufReader::new(stdout).read_line(&mut line).map(|_| line);
+            let _ = sender.send(result);
+        });
+        let ready: serde_json::Value = serde_json::from_str(
+            &receiver
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(ready["pid"], child.id());
+        let socket = PathBuf::from(ready["socket"].as_str().unwrap());
         let deadline = Instant::now() + Duration::from_secs(10);
         let stream = loop {
             if let Ok(stream) = UnixStream::connect(&socket) {
@@ -139,6 +153,7 @@ exec {server} -d "$TEST_REMOTE_ROOT"
             .unwrap();
         let mut daemon = Self {
             child,
+            socket,
             reader: BufReader::new(stream.try_clone().unwrap()),
             stream,
             root,
@@ -196,13 +211,10 @@ exec {server} -d "$TEST_REMOTE_ROOT"
         self.finish(response, succeeds);
     }
     fn reattach(&mut self) {
-        let socket = self
-            .root
-            .path()
-            .join(format!("run/xfer/instances/{}.sock", self.child.id()));
+        let socket = &self.socket;
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let mut stream = UnixStream::connect(&socket).unwrap();
+            let mut stream = UnixStream::connect(socket).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();

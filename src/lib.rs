@@ -1,53 +1,6 @@
-//! Shared primitives for the xfer client/daemon split.
-
-use std::path::PathBuf;
-
-pub mod paths;
 pub use paths::{cache_dir, config_dir, home_dir, runtime_dir, state_dir};
 
-pub mod core;
-
-#[derive(Clone, Debug)]
-pub struct Instance {
-    pub id: String,
-    pub pid: u32,
-    pub socket: PathBuf,
-}
-pub fn instances() -> std::io::Result<Vec<Instance>> {
-    let mut result = Vec::new();
-    for entry in std::fs::read_dir(runtime_dir()?)? {
-        let path = entry?.path();
-        if path.extension().and_then(|v| v.to_str()) != Some("meta") {
-            continue;
-        }
-        let text = match std::fs::read_to_string(&path) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let mut id = None;
-        let mut pid = None;
-        let mut socket = None;
-        for line in text.lines() {
-            if let Some((k, v)) = line.split_once('=') {
-                match k {
-                    "id" => id = Some(v.into()),
-                    "pid" => pid = v.parse().ok(),
-                    "socket" => socket = Some(PathBuf::from(v)),
-                    _ => {}
-                }
-            }
-        }
-        if let (Some(id), Some(pid), Some(socket)) = (id, pid, socket) {
-            if socket.exists() {
-                result.push(Instance { id, pid, socket });
-            } else {
-                let _ = std::fs::remove_file(path);
-            }
-        }
-    }
-    result.sort_by(|a, b| a.id.cmp(&b.id));
-    Ok(result)
-}
+pub mod paths;
 pub mod backend;
 pub mod bookmarks;
 pub mod cache;
@@ -56,7 +9,6 @@ pub mod credentials;
 pub mod daemon;
 pub mod error;
 pub mod listing;
-mod local_path;
 pub mod local_shell;
 pub mod s3;
 pub mod sftp;
@@ -64,5 +16,7 @@ pub mod smb;
 pub mod ssh_askpass;
 pub mod transfer;
 pub mod webdav;
-
 pub mod walker;
+pub mod core;
+
+mod local_path;
