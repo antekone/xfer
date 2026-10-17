@@ -58,7 +58,7 @@ impl Drop for Askpass {
 
 /// Invoked by OpenSSH using this executable as SSH_ASKPASS. Only answer password
 /// prompts, never host-key confirmations, private-key passphrases, or MFA prompts.
-pub fn run(prompt: &str) -> Result<()> {
+pub fn main(prompt: &str) -> Result<()> {
     let prompt = prompt.to_ascii_lowercase();
     if !prompt.trim_end().ends_with("password:") || prompt.contains("passphrase") {
         bail!("unsupported SSH prompt; configure host keys and keys with ssh first");
@@ -101,8 +101,8 @@ mod tests {
     }
     #[test]
     fn askpass_never_confirms_host_keys_or_supplies_key_passphrases() {
-        assert!(run("Are you sure you want to continue connecting (yes/no)?").is_err());
-        assert!(run("Enter passphrase for key '/home/user/.ssh/id_ed25519':").is_err());
-        assert!(run("Enter passphrase for key '/home/password/id_ed25519':").is_err());
+        assert!(main("Are you sure you want to continue connecting (yes/no)?").is_err());
+        assert!(main("Enter passphrase for key '/home/user/.ssh/id_ed25519':").is_err());
+        assert!(main("Enter passphrase for key '/home/password/id_ed25519':").is_err());
     }
 }

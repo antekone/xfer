@@ -15,6 +15,7 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Run the daemon server loop (spawned by the client, not interactive)
+    #[command(hide = true)]
     Daemon,
     /// Attach this terminal to a running daemon; without ID, the only ready one
     Attach {

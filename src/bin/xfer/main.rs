@@ -3,8 +3,6 @@ mod line_editor;
 
 // ------------------------------------------------------------------------------------------------
 
-use line_editor::{CommandLine, Edit};
-
 use anyhow::Result;
 use crossterm::{
     cursor,
@@ -15,6 +13,8 @@ use crossterm::{
         EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
     },
 };
+use line_editor::{CommandLine, Edit};
+use std::env;
 use std::{
     fs, io,
     io::{BufRead, BufReader, Write},
@@ -23,11 +23,10 @@ use std::{
     process::Command,
     time::{Duration, Instant},
 };
-use zeroize::{Zeroize, Zeroizing};
-
 use xfer::commands::{
     self, ClientApp, CommandContext, CommandResult, Completion, ExecutionSite, ParserContext,
 };
+use zeroize::{Zeroize, Zeroizing};
 
 // ------------------------------------------------------------------------------------------------
 
@@ -35,12 +34,13 @@ use xfer::commands::{
 async fn main() -> Result<()> {
     // SSH selects the askpass bridge through the environment and passes its
     // prompt as argv[1]; it must never go through argument parsing.
-    if std::env::var_os(xfer::ssh_askpass::SOCKET_ENV).is_some() {
-        return xfer::ssh_askpass::run(&std::env::args().nth(1).unwrap_or_default());
+    if env::var_os(xfer::ssh_askpass::SOCKET_ENV).is_some() {
+        return xfer::ssh_askpass::main(&env::args().nth(1).unwrap_or_default());
     }
+
     match cli::parse() {
         cli::Invocation::StartAndAttach => start_daemon_and_attach(),
-        cli::Invocation::Daemon => xfer::daemon_server::run().await,
+        cli::Invocation::Daemon => xfer::daemon_server::main().await,
         cli::Invocation::Attach(id) => attach(id.as_deref()),
     }
 }
