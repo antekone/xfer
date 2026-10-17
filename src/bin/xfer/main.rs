@@ -1,15 +1,9 @@
-#[path = "xfer/line_editor.rs"]
+mod cli;
 mod line_editor;
-use line_editor::{CommandLine, Edit};
 
-use std::{
-    fs, io,
-    io::{BufRead, BufReader, Write},
-    os::unix::{net::UnixStream, process::CommandExt},
-    path::PathBuf,
-    process::Command,
-    time::{Duration, Instant},
-};
+// ------------------------------------------------------------------------------------------------
+
+use line_editor::{CommandLine, Edit};
 
 use anyhow::Result;
 use crossterm::{
@@ -21,11 +15,37 @@ use crossterm::{
         EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
     },
 };
+use std::{
+    fs, io,
+    io::{BufRead, BufReader, Write},
+    os::unix::{net::UnixStream, process::CommandExt},
+    path::PathBuf,
+    process::Command,
+    time::{Duration, Instant},
+};
 use zeroize::{Zeroize, Zeroizing};
 
 use xfer::commands::{
     self, ClientApp, CommandContext, CommandResult, Completion, ExecutionSite, ParserContext,
 };
+
+// ------------------------------------------------------------------------------------------------
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // SSH selects the askpass bridge through the environment and passes its
+    // prompt as argv[1]; it must never go through argument parsing.
+    if std::env::var_os(xfer::ssh_askpass::SOCKET_ENV).is_some() {
+        return xfer::ssh_askpass::run(&std::env::args().nth(1).unwrap_or_default());
+    }
+    match cli::parse() {
+        cli::Invocation::StartAndAttach => start_daemon_and_attach(),
+        cli::Invocation::Daemon => xfer::daemon_server::run().await,
+        cli::Invocation::Attach(id) => attach(id.as_deref()),
+    }
+}
+
+// ------------------------------------------------------------------------------------------------
 
 fn load_history(path: Option<&str>) -> Vec<String> {
     match path {
@@ -1415,9 +1435,9 @@ fn fetch_session_prompt(
     Ok(session_prompt(&serde_json::from_str(json)?))
 }
 
-fn attach(args: &[String]) -> Result<()> {
+fn attach(id: Option<&str>) -> Result<()> {
     let all = xfer::instances()?;
-    let selected = match args.get(2) {
+    let selected = match id {
         Some(id) => all
             .into_iter()
             .find(|item| item.id.starts_with(id))
@@ -1535,7 +1555,7 @@ fn start_daemon_and_attach() -> Result<()> {
     let executable = std::env::current_exe()?;
     let daemon = executable;
     let child = Command::new(&daemon)
-        .arg("--daemon")
+        .arg("daemon")
         // Local shell commands share the client's foreground group, but Ctrl-C
         // there must never signal the session daemon or its background jobs.
         .process_group(0)
@@ -1557,22 +1577,7 @@ fn start_daemon_and_attach() -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(25));
     };
-    attach(&vec!["xfer".into(), "attach".into(), instance.id])
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    let args = std::env::args().collect::<Vec<_>>();
-    if std::env::var_os(xfer::ssh_askpass::SOCKET_ENV).is_some() {
-        return xfer::ssh_askpass::run(args.get(1).map(String::as_str).unwrap_or(""));
-    }
-    if args.get(1).map(String::as_str) == Some("--daemon") {
-        return xfer::daemon_server::run().await;
-    }
-    if args.get(1).map(String::as_str) == Some("attach") {
-        return attach(&args);
-    }
-    start_daemon_and_attach()
+    attach(Some(&instance.id))
 }
 
 #[cfg(test)]

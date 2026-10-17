@@ -338,6 +338,11 @@ ui:history-file: session
 ## Daemon process
 
 The same `xfer` executable runs the per-session daemon with `xfer --daemon`.
+The binary is a clap-based CLI: `xfer` starts a daemon and attaches, `xfer
+attach [id]` attaches to an existing daemon by instance-ID prefix, `xfer daemon`
+runs only the daemon loop (spawned by the client), and `--help`/`--version` are
+supported. The SSH askpass bridge is selected by the environment, not arguments.
+
 Normal `xfer` startup spawns that mode automatically, then attaches through its
 private Unix socket. There is no separate `xferd` binary.
 
