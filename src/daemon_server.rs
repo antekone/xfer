@@ -41,7 +41,41 @@ const COMPLETION_PREFIXES: [&str; 6] = [
     "COMPLETE_PUT ",
 ];
 
+/// Test harnesses spawn the daemon directly; their parent is the test binary,
+/// not the xfer client, so they must opt out of the parent check explicitly.
+pub const ALLOW_FOREIGN_PARENT_ENV: &str = "XFER_DAEMON_ALLOW_FOREIGN_PARENT";
+
+/// The daemon is an internal mode that the client spawns from its own
+/// executable. Refuse direct shell execution by requiring the parent process to
+/// be this same binary. This is a usability guard, not a security boundary:
+/// the environment override exists for test harnesses.
+fn verify_spawned_by_client() -> Result<()> {
+    if std::env::var_os(ALLOW_FOREIGN_PARENT_ENV).is_some() {
+        return Ok(());
+    }
+    let own = std::env::current_exe()?
+        .canonicalize()
+        .unwrap_or_else(|_| std::env::current_exe().expect("current_exe exists"));
+    // SAFETY: getppid only reads the parent PID; no preconditions.
+    let parent = unsafe { libc::getppid() };
+    let parent = if parent <= 1 {
+        None
+    } else {
+        std::fs::read_link(format!("/proc/{parent}/exe"))
+            .ok()
+            .and_then(|path| path.canonicalize().ok())
+    };
+    if parent.as_deref() != Some(own.as_path()) {
+        anyhow::bail!(
+            "`xfer daemon` is internal and must be spawned by the xfer client; \
+             start `xfer` normally or attach with `xfer attach`"
+        );
+    }
+    Ok(())
+}
+
 pub async fn main() -> Result<()> {
+    verify_spawned_by_client()?;
     let (listener, socket, metadata) = bind_socket()?;
     let shared = Shared {
         attached: Arc::new(AtomicBool::new(false)),
@@ -49,7 +83,9 @@ pub async fn main() -> Result<()> {
         startup_claimed: Arc::new(AtomicBool::new(false)),
         daemon: Arc::new(Mutex::new(crate::core::Daemon::bootstrap()?)),
     };
-    eprintln!("xferd listening on {}", socket.display());
+
+    eprintln!("xfer daemon listening on {}", socket.display());
+
     while !shared.shutdown.load(Ordering::Acquire) {
         let stream = match listener.accept() {
             Ok((stream, _)) => stream,

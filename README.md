@@ -343,6 +343,10 @@ attach [id]` attaches to an existing daemon by instance-ID prefix, `xfer daemon`
 runs only the daemon loop (spawned by the client), and `--help`/`--version` are
 supported. The SSH askpass bridge is selected by the environment, not arguments.
 
+The daemon refuses direct shell execution: it verifies its parent process is the
+same xfer executable (a usability guard, not a security boundary; test harnesses
+override it with the documented environment variable).
+
 Normal `xfer` startup spawns that mode automatically, then attaches through its
 private Unix socket. There is no separate `xferd` binary.
 
