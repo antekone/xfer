@@ -13,10 +13,19 @@ use anyhow::Result;
 use async_trait::async_trait;
 use base64::Engine;
 use chrono::{DateTime, Utc};
+use futures_util::TryStreamExt;
+use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Empty, Full, StreamBody};
+// These crates keep the plain names under their version-1 stack; see Cargo.toml.
 use hyper::{
-    body::{Bytes, HttpBody},
+    body::{Bytes, Frame, Incoming},
     header::{self, HeaderMap, HeaderValue},
-    Body, Client, Method, Request, Response, StatusCode,
+    Method, Request, Response, StatusCode,
+};
+use hyper_1 as hyper;
+use hyper_rustls_1 as hyper_rustls;
+use hyper_util::{
+    client::legacy::{connect::HttpConnector, Client},
+    rt::TokioExecutor,
 };
 use percent_encoding::percent_decode_str;
 use quick_xml::{
@@ -24,6 +33,7 @@ use quick_xml::{
     name::{Namespace, ResolveResult},
     NsReader,
 };
+use rustls_1 as rustls;
 use serde::{Deserialize, Serialize};
 use std::{
     io::{self, Read},
@@ -230,20 +240,56 @@ pub(crate) fn validate_target(
 
 #[derive(Debug)]
 struct SkipCertificateValidation;
-impl rustls::client::ServerCertVerifier for SkipCertificateValidation {
+impl rustls::client::danger::ServerCertVerifier for SkipCertificateValidation {
     fn verify_server_cert(
         &self,
-        _: &rustls::Certificate,
-        _: &[rustls::Certificate],
-        _: &rustls::ServerName,
-        _: &mut dyn Iterator<Item = &[u8]>,
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &[rustls::pki_types::CertificateDer<'_>],
+        _: &rustls::pki_types::ServerName<'_>,
         _: &[u8],
-        _: std::time::SystemTime,
-    ) -> std::result::Result<rustls::client::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::ServerCertVerified::assertion())
+        _: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn verify_tls13_signature(
+        &self,
+        _: &[u8],
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .signature_verification_algorithms
+            .mapping
+            .iter()
+            .map(|(scheme, _)| *scheme)
+            .collect()
     }
 }
-type HttpClient = Client<hyper_rustls::HttpsConnector<hyper::client::HttpConnector>>;
+type HttpClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>;
+/// Request/parse body type: bounded chunks with a boxed error so response
+/// bodies (hyper::Error), file streams (io::Error), and static data unify.
+type Body = UnsyncBoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
+fn full_body(data: impl Into<Bytes>) -> Body {
+    Full::new(data.into())
+        .map_err(|err| match err {})
+        .boxed_unsync()
+}
+fn empty_body() -> Body {
+    Empty::<Bytes>::new()
+        .map_err(|err| match err {})
+        .boxed_unsync()
+}
 struct WebdavConnection {
     client: HttpClient,
     base: Url,
@@ -273,7 +319,7 @@ fn has_status(error: &anyhow::Error, codes: &[u16]) -> bool {
         .downcast_ref::<HttpFailure>()
         .is_some_and(|error| codes.contains(&error.0))
 }
-fn transport_error(error: hyper::Error) -> anyhow::Error {
+fn transport_error(error: hyper_util::client::legacy::Error) -> anyhow::Error {
     let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
     while let Some(cause) = source {
         if cause.is::<rustls::Error>()
@@ -295,6 +341,9 @@ fn transport_error(error: hyper::Error) -> anyhow::Error {
             None => cause.source(),
         };
     }
+    anyhow::anyhow!("WebDAV transport failed")
+}
+fn body_error(error: hyper::Error) -> anyhow::Error {
     if error.is_parse() || error.is_user() {
         permanent("invalid WebDAV HTTP response or request body")
     } else {
@@ -308,7 +357,7 @@ impl WebdavConnection {
         mut url: Url,
         headers: HeaderMap,
         body: Body,
-    ) -> Result<Response<Body>> {
+    ) -> Result<Response<Incoming>> {
         let mut body = Some(body);
         for attempt in 0..=3 {
             let mut request = Request::builder().method(method.clone()).uri(url.as_str());
@@ -317,7 +366,7 @@ impl WebdavConnection {
                 request = request.header(header::AUTHORIZATION, auth.clone());
             }
             let request = request
-                .body(body.take().unwrap_or_else(Body::empty))
+                .body(body.take().unwrap_or_else(empty_body))
                 .map_err(|_| permanent("invalid WebDAV request"))?;
             let mut response = tokio::time::timeout(self.timeout, self.client.request(request))
                 .await
@@ -353,7 +402,7 @@ impl WebdavConnection {
             }
             // PROPFIND's fixed body is replayable; never replay file uploads.
             if method.as_str() == "PROPFIND" {
-                body = Some(Body::from(PROPERTIES));
+                body = Some(full_body(Bytes::from_static(PROPERTIES.as_bytes())));
             }
             url = next;
         }
@@ -381,7 +430,7 @@ impl WebdavConnection {
                 Method::from_bytes(b"PROPFIND").unwrap(),
                 url.clone(),
                 headers,
-                Body::from(PROPERTIES),
+                full_body(Bytes::from_static(PROPERTIES.as_bytes())),
             )
             .await?;
         if response.status() != StatusCode::MULTI_STATUS {
@@ -394,56 +443,63 @@ impl WebdavConnection {
             return Err(http_error(response.status().as_u16()));
         }
         let url = response.extensions().get::<Url>().cloned().unwrap_or(url);
-        parse_xml(response.into_body(), self.timeout, &mut |raw| {
-            let href = raw.href.ok_or_else(invalid_xml)?;
-            let href = url.join(href.trim()).map_err(|_| invalid_xml())?;
-            if href.origin() != self.base.origin()
-                || !href.username().is_empty()
-                || href.password().is_some()
-                || href.query().is_some()
-                || href.fragment().is_some()
-            {
-                return Err(permanent("WebDAV returned an unsafe resource href"));
-            }
-            let location = Location::from_url(&href)?;
-            if location != *path
-                && (depth == 0
-                    || location.0.len() != path.0.len() + 1
-                    || !location.0.starts_with(&path.0))
-            {
-                return Err(permanent(
-                    "WebDAV returned a resource outside the requested depth",
-                ));
-            }
-            let directory = raw
-                .props
-                .directory
-                .ok_or_else(|| permanent("WebDAV omitted DAV:resourcetype"))?;
-            let size = raw
-                .props
-                .size
-                .map(|value| value.trim().parse::<u64>().map_err(|_| invalid_xml()))
-                .transpose()?;
-            let modified = raw
-                .props
-                .modified
-                .filter(|value| !value.trim().is_empty())
-                .map(|value| parse_date(&value))
-                .transpose()?;
-            let etag = raw
-                .props
-                .etag
-                .filter(|value| !value.trim().is_empty())
-                .map(|value| property_etag(value.trim()))
-                .transpose()?;
-            emit(Entry {
-                location,
-                directory,
-                size,
-                modified,
-                etag,
-            })
-        })
+        parse_xml(
+            response
+                .into_body()
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+                .boxed_unsync(),
+            self.timeout,
+            &mut |raw| {
+                let href = raw.href.ok_or_else(invalid_xml)?;
+                let href = url.join(href.trim()).map_err(|_| invalid_xml())?;
+                if href.origin() != self.base.origin()
+                    || !href.username().is_empty()
+                    || href.password().is_some()
+                    || href.query().is_some()
+                    || href.fragment().is_some()
+                {
+                    return Err(permanent("WebDAV returned an unsafe resource href"));
+                }
+                let location = Location::from_url(&href)?;
+                if location != *path
+                    && (depth == 0
+                        || location.0.len() != path.0.len() + 1
+                        || !location.0.starts_with(&path.0))
+                {
+                    return Err(permanent(
+                        "WebDAV returned a resource outside the requested depth",
+                    ));
+                }
+                let directory = raw
+                    .props
+                    .directory
+                    .ok_or_else(|| permanent("WebDAV omitted DAV:resourcetype"))?;
+                let size = raw
+                    .props
+                    .size
+                    .map(|value| value.trim().parse::<u64>().map_err(|_| invalid_xml()))
+                    .transpose()?;
+                let modified = raw
+                    .props
+                    .modified
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|value| parse_date(&value))
+                    .transpose()?;
+                let etag = raw
+                    .props
+                    .etag
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|value| property_etag(value.trim()))
+                    .transpose()?;
+                emit(Entry {
+                    location,
+                    directory,
+                    size,
+                    modified,
+                    etag,
+                })
+            },
+        )
         .await
     }
     async fn stat(&self, location: &Location, directory: bool) -> Result<Entry> {
@@ -464,7 +520,7 @@ impl WebdavConnection {
                 Method::from_bytes(b"MKCOL").unwrap(),
                 location.url(&self.base, true),
                 HeaderMap::new(),
-                Body::empty(),
+                empty_body(),
             )
             .await?;
         if matches!(response.status().as_u16(), 200 | 201 | 204) {
@@ -628,21 +684,21 @@ impl Backend for Webdav {
             options.password.as_ref(),
         )?;
         let timeout = seconds(&options.settings, "webdav:operation-timeout")?;
-        let mut tcp = hyper::client::HttpConnector::new();
+        let mut tcp = HttpConnector::new();
         tcp.enforce_http(false);
         tcp.set_connect_timeout(Some(seconds(&options.settings, "webdav:connect-timeout")?));
         let builder = hyper_rustls::HttpsConnectorBuilder::new();
         let builder = if options.settings.bool("ssl:skip-validation") {
             builder.with_tls_config(
                 rustls::ClientConfig::builder()
-                    .with_safe_defaults()
+                    .dangerous()
                     .with_custom_certificate_verifier(Arc::new(SkipCertificateValidation))
                     .with_no_client_auth(),
             )
         } else {
-            builder.with_native_roots()
+            builder.with_native_roots()?
         };
-        let client = Client::builder()
+        let client = Client::builder(TokioExecutor::new())
             .http1_max_buf_size(CHUNK)
             .build(builder.https_or_http().enable_http1().wrap_connector(tcp));
         let connection = WebdavConnection {
@@ -773,7 +829,7 @@ impl Connection for WebdavConnection {
                 Method::GET,
                 location.url(&self.base, false),
                 headers,
-                Body::empty(),
+                empty_body(),
             )
             .await?;
         let status = response.status().as_u16();
@@ -819,11 +875,18 @@ impl Connection for WebdavConnection {
             }
         }
         let mut received = 0u64;
-        while let Some(chunk) = tokio::time::timeout(self.timeout, response.body_mut().data())
-            .await
-            .map_err(|_| anyhow::anyhow!("WebDAV read timed out"))?
-        {
-            let chunk = chunk.map_err(transport_error)?;
+        loop {
+            let Some(frame) = tokio::time::timeout(self.timeout, response.body_mut().frame())
+                .await
+                .map_err(|_| anyhow::anyhow!("WebDAV read timed out"))?
+                .transpose()
+                .map_err(body_error)?
+            else {
+                break;
+            };
+            let Some(chunk) = frame.data_ref() else {
+                continue;
+            };
             if chunk.len() as u64 > remaining - received {
                 return Err(permanent("WebDAV sent more bytes than expected"));
             }
@@ -901,7 +964,11 @@ impl Connection for WebdavConnection {
                 Method::PUT,
                 location.url(&self.base, false),
                 headers,
-                Body::wrap_stream(stream),
+                BodyExt::map_err(
+                    StreamBody::new(stream.map_ok(Frame::data)),
+                    |error: io::Error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>,
+                )
+                .boxed_unsync(),
             )
             .await?;
         if !matches!(response.status().as_u16(), 200 | 201 | 204) {
@@ -971,18 +1038,22 @@ impl AsyncBufRead for XmlInput {
             )));
         }
         while this.chunk.is_empty() {
-            match Pin::new(&mut this.body).poll_data(cx) {
+            match hyper::body::Body::poll_frame(Pin::new(&mut this.body), cx) {
                 Poll::Pending => return Poll::Pending,
-                Poll::Ready(Some(Ok(chunk))) => this.chunk = chunk,
+                Poll::Ready(Some(Ok(frame))) => this.chunk = frame.into_data().unwrap_or_default(),
                 Poll::Ready(Some(Err(error))) => {
+                    let parse = error
+                        .downcast_ref::<hyper::Error>()
+                        .map(|e| e.is_parse())
+                        .unwrap_or(false);
                     return Poll::Ready(Err(io::Error::new(
-                        if error.is_parse() {
+                        if parse {
                             io::ErrorKind::InvalidData
                         } else {
                             io::ErrorKind::ConnectionReset
                         },
                         "WebDAV response stream failed",
-                    )))
+                    )));
                 }
                 Poll::Ready(None) => return Poll::Ready(Ok(&[])),
             }
@@ -1369,7 +1440,12 @@ mod tests {
             .collect::<Vec<_>>();
         let mut count = 0;
         parse_xml(
-            Body::wrap_stream(futures_util::stream::iter(chunks)),
+            StreamBody::new(
+                futures_util::stream::iter(chunks)
+                    .map_ok(Frame::data)
+                    .map_err(std::io::Error::into),
+            )
+            .boxed_unsync(),
             Duration::from_secs(3),
             &mut |entry| {
                 count += 1;
@@ -1393,7 +1469,7 @@ mod tests {
             "</a>".repeat(40)
         );
         for xml in ["<!DOCTYPE x SYSTEM 'http://127.0.0.1:1/secret'><multistatus xmlns='DAV:'/>", "<multistatus xmlns='evil'/>", "<multistatus xmlns='DAV:'><response><href>&unknown;</href></response></multistatus>", "<multistatus xmlns='DAV:'>", "<multistatus xmlns='DAV:'/><multistatus xmlns='DAV:'/>", "<multistatus xmlns='DAV:'><response><propstat><prop/></propstat></response></multistatus>", "<?xml version='1.0' encoding='UTF-16'?><multistatus xmlns='DAV:'/>", &deep, &format!("<multistatus xmlns='DAV:'><{large}"), &format!("<multistatus xmlns='DAV:'><response><href>{large}</href></response></multistatus>")] {
-            let error = parse_xml(Body::from(xml.to_owned()), Duration::from_secs(3), &mut |_| Ok(())).await.unwrap_err(); assert!(error.is::<NonRetryableError>()); assert!(!format!("{error:#}").contains("127.0.0.1"));
+            let error = parse_xml(full_body(Bytes::from(xml.to_owned())), Duration::from_secs(3), &mut |_| Ok(())).await.unwrap_err(); assert!(error.is::<NonRetryableError>()); assert!(!format!("{error:#}").contains("127.0.0.1"));
         }
     }
     #[tokio::test]
@@ -1404,17 +1480,23 @@ mod tests {
             entry.repeat(25000)
         );
         let mut count = 0;
-        parse_xml(Body::from(xml), Duration::from_secs(3), &mut |_| {
-            count += 1;
-            Ok(())
-        })
+        parse_xml(
+            full_body(Bytes::from(xml)),
+            Duration::from_secs(3),
+            &mut |_| {
+                count += 1;
+                Ok(())
+            },
+        )
         .await
         .unwrap();
         assert_eq!(count, 25000);
         let xml = format!("<multistatus xmlns='DAV:'>{entry}</multistatus>");
-        let error = parse_xml(Body::from(xml), Duration::from_secs(3), &mut |_| {
-            Err(anyhow::anyhow!("sink stopped"))
-        })
+        let error = parse_xml(
+            full_body(Bytes::from(xml)),
+            Duration::from_secs(3),
+            &mut |_| Err(anyhow::anyhow!("sink stopped")),
+        )
         .await
         .unwrap_err();
         assert_eq!(error.to_string(), "sink stopped");
