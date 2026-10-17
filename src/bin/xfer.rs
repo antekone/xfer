@@ -263,8 +263,13 @@ fn complete_command(
             if common.len() > prefix.trim().len() {
                 *command = format!("{verb} {common}");
             }
-        } else if common.len() > command.len() {
+        } else if common.len() > command.len() || matches.len() == 1 {
             *command = common.to_owned();
+            // A unique initial command is complete: end the word so the next
+            // keypress starts an argument, like shell command completion.
+            if matches.len() == 1 {
+                command.push(' ');
+            }
         }
     }
     Ok(if matches.len() > 1 {
@@ -2377,6 +2382,24 @@ mod startup_tests {
         complete_path_command(&mut client, &mut reader, &mut command).unwrap();
         assert_eq!(shlex::split(&command).unwrap(), vec!["cd", "photo album/"]);
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn initial_command_expansion_appends_a_space_only_for_unique_matches() {
+        let (client, _server) = UnixStream::pair().unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let mut client = client;
+        for (before, expected) in [
+            ("lc", "lcd "),
+            ("l", "l"),
+            ("ls", "ls "),
+            ("ge", "get "),
+            ("", ""),
+        ] {
+            let mut prefix = before.to_owned();
+            complete_command(&mut client, &mut reader, &mut prefix).unwrap();
+            assert_eq!(prefix, expected, "expanding {before:?}");
+        }
     }
 
     #[test]
