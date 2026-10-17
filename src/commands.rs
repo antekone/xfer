@@ -1,8 +1,8 @@
 //! Command interface and the single registry used by daemon/client dispatch,
 //! help, aliases and completion. Small handlers live here; larger ones in submodules.
 use crate::{
-    core::{Daemon, SessionInfo},
     credentials::Password,
+    daemon::{Daemon, SessionInfo},
 };
 use anyhow::{bail, Result};
 

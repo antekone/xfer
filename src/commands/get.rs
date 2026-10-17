@@ -2,7 +2,7 @@
 use super::{Command, CommandContext, CommandResult, Completion, Handler, ParserContext};
 use crate::{
     backend::Connection,
-    core::Daemon,
+    daemon::Daemon,
     error::NonRetryableError,
     listing::{Content, ListingSink},
     transfer::{has_wildmat, wildmat, GetArgs},

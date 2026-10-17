@@ -77,7 +77,7 @@ pub mod bookmarks;
 pub mod cache;
 pub mod commands;
 pub mod credentials;
-pub mod daemon_server;
+pub mod daemon;
 pub mod error;
 pub mod listing;
 mod local_path;

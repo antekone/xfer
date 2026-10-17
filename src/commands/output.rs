@@ -1,6 +1,6 @@
 //! Protocol-internal spool reads and acknowledgement.
 use super::{small, CommandContext, CommandResult, ParserContext, SmallCommand};
-use crate::core::{Daemon, JobState};
+use crate::{core::JobState, daemon::Daemon};
 use anyhow::Result;
 use std::fs;
 pub(super) static READ_OUTPUT: SmallCommand = small(&["read-output"], None, read_output);

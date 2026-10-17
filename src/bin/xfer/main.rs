@@ -40,7 +40,7 @@ async fn main() -> Result<()> {
 
     match cli::parse() {
         cli::Invocation::StartAndAttach => start_daemon_and_attach(),
-        cli::Invocation::Daemon => xfer::daemon_server::main().await,
+        cli::Invocation::Daemon => xfer::daemon::main().await,
         cli::Invocation::Attach(id) => attach(id.as_deref()),
     }
 }
@@ -1400,7 +1400,7 @@ fn report_startup_file(
     Ok(())
 }
 
-fn session_prompt(info: &xfer::core::SessionInfo) -> String {
+fn session_prompt(info: &xfer::daemon::SessionInfo) -> String {
     let safe = |value: &str| {
         value
             .chars()
@@ -1874,7 +1874,7 @@ mod startup_tests {
 
     #[test]
     fn prompt_includes_backend_cwd_but_never_daemon_pid() {
-        let mut info = xfer::core::SessionInfo {
+        let mut info = xfer::daemon::SessionInfo {
             daemon_pid: 987654,
             protocol: None,
             cwd: None,
@@ -1898,7 +1898,7 @@ mod startup_tests {
             let mut request = String::new();
             reader.read_line(&mut request).unwrap();
             assert_eq!(request, "SESSION\n");
-            let info = xfer::core::SessionInfo {
+            let info = xfer::daemon::SessionInfo {
                 daemon_pid: 123,
                 protocol: Some("s3".into()),
                 cwd: Some("/archive/".into()),

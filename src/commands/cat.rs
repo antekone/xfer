@@ -173,10 +173,7 @@ async fn read_file(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        core::{Daemon, JobState},
-        transfer::RemoteFile,
-    };
+    use crate::{core::JobState, daemon::Daemon, transfer::RemoteFile};
     use std::os::unix::fs::PermissionsExt;
     use std::sync::{
         atomic::{AtomicBool, Ordering},

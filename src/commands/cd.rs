@@ -1,6 +1,6 @@
 //! Change backend working directory (default: initial directory).
 use super::{Command, CommandContext, CommandResult, Completion, Handler, ParserContext};
-use crate::core::{Daemon, SessionInfo};
+use crate::daemon::{Daemon, SessionInfo};
 use anyhow::Result;
 
 pub(super) struct Cd;

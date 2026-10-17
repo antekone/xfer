@@ -189,7 +189,7 @@ mod tests {
     use super::*;
     use crate::{
         backend::Connection,
-        core::Daemon,
+        daemon::Daemon,
         listing::{DirectoryInfo, FileInfo, ListingSink},
     };
 

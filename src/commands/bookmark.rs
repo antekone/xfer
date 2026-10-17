@@ -1,6 +1,6 @@
 //! List or edit toml bookmarks.
 use super::{Command, CommandContext, CommandResult, Handler, ParserContext};
-use crate::core::Daemon;
+use crate::daemon::Daemon;
 use anyhow::Result;
 
 pub(super) struct Bookmark;

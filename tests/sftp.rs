@@ -101,7 +101,7 @@ exec {server} -d "$TEST_REMOTE_ROOT"
         fs::write(config.join("bookmarks.toml"), "[test]\ntype = 'sftp'\nurl = 'sftp://user@example.invalid'\npassword_interactive = true\n[stall]\ntype = 'sftp'\nurl = 'sftp://user@stall.invalid'\npassword_interactive = true\n").unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_xfer"))
             .arg("daemon")
-            .env(xfer::daemon_server::ALLOW_FOREIGN_PARENT_ENV, "1")
+            .env(xfer::daemon::ALLOW_FOREIGN_PARENT_ENV, "1")
             .env(
                 "PATH",
                 format!(

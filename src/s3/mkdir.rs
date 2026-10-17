@@ -136,9 +136,7 @@ where
 mod tests {
     use super::*;
     use crate::{
-        backend::Connection,
-        core::{Daemon, JobState},
-        s3::connection_tests::http_client,
+        backend::Connection, core::JobState, daemon::Daemon, s3::connection_tests::http_client,
     };
 
     const EMPTY: &str = "<ListBucketResult></ListBucketResult>";

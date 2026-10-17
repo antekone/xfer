@@ -109,10 +109,7 @@ fn execute(context: &mut CommandContext<'_>, parser: &ParserContext<'_>) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        backend::Connection,
-        core::{Daemon, JobState},
-    };
+    use crate::{backend::Connection, core::JobState, daemon::Daemon};
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,

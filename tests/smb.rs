@@ -13,8 +13,9 @@ use std::{
 };
 use xfer::{
     backend::{Backend, ConnectOptions, Smb},
-    core::{Daemon, JobState, Settings},
+    core::{JobState, Settings},
     credentials::Password,
+    daemon::Daemon,
     error::NonRetryableError,
     listing::{Content, ListingSink},
     transfer::DownloadSink,

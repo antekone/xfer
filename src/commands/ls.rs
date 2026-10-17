@@ -3,7 +3,8 @@ mod sort;
 
 use super::{Command, CommandContext, CommandResult, Completion, Handler, ParserContext};
 use crate::{
-    core::{Daemon, SettingValue, Settings},
+    core::{SettingValue, Settings},
+    daemon::Daemon,
     error::NonRetryableError,
     listing::{Content, DisplayOptions, ListingSink},
     transfer::{has_wildmat, wildmat},

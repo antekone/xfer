@@ -1210,7 +1210,7 @@ mod tests {
     }
     #[test]
     fn invalid_smb_urls_fail_before_creating_a_credential_bearing_job() {
-        let mut app = crate::core::Daemon::bootstrap().unwrap();
+        let mut app = crate::daemon::Daemon::bootstrap().unwrap();
         let result = app.command("connect smb://user:never-log-this@host/share?invalid=secret");
         assert!(!result.join("\n").contains("never-log-this"));
         assert!(app.jobs.jobs.is_empty());

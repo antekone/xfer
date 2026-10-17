@@ -1,6 +1,9 @@
 //! Connection setup, bookmarks, credentials and retried backend initialization.
 use super::{Command, CommandContext, CommandResult, Completion, Handler, ParserContext};
-use crate::core::{Daemon, JobId, SessionInfo};
+use crate::{
+    core::JobId,
+    daemon::{Daemon, SessionInfo},
+};
 use anyhow::{bail, Result};
 
 pub(super) struct Connect;

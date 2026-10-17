@@ -1,6 +1,9 @@
 //! Show daemon, connection, configuration or job details.
 use super::{Command, CommandContext, CommandResult, Handler, ParserContext};
-use crate::core::{Daemon, JobState, Progress};
+use crate::{
+    core::{JobState, Progress},
+    daemon::Daemon,
+};
 use anyhow::Result;
 
 pub(super) struct Status;
