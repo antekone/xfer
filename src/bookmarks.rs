@@ -25,6 +25,10 @@ pub struct Bookmark {
     pub api: Option<String>,
     pub override_host: Option<String>,
     pub override_port: Option<u16>,
+    /// SMB/WebDAV identity overrides; Some("") deliberately selects anonymous access.
+    pub user: Option<String>,
+    pub domain: Option<String>,
+    pub password: Option<crate::credentials::Password>,
     #[serde(default)]
     pub password_interactive: bool,
 }
@@ -62,6 +66,7 @@ pub fn load(path: &Path) -> Result<BTreeMap<String, Bookmark>> {
         Err(e) => return Err(e).context("read bookmarks"),
     };
     // Do not print TOML parser errors: they can include credential-bearing source lines.
+    let source = zeroize::Zeroizing::new(source);
     let entries: BTreeMap<String, Bookmark> = toml::from_str(&source).map_err(|_| {
         anyhow::anyhow!(
             "invalid bookmarks TOML at {} (expected named bookmark tables)",
@@ -69,8 +74,22 @@ pub fn load(path: &Path) -> Result<BTreeMap<String, Bookmark>> {
         )
     })?;
     for (name, entry) in &entries {
-        if entry.password_interactive && entry.protocol != "sftp" {
-            bail!("bookmark {name}: password_interactive is only supported for sftp");
+        if entry.password_interactive
+            && !matches!(entry.protocol.as_str(), "sftp" | "smb" | "webdav")
+        {
+            bail!(
+                "bookmark {name}: password_interactive is only supported for sftp, smb or webdav"
+            );
+        }
+        if entry.password.is_some() && !matches!(entry.protocol.as_str(), "sftp" | "smb" | "webdav")
+        {
+            bail!("bookmark {name}: password is only supported for sftp, smb or webdav");
+        }
+        if entry.domain.is_some() && entry.protocol != "smb" {
+            bail!("bookmark {name}: domain is only supported for smb");
+        }
+        if entry.user.is_some() && !matches!(entry.protocol.as_str(), "smb" | "webdav") {
+            bail!("bookmark {name}: user is only supported for smb or webdav");
         }
         if entry.access_key.is_some() != entry.secret_key.is_some() {
             bail!("bookmark {name}: accessKey and secretKey must be provided together");
@@ -126,6 +145,41 @@ mod tests {
         ).unwrap();
         assert!(values["server"].password_interactive);
         assert!(!values["agent"].password_interactive);
+    }
+
+    #[test]
+    fn smb_bookmarks_allow_the_same_out_of_band_password_workflow() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("bookmarks.toml");
+        fs::write(&file, "[nas]\ntype = 'smb'\nurl = 'smb://WORKGROUP;alice@nas/share'\npassword_interactive = true\n").unwrap();
+        assert!(load(&file).unwrap()["nas"].password_interactive);
+        fs::write(
+            &file,
+            "[wrong]\ntype = 's3'\nurl = 's3://bucket'\npassword_interactive = true\n",
+        )
+        .unwrap();
+        assert!(load(&file).is_err());
+    }
+
+    #[test]
+    fn stored_credentials_and_explicit_empty_fields_are_preserved_but_never_listed() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("bookmarks.toml");
+        fs::write(&file, "[vm]\ntype='smb'\nurl='smb://URL;user:url-secret@host/share'\nuser=''\ndomain=''\npassword=''\n[nas]\ntype='smb'\nurl='smb://host/share'\nuser='alice'\ndomain='DOMAIN'\npassword='book-secret'\n[ssh]\ntype='sftp'\nurl='sftp://host'\npassword='ssh-secret'\n").unwrap();
+        let books = load(&file).unwrap();
+        assert_eq!(books["vm"].user.as_deref(), Some(""));
+        assert_eq!(books["vm"].domain.as_deref(), Some(""));
+        assert_eq!(books["vm"].password.as_ref().unwrap().expose(), "");
+        assert_eq!(
+            books["nas"].password.as_ref().unwrap().expose(),
+            "book-secret"
+        );
+        for (name, book) in books {
+            let summary = book.summary(&name);
+            for secret in ["url-secret", "book-secret", "ssh-secret"] {
+                assert!(!summary.contains(secret));
+            }
+        }
     }
 
     #[test]

@@ -446,6 +446,7 @@ pub enum SettingValue {
     Bool(bool),
     Int(i64),
     Text(String),
+    Secret(Option<crate::credentials::Password>),
 }
 impl SettingValue {
     pub fn display(&self) -> String {
@@ -453,6 +454,8 @@ impl SettingValue {
             Self::Bool(value) => value.to_string(),
             Self::Int(value) => value.to_string(),
             Self::Text(value) => value.clone(),
+            Self::Secret(Some(_)) => "[redacted]".into(),
+            Self::Secret(None) => "[not set]".into(),
         }
     }
     pub fn as_bool(&self) -> Option<bool> {
@@ -481,14 +484,30 @@ impl Settings {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error.into()),
         };
+        let source = zeroize::Zeroizing::new(source);
         for (line_no, line) in source.lines().enumerate() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let (name, value) = line
-                .split_once(": ")
-                .or_else(|| line.rsplit_once(':'))
+            // Match a registered namespaced key first. Splitting at the last
+            // colon would misread passwords containing ':' and could echo part
+            // of the secret as an unknown setting name.
+            let known = self
+                .values
+                .keys()
+                .filter_map(|name| {
+                    line.strip_prefix(name)
+                        .and_then(|rest| rest.trim_start().strip_prefix(':'))
+                        .map(|value| (name.clone(), value))
+                })
+                .max_by_key(|(name, _)| name.len());
+            let (name, value) = known
+                .or_else(|| {
+                    line.split_once(": ")
+                        .or_else(|| line.rsplit_once(':'))
+                        .map(|(name, value)| (name.to_owned(), value))
+                })
                 .ok_or_else(|| {
                     anyhow::anyhow!("{}:{}: expected `name: value`", path.display(), line_no + 1)
                 })?;
@@ -524,6 +543,12 @@ impl Settings {
             _ => None,
         })
     }
+    pub fn secret(&self, name: &str) -> Option<&crate::credentials::Password> {
+        match self.values.get(name).map(|setting| &setting.value) {
+            Some(SettingValue::Secret(value)) => value.as_ref(),
+            _ => None,
+        }
+    }
     pub fn set(&mut self, name: &str, raw: &str) -> Result<()> {
         let setting = self
             .values
@@ -533,11 +558,14 @@ impl Settings {
             SettingValue::Bool(_) => SettingValue::Bool(raw.parse()?),
             SettingValue::Int(_) => SettingValue::Int(raw.parse()?),
             SettingValue::Text(_) => SettingValue::Text(raw.into()),
+            SettingValue::Secret(_) => {
+                SettingValue::Secret(Some(crate::credentials::Password::new(raw.into())))
+            }
         };
         Ok(())
     }
 }
-pub use crate::backend::{Backend, Sftp, Smb, S3};
+pub use crate::backend::{Backend, Sftp, Smb, Webdav, S3};
 
 /// Lightweight committed session state: safe to query while a job owns the
 /// backend connection lock. It never contains credentials or endpoint secrets.
@@ -624,7 +652,12 @@ impl Daemon {
         );
         crate::commands::ls::register_settings(&mut settings);
         crate::cache::CacheOptions::register(&mut settings);
-        let backends: Vec<Box<dyn Backend>> = vec![Box::new(Sftp), Box::new(S3), Box::new(Smb)];
+        let backends: Vec<Box<dyn Backend>> = vec![
+            Box::new(Sftp),
+            Box::new(S3),
+            Box::new(Smb),
+            Box::new(Webdav),
+        ];
         for backend in &backends {
             backend.register_settings(&mut settings);
         }

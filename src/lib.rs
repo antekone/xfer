@@ -84,7 +84,9 @@ mod local_path;
 pub mod local_shell;
 pub mod s3;
 pub mod sftp;
+pub mod smb;
 pub mod ssh_askpass;
 pub mod transfer;
+pub mod webdav;
 
 pub mod walker;

@@ -17,6 +17,9 @@ impl Command for Connect {
             multiple_arguments: false,
         }
     }
+    fn record_history_for(&self, parser: &ParserContext<'_>) -> bool {
+        !parser.words().any(crate::credentials::sensitive_url)
+    }
     fn help(&self) -> Option<(&'static str, &'static str)> {
         Some(("connect <url|name>", "connect using a protocol or bookmark"))
     }
@@ -62,8 +65,32 @@ fn start(
         .map(|value| value.protocol.as_str())
         .or_else(|| target.split_once("://").map(|(token, _)| token))
         .unwrap_or("");
-    if password.is_some() && token != "sftp" {
-        anyhow::bail!("interactive passwords are only supported for sftp");
+    let token = match token {
+        "http" | "https" | "dav" | "davs" | "webdavs" => "webdav",
+        token => token,
+    };
+    if token == "webdav" {
+        crate::webdav::validate_target(
+            bookmark
+                .as_ref()
+                .map(|bookmark| bookmark.url.as_str())
+                .unwrap_or(target),
+            &app.settings,
+            bookmark.as_ref(),
+        )?;
+    }
+    if token == "smb" {
+        crate::smb::validate_target(
+            bookmark
+                .as_ref()
+                .map(|bookmark| bookmark.url.as_str())
+                .unwrap_or(target),
+            &app.settings,
+            bookmark.as_ref(),
+        )?;
+    }
+    if password.is_some() && !matches!(token, "sftp" | "smb" | "webdav") {
+        anyhow::bail!("interactive passwords are only supported for sftp, smb or webdav");
     }
     let backend = app
         .backends
@@ -77,6 +104,11 @@ fn start(
     {
         return Err(crate::credentials::PasswordRequired.into());
     }
+    let password = password.or_else(|| {
+        bookmark
+            .as_ref()
+            .and_then(|bookmark| bookmark.password.clone())
+    });
     let cache_options = crate::cache::CacheOptions::from_settings(&app.settings)?;
     let options = crate::backend::ConnectOptions {
         target: target.to_owned(),
@@ -86,9 +118,9 @@ fn start(
     };
     let connection = app.connection.clone();
     let session = app.session.clone();
-    Ok(app
-        .jobs
-        .start_retrying_operation(format!("connect {target}"), move |_| {
+    Ok(app.jobs.start_retrying_operation(
+        format!("connect {}", crate::credentials::connection_label(target)),
+        move |_| {
             let connection = connection.clone();
             let backend = backend.clone();
             let options = options.clone();
@@ -107,5 +139,6 @@ fn start(
                 *session.lock().expect("session state poisoned") = info;
                 Ok(message)
             }
-        }))
+        },
+    ))
 }

@@ -362,7 +362,7 @@ fn read_attached_command(
                 disable_raw_mode()?;
                 println!();
                 let command = command.into_string();
-                if !command.trim().is_empty() {
+                if commands::should_record_history(&command) {
                     history.push(command.clone());
                 }
                 return Ok(Some(command));
@@ -1250,13 +1250,12 @@ fn dispatch_attached_command(
     let parser = match ParserContext::parse(command) {
         Ok(parser) => parser,
         Err(error) => {
-            append_history(history_file, command);
             eprintln!("{error}");
             return Ok(true);
         }
     };
     let definition = commands::find(&parser);
-    if definition.is_none_or(|command| command.record_history()) {
+    if definition.is_none_or(|command| command.record_history_for(&parser)) {
         append_history(history_file, command);
     }
     if let Some(definition) = definition.filter(|command| command.site() == ExecutionSite::Client) {
@@ -2491,6 +2490,45 @@ mod startup_tests {
                 .kind(),
             io::ErrorKind::WouldBlock
         );
+    }
+
+    #[test]
+    fn password_settings_and_inline_credentials_are_never_written_to_history() {
+        let root = tempfile::tempdir().unwrap();
+        let history = root.path().join("history");
+        fs::write(&history, "help\n").unwrap();
+        let commands = [
+            "set smb:password never-log-this",
+            "open smb://user:never-log-this@host/share",
+            "open smb://user:@host/share",
+        ];
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            let mut reader = BufReader::new(server);
+            for command in commands {
+                let mut request = String::new();
+                reader.read_line(&mut request).unwrap();
+                assert_eq!(request, format!("COMMAND {command}\n"));
+                reader
+                    .get_mut()
+                    .write_all(b"OUTPUT declined\nDONE\n")
+                    .unwrap();
+            }
+        });
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        for command in commands {
+            assert!(!commands::should_record_history(command));
+            assert!(dispatch_attached_command(
+                &mut client,
+                &mut reader,
+                command,
+                history.to_str(),
+                &mut Typeahead::default()
+            )
+            .unwrap());
+        }
+        worker.join().unwrap();
+        assert_eq!(fs::read_to_string(&history).unwrap(), "help\n");
     }
 
     #[test]

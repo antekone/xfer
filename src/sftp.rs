@@ -272,7 +272,12 @@ impl Backend for Sftp {
         let recipe = ConnectRecipe {
             target,
             timeout,
-            password: options.password,
+            password: options.password.or_else(|| {
+                options
+                    .bookmark
+                    .as_ref()
+                    .and_then(|bookmark| bookmark.password.clone())
+            }),
             program: PathBuf::from("ssh"),
         };
         let (session, home) = recipe.establish(true).await?;

@@ -1,14 +1,9 @@
 //! Transport-independent backend and connection interfaces.
-use crate::{
-    bookmarks::Bookmark,
-    core::{SettingValue, Settings},
-    error::NonRetryableError,
-    listing::ListingSink,
-};
+use crate::{bookmarks::Bookmark, core::Settings, error::NonRetryableError, listing::ListingSink};
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 
-pub use crate::{s3::S3, sftp::Sftp};
+pub use crate::{s3::S3, sftp::Sftp, smb::Smb, webdav::Webdav};
 
 #[derive(Clone)]
 pub struct ConnectOptions {
@@ -93,20 +88,5 @@ pub trait Backend: Send + Sync {
     }
     async fn connect(&self, _options: ConnectOptions) -> Result<Box<dyn Connection>> {
         bail!("{} backend is not implemented yet", self.protocol())
-    }
-}
-
-pub struct Smb;
-#[async_trait]
-impl Backend for Smb {
-    fn protocol(&self) -> &'static str {
-        "smb"
-    }
-    fn register_settings(&self, settings: &mut Settings) {
-        settings.register(
-            "smb:max-credits",
-            SettingValue::Int(32),
-            "Maximum SMB credits",
-        );
     }
 }

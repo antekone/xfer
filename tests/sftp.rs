@@ -1007,3 +1007,23 @@ fn put_completion_is_local_file_only_and_selected_files_upload_from_local_cwd() 
     let response = daemon.command("close");
     daemon.finish(response, true);
 }
+
+#[test]
+fn stored_sftp_bookmark_password_uses_askpass_without_prompt_or_credential_output() {
+    let Some(mut daemon) = Daemon::start() else {
+        return;
+    };
+    fs::write(
+        daemon.root.path().join("config/xfer/bookmarks.toml"),
+        "[stored]\ntype='sftp'\nurl='sftp://user@example.invalid'\npassword='test-secret'\n",
+    )
+    .unwrap();
+    let response = daemon.command("open stored");
+    assert!(response[0].starts_with("JOB "));
+    daemon.finish(response, true);
+    for command in ["bookmark", "jobs", "status"] {
+        assert!(!daemon.command(command).join("\n").contains("test-secret"));
+    }
+    let response = daemon.command("close");
+    daemon.finish(response, true);
+}

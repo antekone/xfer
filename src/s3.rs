@@ -883,6 +883,9 @@ mod connection_tests {
             api: None,
             override_host: None,
             override_port: None,
+            user: None,
+            domain: None,
+            password: None,
             password_interactive: false,
         };
         let connection = S3
@@ -1443,6 +1446,9 @@ mod connection_tests {
             api: Some("s3v4".into()),
             override_host: None,
             override_port: None,
+            user: None,
+            domain: None,
+            password: None,
             password_interactive: false,
         };
         let connection = S3

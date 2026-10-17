@@ -175,6 +175,19 @@ pub trait Command: Sync {
     fn record_history(&self) -> bool {
         true
     }
+    fn record_history_for(&self, _parser: &ParserContext<'_>) -> bool {
+        self.record_history()
+    }
+}
+
+/// Shared by both persistent history and the interactive up/down buffer.
+/// Invalid quoting is not recorded, since it may contain incomplete credentials.
+pub fn should_record_history(line: &str) -> bool {
+    let Ok(parser) = ParserContext::parse(line) else {
+        return false;
+    };
+    !parser.name().is_empty()
+        && find(&parser).is_none_or(|command| command.record_history_for(&parser))
 }
 
 /// Adding a command requires a handler/Command implementation and ONE entry here.
@@ -300,6 +313,14 @@ impl Command for SmallCommand {
     }
     fn record_history(&self) -> bool {
         self.history
+    }
+    fn record_history_for(&self, parser: &ParserContext<'_>) -> bool {
+        self.history
+            && !(self.names.contains(&"set")
+                && parser
+                    .arguments()
+                    .first()
+                    .is_some_and(|name| name == "password" || name.ends_with(":password")))
     }
 }
 
@@ -564,7 +585,10 @@ fn set_lines(app: &mut Daemon, parser: &ParserContext<'_>) -> Vec<String> {
     let mut words = parser.words();
     match (words.next(), words.next()) {
         (Some(name), Some(value)) => match app.settings.set(name, value) {
-            Ok(()) => vec![format!("{name} set to {value}")],
+            Ok(()) => vec![format!(
+                "{name} set to {}",
+                app.settings.values[name].value.display()
+            )],
             Err(error) => vec![error.to_string()],
         },
         _ => vec!["usage: set <name> <value>".into()],
@@ -844,6 +868,54 @@ mod tests {
             .unwrap()
             .execute(&mut CommandContext::Client { app: &mut client }, &parser)
             .is_err());
+    }
+
+    #[test]
+    fn secret_settings_and_credential_urls_are_redacted_and_excluded_from_all_history() {
+        let mut app = Daemon::bootstrap().unwrap();
+        assert!(!app
+            .command("set smb:password 'never:log-this'")
+            .join("\n")
+            .contains("never:log-this"));
+        assert!(app.command("show smb:password")[0].contains("[redacted]"));
+        assert!(!app.command("show").join("\n").contains("never:log-this"));
+        assert_eq!(
+            app.settings.secret("smb:password").unwrap().expose(),
+            "never:log-this"
+        );
+        assert!(
+            !format!("{:?}", app.settings.values["smb:password"].value).contains("never:log-this")
+        );
+        for line in [
+            "set smb:password 'never:log-this'",
+            "open smb://user:secret@host/share",
+            "connect smb://user:@host/share",
+            "open smb://user:incomplete",
+            "set smb:password 'unfinished",
+        ] {
+            assert!(!should_record_history(line), "{line}");
+        }
+        for line in [
+            "open nas",
+            "open smb://user@host:445/share",
+            "set smb:user ''",
+            "show smb:password",
+        ] {
+            assert!(should_record_history(line), "{line}");
+        }
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("xfer.conf");
+        std::fs::write(&config, "smb:password:no:space:secret\nsmb:user:\n").unwrap();
+        app.settings.load_file(&config).unwrap();
+        assert_eq!(
+            app.settings.secret("smb:password").unwrap().expose(),
+            "no:space:secret"
+        );
+        assert_eq!(app.settings.text("smb:user"), Some(""));
+        assert!(!app
+            .command("show smb:password")
+            .join("\n")
+            .contains("no:space:secret"));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # xfer
 
-A Rust prototype for an lftp-like transfer client, with S3/SFTP backends and a
+A Rust prototype for an lftp-like transfer client, with S3/SFTP/SMB/WebDAV backends and a
 client/daemon runtime:
 
 - lftp-style inline prompt in the normal terminal buffer; only pager mode uses the alternate screen;
@@ -8,8 +8,8 @@ client/daemon runtime:
   `Ctrl-C` cancellation;
 - `Ctrl-Z` backgrounds the foreground job; `jobs` and `fg [id]` manage jobs;
 - pager mode with vi-style navigation, `$VISUAL` handoff, and the `ui:auto-pager` setting;
-- typed settings and backend interfaces, with S3/SFTP listing/download support
-  and an SMB placeholder.
+- typed settings and backend interfaces, with S3/SFTP/SMB/WebDAV listing/download support
+  and SFTP/SMB/WebDAV uploads.
 
 Run it with:
 
@@ -34,12 +34,236 @@ s3:region: us-east-1
 smb:max-credits: 32
 ```
 
-S3 and SFTP support connect, navigation, listing and downloads. SFTP also supports
-uploads with `put`; S3 uploads, mirroring, and SMB operations are not implemented yet.
+S3, SFTP, SMB, and WebDAV support connect, navigation, listing and downloads.
+SFTP, SMB, and WebDAV also support uploads with `put`; S3 uploads and mirroring
+are not implemented yet.
+
+## WebDAV
+
+`src/webdav.rs` implements native async HTTP/WebDAV, not HTML directory-index
+scraping. HTTP(S) and DAV(S) URLs select this backend:
+
+```text
+open https://live.sysinternals.com/
+ls
+```
+
+Anonymous HTTPS browsing of this public endpoint has been verified with the real
+terminal client. `http://`, `dav://`, and `webdav://` use plain HTTP;
+`https://`, `davs://`, and `webdavs://` use TLS. A plain Apache/nginx HTML index
+without `PROPFIND` support is not sufficient.
+
+For authenticated access, use a bookmark:
+
+```toml
+[files]
+type = 'webdav'
+url = 'https://dav.example.com/files/'
+user = 'alice'
+password = 'your password'
+# Or omit password and use password_interactive = true.
+```
+
+HTTP Basic authentication and anonymous access are supported; Digest, NTLM,
+OAuth/Bearer, and client certificates are not implemented. Password prompts use
+the existing private IPC flow. Interactive passwords override stored bookmark
+passwords, which override URL credentials and then `webdav:user`/`webdav:password`
+defaults. Explicit empty values override defaults; an empty user means anonymous
+and sends no inherited password. URL credentials are percent-decoded, redacted
+from job labels, and excluded from history. Prefer bookmarks: inline passwords
+are visible while typed. Stored passwords are plaintext; protect credential
+files with mode 0600. HTTP header/TLS buffer copies are not guaranteed to be wiped
+when released.
+
+TLS certificate verification is enabled by default; the existing, deliberately
+unsafe `ssl:skip-validation` switch is honored per connection. Basic credentials
+are refused over plain HTTP unless `webdav:allow-insecure-auth` is explicitly
+set to true, even on loopback. Redirects may only canonicalize a trailing slash
+at the same origin; cross-origin, scheme-changing, and arbitrary path redirects
+are refused, and mutations are never replayed through redirects.
+
+`ls` and completion use namespace-aware `PROPFIND` with `Depth: 0`/`1`,
+`get`/`cat` use streaming `GET`, `put` uses streaming `PUT`, and `mkdir [-p]` uses
+`MKCOL`. `pwd` and navigation use decoded UTF-8 paths; `/` is the HTTP origin's
+root, while bare `cd` returns to the URL's initial collection. Parent navigation
+may fail if the origin root is not itself WebDAV-enabled. Server-provided sizes,
+UTC modification dates, and collection types are used without fabricated POSIX
+metadata. Foreign/deeper-than-requested hrefs, encoded path separators, DTDs,
+malformed XML, and oversized XML tokens/resources are rejected. Listings stream
+without a resource-count cap; XML nesting is limited to 32, tokens/resources to
+1 MiB, and individual metadata fields to 64 KiB.
+
+Transfers use bounded 64 KiB chunks. Downloads check size and validators before
+and after reading, use strong ETag `If-Match` (or modification-time
+`If-Unmodified-Since`), and validate exact `206`/`Content-Range` responses on
+resume. Ignored ranges, changed metadata, compressed bodies, and oversized
+responses cannot silently corrupt an appended file. Resume without a strong
+ETag or modification date is refused; date-only checks have server timestamp
+precision limits and are not atomic snapshots or content hashes. Servers must
+honor HTTP preconditions. Uploads use `If-None-Match: *` unless clobber is enabled;
+interrupted uploads may leave a remote file and restart rather than resume.
+No WebDAV locking, atomic temporary-upload/rename, `MOVE`, or `DELETE` commands
+are exposed. Cancellation drops active request/body futures; existing job
+backoff reconnects HTTP transport as needed with frozen connection options.
+HTTP authentication/access/missing-path/unsupported-method errors stop retries;
+timeouts, throttling, and transient service failures remain retryable.
+
+WebDAV settings (reconnect to apply):
+
+```text
+webdav:user:
+# Optional: webdav:password: your password
+webdav:connect-timeout: 10
+webdav:operation-timeout: 30
+webdav:allow-insecure-auth: false
+```
+
+Timeouts are validated to 1..300 seconds. `tests/webdav.rs` exercises real local
+HTTP exchanges without external services, including credentials, TLS rejection,
+range safety, disconnect/resume, cancellation, mutations, and daemon workflows.
+A separate manual test against WsgiDAV and a real PTY covered stored/prompted
+login, resumable binary downloads, Unicode uploads, completion, and `mkdir`.
+
+## SMB / CIFS
+
+`src/smb.rs` uses the pure-Rust `smb2` crate's native Tokio APIs. No CIFS mount,
+root privileges, external `smbclient`, or dedicated blocking SMB thread is needed.
+SMB1 is not supported. xfer currently exposes NTLM/domain-password or explicit
+guest access, not the library's separate Kerberos API.
+
+```text
+open smb://nas/share
+open smb://nas:1445/share/subdirectory
+```
+
+An empty effective user requests a **true anonymous / NULL session**, never the
+local OS username or the named `Guest` account. This works with public Samba shares
+using `map to guest = Never`; no failed-login-to-guest mapping is needed. The
+adapter uses the library's public connection/tree APIs for anonymous login because
+`smb2` 0.31's normal empty-credential NTLMv2 login is not a NULL session.
+
+For a public share such as `//127.0.0.1/vm`, use:
+
+```toml
+[vm]
+type = 'smb'
+url = 'smb://127.0.0.1/vm'
+user = ''
+domain = ''
+password = ''
+```
+
+Then `open vm`, without a prompt. `user = ''` is significant, not an unset value:
+it forces anonymous access and discards inherited domain/password credentials.
+With the default empty `smb:user`, `open smb://127.0.0.1/vm` is anonymous too.
+An explicit empty URL user (`open smb://@127.0.0.1/vm`) overrides a named global
+user. The named `Guest` account and passwordless logins as another username remain
+separate logins; they are not substituted for anonymous access.
+
+To store a noninteractive Samba-account password instead:
+
+```toml
+[vm-login]
+type = 'smb'
+url = 'smb://127.0.0.1/vm'
+user = 'antek'
+domain = ''
+password = 'your Samba password'
+```
+
+A Samba account password is separate from the Linux account password. Protect
+`bookmarks.toml` and any credential-bearing `xfer.conf` with mode 0600; stored
+passwords are plaintext on disk, not encrypted. `password` is also supported in
+SFTP bookmarks. It is never included in bookmark listings.
+
+For a client-side password prompt, use `password_interactive = true` instead.
+That flag deliberately forces a prompt even if a stored password is present;
+the answer travels through private IPC, not argv/environment/history. Explicit
+SMB bookmark fields override URL components, which override `smb:user`,
+`smb:domain`, and `smb:password` defaults. The interactive password takes precedence
+over every stored source. Explicit empty values override rather than fall through.
+
+SMB URL shortcuts are also accepted:
+
+```text
+open 'smb://WORKGROUP;antek:password@nas/Documents'
+```
+
+`DOMAIN%5Cuser` is an alternative to `DOMAIN;user`; percent-encode reserved
+characters in URL passwords (`%40` for `@`, `%2F` for `/`, etc.). Prefer bookmarks:
+a password typed in a URL or `set smb:password ...` is still visible on the input
+line. Such commands are excluded from both persistent and up/down history, job
+labels redact URL userinfo, and `show`/`set` display passwords as `[redacted]`.
+`set` changes in-memory defaults; use a configuration file for persistence.
+
+Remote paths use `/share/path/`, with `/` representing the server's disk-share
+namespace. `open smb://nas` / `cd /` enumerate shares when the server permits it;
+connecting directly to a share does not require share-enumeration permission.
+Use forward slashes, not Windows UNC backslashes: the library treats a backslash
+inside a filename as a literal character. `cd` without arguments returns to the
+directory selected by the connection URL. `mkdir -p` creates directories, never
+shares. `ls`, completion, `get [-c]`, `cat`, `put`, and `du` use the existing job,
+cache, sorting, and transfer interfaces. Listing supplies exact sizes and UTC
+mtime, not fabricated POSIX permissions, UID/GID, or owner names. Descendant
+reparse-point directories are not traversed by `du` or offered as directories by
+completion, avoiding junction/symlink cycles.
+
+Directory listings are read one server batch at a time. Transfers use bounded
+64 KiB chunks and a capped in-flight window, rather than buffering whole files.
+Cancelled, timed-out, or broken sessions are closed and replaced lazily. Existing
+job backoff reconnects with frozen settings and in-memory credentials; downloads
+resume at the last written byte after checking size and server modification/change
+timestamps (100 ns wire precision). CreationTime is excluded because Samba may
+report different birth-time estimates across opens. These metadata checks
+are not atomic snapshots or cryptographic content verification. Authentication,
+security, permission, and missing-path errors do not retry indefinitely. Uploads
+use exclusive creation unless clobber is enabled, and flush before success;
+interrupted uploads may leave a partial remote file and are not resumed in place.
+
+SMB settings (reconnect to apply):
+
+```text
+smb:user:
+smb:domain:
+# Optional: smb:password: your Samba password
+smb:connect-timeout: 10
+smb:operation-timeout: 30
+smb:max-credits: 32
+smb:dfs: false
+smb:require-encryption: false
+```
+
+`smb:max-credits` bounds in-flight 64 KiB transfer chunks (1..128), not the server's
+negotiated credit grant. DFS is disabled by default because referrals can forward
+credentials to other servers; enable it only for a trusted namespace. Anonymous
+sessions currently do not support DFS. Named SMB
+sessions use the library's signing verification. Encryption is not guaranteed by
+default. `smb:require-encryption` requires an authenticated SMB3 encrypted session,
+including the tree connect, and fails closed without a plaintext fallback. It
+cannot currently be combined with DFS, since referral encryption cannot be
+enforced uniformly by this adapter.
+
+**Encryption interoperability limitation:** with `smb2` 0.31 and the tested Samba
+4.24 server, no encryption cipher was negotiated, so encryption-required access
+was refused. Signed authenticated and guest transfers were tested successfully;
+do not assume encrypted-share compatibility until your server has been verified.
+
+Connection-specific credentials are retained for logical reconnects and released
+on close/replacement; configured global defaults remain until replaced or daemon
+exit. xfer's own password handle is zeroizing, but `smb2` also retains ordinary password
+and session-key allocations internally; their deallocation is not a guaranteed
+secure memory wipe. xfer does not copy credentials into logs, job spools, or
+history; explicitly stored passwords remain in their configured source files.
+
+SMB integration tests use an isolated Samba instance on an ephemeral loopback
+port with private passdb/state directories. They require `smbd` and `smbpasswd`,
+and either root or Linux user namespaces (`unshare --map-auto --map-root-user`
+plus `setpriv` and subordinate UID/GID mappings). Tests skip when unavailable and
+never reconfigure the system Samba server or accounts.
 
 ## Creating remote directories
 
-`mkdir [-p] [--] <directories...>` creates remote directories on SFTP or directory
+`mkdir [-p] [--] <directories...>` creates remote directories on SFTP/SMB or directory
 markers on S3:
 
 ```text
@@ -575,7 +799,7 @@ their usual behavior rather than becoming typeahead.
 ## Remote file contents
 
 `cat [--] <files...>` prints remote file contents to stdout using the active
-S3/SFTP connection:
+S3/SFTP/SMB connection:
 
 ```text
 cat README.txt
@@ -603,7 +827,7 @@ byte is not a newline, the interactive UI puts its next prompt on a separate lin
 
 ## Uploads and local file completion
 
-`put [--] <files...>` uploads regular local files to the current remote SFTP
+`put [--] <files...>` uploads regular local files to the current remote SFTP/SMB
 directory. Local relative paths use Local CWD (selected with `lcd`); absolute
 paths and literal `~/...` paths are also accepted.
 

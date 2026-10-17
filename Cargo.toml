@@ -23,18 +23,22 @@ aws-smithy-http-client = { version = "1", features = ["hyper-014"] }
 hyper-rustls = "0.24"
 rustls = { version = "0.21", features = ["dangerous_configuration"] }
 
-hyper = { version = "0.14", features = ["client", "tcp"] }
+hyper = { version = "0.14", features = ["client", "tcp", "stream"] }
+quick-xml = { version = "0.37", features = ["async-tokio"] }
+base64 = "0.22"
 tower-service = "0.3"
 unicode-width = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["std", "serde"] }
 libc = "0.2"
 openssh-sftp-client = "0.15.10"
+smb2 = "0.31"
 futures-util = "0.3"
 percent-encoding = "2"
 tempfile = "3.10"
 zeroize = "1"
 
 [dev-dependencies]
+hyper = { version = "0.14", features = ["server"] }
 tokio = { version = "1", features = ["test-util"] }
 rcgen = "0.13"
 
