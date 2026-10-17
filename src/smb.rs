@@ -626,6 +626,19 @@ fn valid_name(name: &str) -> Result<()> {
 
 #[async_trait]
 impl Connection for SmbConnection {
+    fn prompt_user(&self) -> String {
+        self.recipe.target.username.clone()
+    }
+    fn prompt_host(&self) -> String {
+        self.recipe
+            .target
+            .address
+            .rsplit_once(':')
+            .map(|(host, _)| host)
+            .unwrap_or("")
+            .to_owned()
+    }
+
     fn protocol(&self) -> &'static str {
         "smb"
     }

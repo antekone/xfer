@@ -34,11 +34,17 @@ fn default_history_path() -> String {
 
 /// Lightweight committed session state: safe to query while a job owns the
 /// backend connection lock. It never contains credentials or endpoint secrets.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct SessionInfo {
     pub daemon_pid: u32,
     pub protocol: Option<String>,
     pub cwd: Option<String>,
+    #[serde(default)]
+    pub user: String,
+    #[serde(default)]
+    pub host: String,
+    #[serde(default)]
+    pub prompt: Option<String>,
 }
 impl SessionInfo {
     pub(crate) fn disconnected() -> Self {
@@ -46,6 +52,7 @@ impl SessionInfo {
             daemon_pid: std::process::id(),
             protocol: None,
             cwd: None,
+            ..Self::default()
         }
     }
     pub(crate) fn connected(connection: &dyn crate::backend::Connection) -> Self {
@@ -53,6 +60,9 @@ impl SessionInfo {
             daemon_pid: std::process::id(),
             protocol: Some(connection.protocol().to_owned()),
             cwd: connection.pwd().ok(),
+            user: connection.prompt_user(),
+            host: connection.prompt_host(),
+            prompt: None,
         }
     }
 }
@@ -136,6 +146,11 @@ impl Daemon {
             SettingValue::Bool(true),
             "Use pager for long output",
         );
+        settings.register(
+            "ui:prompt",
+            SettingValue::Text("xfer$location> ".into()),
+            "Prompt template: $cwd, $cwdn, $user, $host, $proto, $lcwd, $lcwdn, $location; $$ escapes $",
+        );
         let config_file = ConfigFile::load(&mut settings, crate::config_dir().join("xfer.conf"))?;
         let config_override = std::env::var_os("XFER_CONFIG")
             .map(|path| ConfigFile::load(&mut settings, PathBuf::from(path)))
@@ -199,7 +214,13 @@ impl Daemon {
     }
 
     pub fn session_info(&self) -> SessionInfo {
-        self.session.lock().expect("session state poisoned").clone()
+        let mut info = self.session.lock().expect("session state poisoned").clone();
+        info.prompt = Some(crate::prompt::format(
+            self.settings.text("ui:prompt").unwrap_or("xfer$location> "),
+            &info,
+            &self.local_directory.to_string_lossy(),
+        ));
+        info
     }
 
     pub fn bookmark_completion(&self, input: &str) -> Result<crate::cache::PathCompletion> {
@@ -947,6 +968,31 @@ mod tests {
             "Bookmarks file: {}",
             std::path::absolute("other.toml").unwrap().display()
         )));
+    }
+
+    #[test]
+    fn prompt_setting_refreshes_from_committed_state() {
+        let mut daemon = Daemon::bootstrap().unwrap();
+        daemon.settings.set("ui:prompt", "xfer$location> ").unwrap();
+        assert_eq!(daemon.session_info().prompt.as_deref(), Some("xfer> "));
+        *daemon.session.lock().unwrap() = SessionInfo {
+            protocol: Some("sftp".into()),
+            cwd: Some("/home/antek/".into()),
+            user: "antek".into(),
+            host: "example.org".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            daemon.session_info().prompt.as_deref(),
+            Some("xfer[sftp:/home/antek/]> ")
+        );
+        daemon.command("set ui:prompt '$user@$host [$cwdn]> '");
+        assert_eq!(
+            daemon.session_info().prompt.as_deref(),
+            Some("antek@example.org [antek]> ")
+        );
+        *daemon.session.lock().unwrap() = SessionInfo::disconnected();
+        assert_eq!(daemon.session_info().prompt.as_deref(), Some("@ []> "));
     }
 
     #[tokio::test]

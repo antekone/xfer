@@ -137,6 +137,7 @@ fn seconds(settings: &Settings, key: &str) -> Result<Duration> {
     }
 }
 struct Target {
+    user: String,
     base: Url,
     home: Location,
     auth: Option<HeaderValue>,
@@ -221,6 +222,7 @@ impl Target {
         let _ = url.set_username("");
         url.set_path("/");
         Ok(Self {
+            user,
             base: url,
             home,
             auth,
@@ -291,6 +293,7 @@ fn empty_body() -> Body {
         .boxed_unsync()
 }
 struct WebdavConnection {
+    user: String,
     client: HttpClient,
     base: Url,
     cwd: Location,
@@ -702,6 +705,7 @@ impl Backend for Webdav {
             .http1_max_buf_size(CHUNK)
             .build(builder.https_or_http().enable_http1().wrap_connector(tcp));
         let connection = WebdavConnection {
+            user: target.user,
             client,
             base: target.base,
             cwd: target.home.clone(),
@@ -717,6 +721,13 @@ impl Backend for Webdav {
 }
 #[async_trait]
 impl Connection for WebdavConnection {
+    fn prompt_user(&self) -> String {
+        self.user.clone()
+    }
+    fn prompt_host(&self) -> String {
+        self.base.host_str().unwrap_or("").to_owned()
+    }
+
     fn protocol(&self) -> &'static str {
         "webdav"
     }

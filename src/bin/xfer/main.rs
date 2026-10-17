@@ -1657,6 +1657,9 @@ fn report_startup_file(
 }
 
 fn session_prompt(info: &xfer::daemon::SessionInfo) -> String {
+    if let Some(prompt) = &info.prompt {
+        return prompt.clone();
+    }
     let safe = |value: &str| {
         value
             .chars()
@@ -2067,6 +2070,7 @@ mod startup_tests {
             daemon_pid: 987654,
             protocol: None,
             cwd: None,
+            ..Default::default()
         };
         assert_eq!(session_prompt(&info), "xfer> ");
         info.protocol = Some("s3".into());
@@ -2091,13 +2095,15 @@ mod startup_tests {
                 daemon_pid: 123,
                 protocol: Some("s3".into()),
                 cwd: Some("/archive/".into()),
+                prompt: Some("custom[archive]> ".into()),
+                ..Default::default()
             };
             writeln!(server, "SESSION {}", serde_json::to_string(&info).unwrap()).unwrap();
         });
         let mut reader = BufReader::new(client.try_clone().unwrap());
         assert_eq!(
             fetch_session_prompt(&mut client, &mut reader).unwrap(),
-            "xfer[s3:/archive/]> "
+            "custom[archive]> "
         );
         worker.join().unwrap();
     }

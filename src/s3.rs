@@ -58,6 +58,7 @@ impl S3Location {
 }
 
 struct S3Connection {
+    host: String,
     client: aws_sdk_s3::Client,
     location: S3Location,
     home: S3Location,
@@ -71,6 +72,7 @@ impl S3Connection {
         };
         Self {
             client,
+            host: String::new(),
             home: location.clone(),
             location,
             redactions,
@@ -79,6 +81,10 @@ impl S3Connection {
 }
 #[async_trait]
 impl Connection for S3Connection {
+    fn prompt_host(&self) -> String {
+        self.host.clone()
+    }
+
     fn protocol(&self) -> &'static str {
         "s3"
     }
@@ -534,6 +540,11 @@ impl Backend for S3 {
         // The daemon owns retries/backoff and cancellation, not a second SDK loop.
         let mut config = aws_sdk_s3::config::Builder::from(&shared)
             .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(1));
+        let host = endpoint
+            .as_deref()
+            .and_then(|value| url::Url::parse(value).ok())
+            .and_then(|url| url.host_str().map(str::to_owned))
+            .unwrap_or_default();
         if let Some(endpoint) = endpoint {
             config = config.endpoint_url(endpoint).force_path_style(true);
         }
@@ -557,7 +568,9 @@ impl Backend for S3 {
                 .await
                 .map_err(|error| probe_error("ListBuckets", &error, &redactions))?;
         }
-        Ok(Box::new(S3Connection::new(client, bucket, redactions)))
+        let mut connection = S3Connection::new(client, bucket, redactions);
+        connection.host = host;
+        Ok(Box::new(connection))
     }
 }
 

@@ -252,6 +252,13 @@ impl CachedConnection {
 
 #[async_trait]
 impl Connection for CachedConnection {
+    fn prompt_user(&self) -> String {
+        self.inner.prompt_user()
+    }
+    fn prompt_host(&self) -> String {
+        self.inner.prompt_host()
+    }
+
     fn protocol(&self) -> &'static str {
         self.inner.protocol()
     }

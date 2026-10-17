@@ -16,6 +16,13 @@ pub struct ConnectOptions {
 #[async_trait]
 pub trait Connection: Send + Sync {
     fn protocol(&self) -> &'static str;
+    /// Non-secret display identity only; never return credentials or full URLs.
+    fn prompt_user(&self) -> String {
+        String::new()
+    }
+    fn prompt_host(&self) -> String {
+        String::new()
+    }
     async fn list(&self, _path: &str, _output: &mut dyn ListingSink) -> Result<u64> {
         bail!("listing is not implemented for {}", self.protocol())
     }

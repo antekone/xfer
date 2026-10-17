@@ -20,3 +20,4 @@ pub mod walker;
 pub mod core;
 
 mod local_path;
+mod prompt;

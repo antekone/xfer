@@ -672,6 +672,13 @@ impl SftpConnection {
 
 #[async_trait]
 impl Connection for SftpConnection {
+    fn prompt_user(&self) -> String {
+        self.recipe.target.user.clone().unwrap_or_default()
+    }
+    fn prompt_host(&self) -> String {
+        self.recipe.target.host.clone()
+    }
+
     fn protocol(&self) -> &'static str {
         "sftp"
     }

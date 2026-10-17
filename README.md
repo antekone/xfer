@@ -812,6 +812,33 @@ xfer[s3:/archive/]> cd photos
 xfer[s3:/archive/photos/]> status
 ```
 
+Configure the prompt with the string setting `ui:prompt`, either interactively:
+
+```text
+set ui:prompt 'xfer[$cwd]> '
+set ui:prompt '$user@$host [$cwdn]> '
+```
+
+or in `xfer.conf`: `ui:prompt: xfer[$cwd]> `.
+
+| Variable | Expansion |
+| --- | --- |
+| `$cwd` | Backend and full remote directory, e.g. `sftp:/home/antek/` |
+| `$cwdn` | Last component of the remote directory (`/` at root) |
+| `$user` | Configured remote username, if known |
+| `$host` | Remote hostname / configured S3 endpoint hostname, if known |
+| `$proto` | Backend protocol, e.g. `sftp` or `s3` |
+| `$lcwd` | Full local working directory |
+| `$lcwdn` | Last component of the local working directory |
+| `$location` | `[$cwd]` when connected, empty when disconnected |
+
+The default is `xfer$location> `, preserving the prompts above. Remote variables
+are empty when unavailable; `$user` does not expose S3 credentials or infer a
+username from SSH configuration. `$host` is empty for S3's automatic AWS endpoint.
+`${name}` also works, and `$$` prints a literal `$`. Unknown variables stay literal.
+Expansion is single-pass (not shell evaluation); terminal control characters are
+escaped. Include any desired trailing space in the template.
+
 `status` displays the connected daemon's PID, backend, CWD, and running-job count,
 plus absolute paths for the user config, the `XFER_CONFIG` override (if set), and
 the current `bookmarks:file`. Config files missing at startup are explicitly marked
