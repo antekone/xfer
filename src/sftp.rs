@@ -35,9 +35,12 @@ pub struct Sftp;
 fn permanent(message: impl Into<String>) -> anyhow::Error {
     NonRetryableError(message.into()).into()
 }
+
 fn local_error(path: &Path, error: impl std::fmt::Display) -> anyhow::Error {
     permanent(format!("local file {}: {error}", path.display()))
 }
+
+// ------------------------------------------------------------------------------------------------
 
 #[derive(Debug, PartialEq)]
 struct Target {
@@ -46,6 +49,7 @@ struct Target {
     port: Option<u16>,
     directory: String,
 }
+
 impl Target {
     fn parse(value: &str) -> Result<Self> {
         let url = url::Url::parse(value).map_err(|_| permanent("invalid SFTP URL"))?;
@@ -56,38 +60,49 @@ impl Target {
         {
             return Err(permanent("expected sftp://[user@]host[:port][/directory]; passwords belong in the interactive prompt"));
         }
+
         let host = match url.host() {
             Some(url::Host::Domain(host)) => host.to_owned(),
             Some(url::Host::Ipv4(host)) => host.to_string(),
             Some(url::Host::Ipv6(host)) => host.to_string(),
             None => return Err(permanent("SFTP URL requires a host")),
         };
-        if host.starts_with('-')
-            || host.chars().any(|c| c.is_whitespace() || c.is_control())
-            || url.port() == Some(0)
-        {
-            return Err(permanent("invalid SFTP host or port"));
+
+        // guard against option injection
+
+        if host.starts_with('-') || host.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err(permanent("invalid SFTP host"));
         }
+
+        if url.port() == Some(0) {
+            return Err(permanent("invalid SFTP port"));
+        }
+
         let decode = |value: &str| -> Result<String> {
             let value = percent_decode_str(value)
                 .decode_utf8()
                 .map_err(|_| permanent("SFTP URL must be valid UTF-8"))?
                 .into_owned();
+
             if value.chars().any(char::is_control) {
                 return Err(permanent("control characters are not allowed in SFTP URLs"));
             }
+
             Ok(value)
         };
+
         let user = if url.username().is_empty() {
             None
         } else {
             Some(decode(url.username())?)
         };
+
         let directory = if url.path().is_empty() {
             ".".into()
         } else {
             decode(url.path())?
         };
+
         Ok(Self {
             host,
             user,
@@ -118,49 +133,46 @@ impl Target {
         } else {
             self.host.clone()
         };
+
         let user = self
             .user
             .as_ref()
             .map(|user| format!("{user}@"))
             .unwrap_or_default();
+
         let port = self.port.map(|port| format!(":{port}")).unwrap_or_default();
         format!("{user}{host}{port}")
     }
 
     fn command(&self, program: &Path, timeout: u64, password: bool) -> Command {
         let mut command = Command::new(program);
+
         command
             .args([
                 "-T",
-                "-o",
-                "StrictHostKeyChecking=yes",
-                "-o",
-                "NumberOfPasswordPrompts=1",
-                "-o",
-                "KbdInteractiveAuthentication=no",
-                "-o",
-                "PermitLocalCommand=no",
-                "-o",
-                "ClearAllForwardings=yes",
-                "-o",
-                "ServerAliveInterval=15",
-                "-o",
-                "ServerAliveCountMax=2",
+                "-o", "StrictHostKeyChecking=yes",
+                "-o", "NumberOfPasswordPrompts=1",
+                "-o", "KbdInteractiveAuthentication=no",
+                "-o", "PermitLocalCommand=no",
+                "-o", "ClearAllForwardings=yes",
+                "-o", "ServerAliveInterval=15",
+                "-o", "ServerAliveCountMax=2",
             ])
-            .arg("-o")
-            .arg(format!("ConnectTimeout={timeout}"))
-            .arg("-o")
-            .arg(if password {
+            .arg("-o").arg(format!("ConnectTimeout={timeout}"))
+            .arg("-o").arg(if password {
                 "BatchMode=no"
             } else {
                 "BatchMode=yes"
             });
+
         if let Some(user) = &self.user {
             command.arg("-l").arg(user);
         }
+
         if let Some(port) = self.port {
             command.arg("-p").arg(port.to_string());
         }
+
         command
             .arg("-s")
             .arg("--")
@@ -170,25 +182,31 @@ impl Target {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+
         // Never let an inherited desktop askpass prompt consume credentials.
         command
             .env_remove(crate::ssh_askpass::SOCKET_ENV)
             .env("SSH_ASKPASS_REQUIRE", "never");
+
         command
     }
 }
+
+// ------------------------------------------------------------------------------------------------
 
 struct SshProcess {
     child: Child,
     diagnostics: Arc<Mutex<Vec<u8>>>,
     stderr_task: JoinHandle<()>,
 }
+
 impl SshProcess {
     fn spawn(command: &mut Command) -> Result<Self> {
         let mut child = command.spawn().context("start installed ssh client")?;
         let mut stderr = child.stderr.take().expect("piped SSH stderr");
         let diagnostics = Arc::new(Mutex::new(Vec::new()));
         let saved = diagnostics.clone();
+
         let stderr_task = tokio::spawn(async move {
             let mut buffer = [0; 1024];
             while let Ok(n) = stderr.read(&mut buffer).await {
@@ -200,12 +218,14 @@ impl SshProcess {
                 saved.extend_from_slice(&buffer[..n.min(remaining)]);
             }
         });
+
         Ok(Self {
             child,
             diagnostics,
             stderr_task,
         })
     }
+
     async fn failure_status(&mut self, timed_out: bool) -> Option<ExitStatus> {
         // Preserve SSH's actual exit status instead of immediately killing it.
         let status = if timed_out {
@@ -216,10 +236,12 @@ impl SshProcess {
                 .ok()
                 .and_then(Result::ok)
         };
+
         if status.is_none() {
             let _ = self.child.start_kill();
             let _ = tokio::time::timeout(Duration::from_millis(200), self.child.wait()).await;
         }
+
         // Reaping the process does not mean its stderr reader has drained the
         // pipe. Await that reader before formatting the error, with a bound for
         // proxy processes which might still hold the pipe open.
@@ -233,6 +255,7 @@ impl SshProcess {
             .to_owned()
     }
 }
+
 impl Drop for SshProcess {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
@@ -245,6 +268,7 @@ impl Backend for Sftp {
     fn protocol(&self) -> &'static str {
         "sftp"
     }
+
     fn register_settings(&self, settings: &mut Settings) {
         settings.register(
             "sftp:connect-timeout",
@@ -252,6 +276,7 @@ impl Backend for Sftp {
             "SSH connection/authentication timeout (seconds)",
         );
     }
+
     async fn connect(&self, options: ConnectOptions) -> Result<Box<dyn Connection>> {
         let target = Target::parse(
             options
@@ -260,6 +285,7 @@ impl Backend for Sftp {
                 .map(|b| b.url.as_str())
                 .unwrap_or(&options.target),
         )?;
+
         let timeout = match options
             .settings
             .values
@@ -269,6 +295,7 @@ impl Backend for Sftp {
             Some(SettingValue::Int(value)) if *value > 0 => *value as u64,
             _ => return Err(permanent("sftp:connect-timeout must be positive")),
         };
+
         let recipe = ConnectRecipe {
             target,
             timeout,
@@ -280,8 +307,10 @@ impl Backend for Sftp {
             }),
             program: PathBuf::from("ssh"),
         };
+
         let (session, home) = recipe.establish(true).await?;
         let home = home.expect("initial connection resolves home directory");
+
         Ok(Box::new(SftpConnection {
             recipe,
             session: AsyncMutex::new(Some(session)),
@@ -300,10 +329,12 @@ struct ConnectRecipe {
     password: Option<crate::credentials::Password>,
     program: PathBuf,
 }
+
 impl ConnectRecipe {
     async fn establish(&self, initial: bool) -> Result<(SftpSession, Option<String>)> {
         let target = &self.target;
         let timeout = self.timeout;
+
         let askpass = self
             .password
             .clone()
@@ -314,20 +345,25 @@ impl ConnectRecipe {
                     "cannot initialize private SSH password helper: {error:#}"
                 ))
             })?;
+
         let mut command = target.command(&self.program, timeout, askpass.is_some());
         if let Some(askpass) = &askpass {
             askpass.configure(&mut command)?;
         }
+
         let mut process = SshProcess::spawn(&mut command).map_err(|error| {
             permanent(format!("connect to {}: {error:#}", target.description()))
         })?;
+
         let stdin = process.child.stdin.take().unwrap();
         let stdout = process.child.stdout.take().unwrap();
         let mut stage = "start SFTP subsystem";
+
         let result = tokio::time::timeout(Duration::from_secs(timeout), async {
             let sftp = Client::new(stdin, stdout, SftpOptions::new())
                 .await
                 .context(stage)?;
+
             // Logical cwd/home are absolute paths kept by SftpConnection. A
             // recovery session must not reset them or re-resolve a changed ~.
             let home = if initial {
@@ -338,12 +374,15 @@ impl ConnectRecipe {
                     .canonicalize(&directory)
                     .await
                     .with_context(|| format!("{stage} {:?}", target.directory))?;
+
                 stage = "stat initial remote directory";
+
                 let metadata = sftp
                     .fs()
                     .metadata(&home)
                     .await
                     .with_context(|| format!("{stage} {}", home.display()))?;
+
                 if !metadata.file_type().is_some_and(|kind| kind.is_dir()) {
                     bail!(
                         "SFTP initial path {} on {} is not a directory",
@@ -355,9 +394,10 @@ impl ConnectRecipe {
             } else {
                 None
             };
+
             Ok::<_, anyhow::Error>((sftp, home))
-        })
-        .await;
+        }).await;
+
         match result {
             Ok(Ok((sftp, home))) => {
                 drop(askpass); // No listening secret socket outside authentication.
@@ -370,6 +410,7 @@ impl ConnectRecipe {
                     Err(_) => anyhow::anyhow!("timed out after {timeout}s while trying to {stage}"),
                     Ok(Ok(_)) => unreachable!(),
                 };
+
                 let status = process.failure_status(timed_out).await;
                 let diagnostic = process.diagnostic();
                 let message =
@@ -379,11 +420,13 @@ impl ConnectRecipe {
                         .chain()
                         .filter_map(|cause| cause.downcast_ref::<openssh_sftp_client::Error>())
                         .any(transport_failure);
+
                 if !permanent_ssh_error(&diagnostic)
                     && (timed_out || transient_ssh_error(&diagnostic) || reconnect_transport)
                 {
                     return Err(transport(message));
                 }
+
                 Err(permanent(message))
             }
         }
@@ -457,17 +500,21 @@ fn connection_error(
         "SSH/SFTP connection to {} failed: {error:#}",
         target.description()
     );
+
     if let Some(status) = status {
         message.push_str(&format!("; SSH {status}"));
     }
+
     if !diagnostic.trim().is_empty() {
         message.push_str(&format!("; SSH stderr: {}", diagnostic.trim()));
     }
+
     // Redact the entire cause chain and stderr BEFORE bounding the output, so
     // truncation cannot expose a password prefix. Never emit terminal controls.
     if let Some(password) = password.filter(|p| !p.expose().is_empty()) {
         message = message.replace(password.expose(), "[redacted]");
     }
+
     message
         .chars()
         .map(|ch| if ch.is_control() { ' ' } else { ch })
@@ -494,17 +541,21 @@ fn remote_path(path: &Path) -> Result<String> {
     let path = path
         .to_str()
         .ok_or_else(|| permanent("non-UTF-8 remote paths are not supported"))?;
+
     if !path.starts_with('/') {
         return Err(permanent("SFTP server returned a non-absolute path"));
     }
+
     Ok(directory(&normalize("/", path)))
 }
+
 fn normalize(cwd: &str, path: &str) -> String {
     let mut parts = if path.starts_with('/') {
         Vec::new()
     } else {
         cwd.split('/').filter(|p| !p.is_empty()).collect::<Vec<_>>()
     };
+
     for part in path.split('/') {
         match part {
             "" | "." => {}
@@ -516,6 +567,7 @@ fn normalize(cwd: &str, path: &str) -> String {
     }
     format!("/{}", parts.join("/"))
 }
+
 fn directory(path: &str) -> String {
     if path.ends_with('/') {
         path.to_owned()
@@ -523,9 +575,11 @@ fn directory(path: &str) -> String {
         format!("{path}/")
     }
 }
+
 fn directory_input(path: &str) -> bool {
     path.is_empty() || path.ends_with('/') || matches!(path.rsplit('/').next(), Some("." | ".."))
 }
+
 async fn operation<T>(
     future: impl Future<Output = Result<T, openssh_sftp_client::Error>>,
 ) -> Result<T> {
@@ -546,6 +600,7 @@ async fn operation<T>(
     };
     Err(permanent(message))
 }
+
 fn record(
     name: String,
     metadata: &MetaData,
@@ -585,6 +640,7 @@ fn record(
         })
     }
 }
+
 /// Extract owner and group from the conventional SFTP v3 longname form.
 /// The field is server-defined, so only accept an ls-like mode and link-count
 /// prefix; numeric SFTP attributes remain the fallback when this fails.
@@ -592,13 +648,16 @@ fn owner_group_from_longname(longname: &[u8]) -> (Option<String>, Option<String>
     let Ok(longname) = std::str::from_utf8(longname) else {
         return (None, None);
     };
+
     let mut fields = longname.split_ascii_whitespace();
     let Some(mode) = fields.next() else {
         return (None, None);
     };
+
     let Some(links) = fields.next() else {
         return (None, None);
     };
+
     if mode.len() != 10
         || !matches!(
             mode.as_bytes()[0],
@@ -608,9 +667,11 @@ fn owner_group_from_longname(longname: &[u8]) -> (Option<String>, Option<String>
     {
         return (None, None);
     }
+
     let (Some(owner), Some(group)) = (fields.next(), fields.next()) else {
         return (None, None);
     };
+
     (Some(owner.to_owned()), Some(group.to_owned()))
 }
 
@@ -618,6 +679,7 @@ fn remote_file(metadata: &MetaData) -> Result<RemoteFile> {
     if !metadata.file_type().is_some_and(|kind| kind.is_file()) {
         return Err(permanent("expected a regular remote file"));
     }
+
     Ok(RemoteFile {
         size: metadata
             .len()
@@ -625,11 +687,13 @@ fn remote_file(metadata: &MetaData) -> Result<RemoteFile> {
         revision: metadata.modified().map(|time| time.into_raw().to_string()),
     })
 }
+
 fn unchanged(metadata: &MetaData, expected: &RemoteFile) -> Result<()> {
     let current = remote_file(metadata)?;
     if current.size != expected.size || current.revision != expected.revision {
         return Err(permanent("remote file changed; partial file was retained"));
     }
+
     Ok(())
 }
 
@@ -647,6 +711,7 @@ struct SessionLease<'a> {
     session: SftpSession,
     slot: MutexGuard<'a, Option<SftpSession>>,
 }
+
 impl SessionLease<'_> {
     fn finish<T>(self, result: Result<T>) -> Result<T> {
         let Self { session, mut slot } = self;
@@ -656,9 +721,11 @@ impl SessionLease<'_> {
         {
             *slot = Some(session);
         }
+
         result
     }
 }
+
 impl SftpConnection {
     async fn acquire(&self) -> Result<SessionLease<'_>> {
         let mut slot = self.session.lock().await;
@@ -666,66 +733,32 @@ impl SftpConnection {
             Some(session) => session,
             None => self.recipe.establish(false).await?.0,
         };
+
         Ok(SessionLease { session, slot })
     }
 }
 
 #[async_trait]
 impl Connection for SftpConnection {
+    fn protocol(&self) -> &'static str {
+        "sftp"
+    }
+
     fn prompt_user(&self) -> String {
         self.recipe.target.user.clone().unwrap_or_default()
     }
+
     fn prompt_host(&self) -> String {
         self.recipe.target.host.clone()
     }
 
-    fn protocol(&self) -> &'static str {
-        "sftp"
-    }
-    fn pwd(&self) -> Result<String> {
-        Ok(self.cwd.clone())
-    }
-    fn resolve_directory(&self, path: Option<&str>) -> Result<String> {
-        Ok(match path {
-            None => self.home.clone(),
-            Some(path) => directory(&normalize(&self.cwd, path)),
-        })
-    }
-    fn resolve_listing_path(&self, path: &str) -> Result<String> {
-        let resolved = normalize(&self.cwd, path);
-        Ok(if directory_input(path) {
-            directory(&resolved)
-        } else {
-            resolved
-        })
-    }
-    async fn change_directory(&mut self, path: &str) -> Result<()> {
-        let path = self.resolve_directory(Some(path))?;
-        let lease = self.acquire().await?;
-        let result = async {
-            let canonical = operation(lease.session.sftp.fs().canonicalize(&path)).await?;
-            let metadata = operation(lease.session.sftp.fs().metadata(&canonical)).await?;
-            if !metadata.file_type().is_some_and(|kind| kind.is_dir()) {
-                return Err(permanent("not a remote directory"));
-            }
-            remote_path(&canonical)
-        }
-        .await;
-        self.cwd = lease.finish(result)?;
-        Ok(())
-    }
-    async fn create_directory(&self, path: &str, parents: bool) -> Result<()> {
-        let path = normalize(&self.cwd, path);
-        let lease = self.acquire().await?;
-        let result = mkdir_on(&lease.session.sftp, &path, parents).await;
-        lease.finish(result)
-    }
     async fn list(&self, path: &str, output: &mut dyn ListingSink) -> Result<u64> {
         let path = self.resolve_listing_path(path)?;
         let lease = self.acquire().await?;
         let result = list_on(&lease.session.sftp, &path, output).await;
         lease.finish(result)
     }
+
     async fn stat_file(&self, path: &str) -> Result<RemoteFile> {
         let path = self.resolve_listing_path(path)?;
         let lease = self.acquire().await?;
@@ -736,12 +769,14 @@ impl Connection for SftpConnection {
         .await;
         lease.finish(result)
     }
+
     async fn upload(&self, local: &Path, path: &str, overwrite: bool) -> Result<()> {
         let path = self.resolve_listing_path(path)?;
         let lease = self.acquire().await?;
         let result = upload_on(&lease.session.sftp, local, &path, overwrite).await;
         lease.finish(result)
     }
+
     async fn download(
         &self,
         path: &str,
@@ -757,6 +792,50 @@ impl Connection for SftpConnection {
         let result = download_on(&lease.session.sftp, &path, offset, expected, sink).await;
         lease.finish(result)
     }
+
+    fn resolve_directory(&self, path: Option<&str>) -> Result<String> {
+        Ok(match path {
+            None => self.home.clone(),
+            Some(path) => directory(&normalize(&self.cwd, path)),
+        })
+    }
+
+    fn resolve_listing_path(&self, path: &str) -> Result<String> {
+        let resolved = normalize(&self.cwd, path);
+        Ok(if directory_input(path) {
+            directory(&resolved)
+        } else {
+            resolved
+        })
+    }
+
+    fn pwd(&self) -> Result<String> {
+        Ok(self.cwd.clone())
+    }
+
+    async fn change_directory(&mut self, path: &str) -> Result<()> {
+        let path = self.resolve_directory(Some(path))?;
+        let lease = self.acquire().await?;
+        let result = async {
+            let canonical = operation(lease.session.sftp.fs().canonicalize(&path)).await?;
+            let metadata = operation(lease.session.sftp.fs().metadata(&canonical)).await?;
+            if !metadata.file_type().is_some_and(|kind| kind.is_dir()) {
+                return Err(permanent("not a remote directory"));
+            }
+            remote_path(&canonical)
+        }
+        .await;
+        self.cwd = lease.finish(result)?;
+        Ok(())
+    }
+
+    async fn create_directory(&self, path: &str, parents: bool) -> Result<()> {
+        let path = normalize(&self.cwd, path);
+        let lease = self.acquire().await?;
+        let result = mkdir_on(&lease.session.sftp, &path, parents).await;
+        lease.finish(result)
+    }
+
     async fn disconnect(self: Box<Self>) -> Result<()> {
         let session = self.session.lock().await.take();
         drop(self); // Release retained credentials even if graceful close fails.
@@ -777,10 +856,13 @@ async fn mkdir_on(sftp: &Client, path: &str, parents: bool) -> Result<()> {
     if !parents {
         return operation(sftp.fs().create_dir(path)).await;
     }
+
     let mut ancestor = String::new();
+
     for component in path.split('/').filter(|part| !part.is_empty()) {
         ancestor.push('/');
         ancestor.push_str(component);
+
         match operation(sftp.fs().create_dir(&ancestor)).await {
             Ok(()) => {}
             Err(error) if error.is::<TransportError>() => return Err(error),
@@ -812,27 +894,34 @@ async fn list_on(sftp: &Client, path: &str, output: &mut dyn ListingSink) -> Res
         output.emit_file(record(name, &metadata, false, None, None))?;
         return Ok(1);
     }
+
     let dir = operation(sftp.fs().open_dir(&path)).await?;
     let mut entries = Box::pin(dir.read_dir());
     let mut count = 0;
+
     loop {
         let entry = tokio::time::timeout(IO_TIMEOUT, entries.next())
             .await
             .map_err(|_| transport("SFTP directory read timed out; reconnecting on retry"))?;
+
         let Some(entry) = entry else {
             break;
         };
+
         let entry = operation(async { entry }).await?;
         let name = entry
             .filename()
             .to_str()
             .ok_or_else(|| permanent("non-UTF-8 remote filenames are not supported"))?;
+
         if matches!(name, "." | "..") {
             continue;
         }
+
         if name.contains('/') {
             return Err(permanent("SFTP server returned an invalid filename"));
         }
+
         let metadata = entry.metadata();
         let mut directory = metadata.file_type().is_some_and(|kind| kind.is_dir());
         // Follow symlinks only to classify directory completion. Keep the
@@ -849,10 +938,12 @@ async fn list_on(sftp: &Client, path: &str, output: &mut dyn ListingSink) -> Res
                 Err(_) => {} // A broken/unreadable symlink is still a valid listing entry.
             }
         }
+
         let (owner, group) = owner_group_from_longname(entry.longname());
         output.emit(record(name.to_owned(), &metadata, directory, owner, group))?;
         count += 1;
     }
+
     Ok(count)
 }
 
@@ -860,22 +951,27 @@ async fn upload_on(sftp: &Client, local: &Path, remote: &str, overwrite: bool) -
     let mut input = File::open(local).map_err(|error| local_error(local, error))?;
     let mut options = sftp.options();
     options.write(true);
+
     if overwrite {
         options.create(true).truncate(true);
     } else {
         options.create_new(true);
     }
+
     let mut output = operation(options.open(remote)).await?;
     let mut buffer = [0u8; 64 * 1024];
     loop {
         let read = input
             .read(&mut buffer)
             .map_err(|error| local_error(local, error))?;
+
         if read == 0 {
             break;
         }
+
         operation(output.write_all(&buffer[..read])).await?;
     }
+
     operation(output.close()).await
 }
 
@@ -889,9 +985,11 @@ async fn download_on(
     if offset > expected.size {
         return Err(permanent("resume offset exceeds remote size"));
     }
+
     let mut file = operation(sftp.open(path)).await?;
     unchanged(&operation(file.metadata()).await?, expected)?;
     let mut position = offset;
+
     while position < expected.size {
         // Explicit offsets also handle servers returning short reads.
         file.seek(SeekFrom::Start(position)).await?;
@@ -906,6 +1004,7 @@ async fn download_on(
         sink.write(&bytes)?;
         position += bytes.len() as u64;
     }
+
     unchanged(&operation(file.metadata()).await?, expected)?;
     operation(file.close()).await?;
     Ok(())
