@@ -30,11 +30,11 @@ pub enum Completion {
     None,
     Settings,
     RemotePath {
-        request: &'static str,
+        kind: crate::ipc::pb::CompletionKind,
         multiple_arguments: bool,
     },
     LocalPath {
-        request: &'static str,
+        kind: crate::ipc::pb::CompletionKind,
         multiple_arguments: bool,
     },
 }
@@ -119,6 +119,9 @@ impl CommandContext<'_> {
 #[derive(Debug, PartialEq, Eq)]
 pub enum CommandResult {
     Output(Vec<String>),
+    JobStarted(crate::core::JobId),
+    PasswordRequired(String),
+    EditBookmarks(std::path::PathBuf),
     Detach,
 }
 impl From<Vec<String>> for CommandResult {
@@ -252,16 +255,23 @@ pub fn visible_names() -> impl Iterator<Item = &'static str> {
     names.into_iter()
 }
 
+/// Human-readable command adapter retained for embedded callers and command tests.
+/// IPC uses the typed result below, never parses these display strings.
 pub fn dispatch_daemon(app: &mut Daemon, line: &str) -> Vec<String> {
-    let parser = match ParserContext::parse(line) {
-        Ok(parser) => parser,
-        Err(error) => return vec![error.to_string()],
-    };
+    display_result(dispatch_daemon_result(app, line))
+}
+pub fn dispatch_connect(app: &mut Daemon, target: &str, password: Option<Password>) -> Vec<String> {
+    display_result(dispatch_connect_result(app, target, password))
+}
+pub fn dispatch_daemon_result(app: &mut Daemon, line: &str) -> Result<CommandResult> {
+    let parser = ParserContext::parse(line)?;
     run_daemon(app, &parser, None)
 }
-
-/// Passwords are out-of-band context, never parser source, history or job titles.
-pub fn dispatch_connect(app: &mut Daemon, target: &str, password: Option<Password>) -> Vec<String> {
+pub fn dispatch_connect_result(
+    app: &mut Daemon,
+    target: &str,
+    password: Option<Password>,
+) -> Result<CommandResult> {
     let parser = ParserContext {
         line: "connect",
         name: "connect".into(),
@@ -270,17 +280,23 @@ pub fn dispatch_connect(app: &mut Daemon, target: &str, password: Option<Passwor
     };
     run_daemon(app, &parser, password)
 }
-
 fn run_daemon(
     app: &mut Daemon,
     parser: &ParserContext<'_>,
     password: Option<Password>,
-) -> Vec<String> {
-    let Some(command) = find(parser) else {
-        return vec!["unknown daemon command".into()];
-    };
-    match command.execute(&mut CommandContext::Daemon { app, password }, parser) {
+) -> Result<CommandResult> {
+    let command = find(parser).ok_or_else(|| anyhow::anyhow!("unknown daemon command"))?;
+    command.execute(&mut CommandContext::Daemon { app, password }, parser)
+}
+fn display_result(result: Result<CommandResult>) -> Vec<String> {
+    match result {
         Ok(CommandResult::Output(lines)) => lines,
+        Ok(CommandResult::JobStarted(id)) => vec![format!("JOB {id}")],
+        Ok(CommandResult::PasswordRequired(target)) => vec![format!(
+            "PASSWORD_REQUIRED {}",
+            serde_json::to_string(&target).unwrap()
+        )],
+        Ok(CommandResult::EditBookmarks(path)) => vec![format!("BOOKMARK_EDIT {}", path.display())],
         Ok(CommandResult::Detach) => unreachable!("daemon command cannot detach a client"),
         Err(error) => vec![error.to_string()],
     }
@@ -400,7 +416,7 @@ static PWD: SmallCommand = small(
 );
 static LCD: SmallCommand = SmallCommand {
     completion: Completion::LocalPath {
-        request: "COMPLETE_LCD",
+        kind: crate::ipc::pb::CompletionKind::LocalDirectory,
         multiple_arguments: false,
     },
     ..small(
@@ -463,7 +479,7 @@ static DETACH: SmallCommand = SmallCommand {
     )
 };
 
-fn disconnect_lines(app: &mut Daemon, _parser: &ParserContext<'_>) -> Vec<String> {
+fn disconnect_lines(app: &mut Daemon, _parser: &ParserContext<'_>) -> CommandResult {
     let connection = app.connection.clone();
     let session = app.session.clone();
     let id = app.jobs.start_operation("disconnect".into(), async move {
@@ -482,20 +498,20 @@ fn disconnect_lines(app: &mut Daemon, _parser: &ParserContext<'_>) -> Vec<String
             None => Ok("not connected".into()),
         }
     });
-    vec![format!("JOB {id}")]
+    CommandResult::JobStarted(id)
 }
 
 fn disconnect(
     context: &mut CommandContext<'_>,
     parser: &ParserContext<'_>,
 ) -> Result<CommandResult> {
-    Ok(disconnect_lines(context.daemon()?, parser).into())
+    Ok(disconnect_lines(context.daemon()?, parser))
 }
 
-fn pwd_lines(app: &mut Daemon, parser: &ParserContext<'_>) -> Vec<String> {
+fn pwd_lines(app: &mut Daemon, parser: &ParserContext<'_>) -> CommandResult {
     let mut words = parser.words();
     if words.next().is_some() {
-        return vec!["usage: pwd".into()];
+        return vec!["usage: pwd".into()].into();
     }
     let connection = app.connection.clone();
     let id = app.jobs.start_operation("pwd".into(), async move {
@@ -505,11 +521,11 @@ fn pwd_lines(app: &mut Daemon, parser: &ParserContext<'_>) -> Vec<String> {
             .ok_or_else(|| anyhow::anyhow!("not connected; use connect first"))?
             .pwd()
     });
-    vec![format!("JOB {id}")]
+    CommandResult::JobStarted(id)
 }
 
 fn pwd(context: &mut CommandContext<'_>, parser: &ParserContext<'_>) -> Result<CommandResult> {
-    Ok(pwd_lines(context.daemon()?, parser).into())
+    Ok(pwd_lines(context.daemon()?, parser))
 }
 
 fn lcd(context: &mut CommandContext<'_>, parser: &ParserContext<'_>) -> Result<CommandResult> {
@@ -677,7 +693,7 @@ mod tests {
         assert_eq!(
             completion_for("lcd"),
             Completion::LocalPath {
-                request: "COMPLETE_LCD",
+                kind: crate::ipc::pb::CompletionKind::LocalDirectory,
                 multiple_arguments: false
             }
         );
@@ -685,21 +701,21 @@ mod tests {
         assert_eq!(
             completion_for("cd"),
             Completion::RemotePath {
-                request: "COMPLETE_CD",
+                kind: crate::ipc::pb::CompletionKind::RemoteDirectory,
                 multiple_arguments: false
             }
         );
         assert_eq!(
             completion_for("ls"),
             Completion::RemotePath {
-                request: "COMPLETE_LS",
+                kind: crate::ipc::pb::CompletionKind::RemotePath,
                 multiple_arguments: false
             }
         );
         assert_eq!(
             completion_for("get"),
             Completion::RemotePath {
-                request: "COMPLETE_GET",
+                kind: crate::ipc::pb::CompletionKind::RemotePath,
                 multiple_arguments: true
             }
         );

@@ -10,6 +10,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
 directories = "6"
+prost = "0.14"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "process", "io-util", "net"] }
 tokio-util = "0.7"
 async-trait = "0.1"
@@ -44,6 +45,10 @@ futures-util = "0.3"
 percent-encoding = "2"
 tempfile = "3.10"
 zeroize = "1"
+
+[build-dependencies]
+prost-build = "0.14"
+protox = "0.10"
 
 [dev-dependencies]
 hyper = { version = "0.14", features = ["server"] }

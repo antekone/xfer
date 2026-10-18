@@ -28,7 +28,7 @@ impl Command for Put {
     }
     fn completion(&self) -> Completion {
         Completion::LocalPath {
-            request: "COMPLETE_PUT",
+            kind: crate::ipc::pb::CompletionKind::LocalFile,
             multiple_arguments: true,
         }
     }
@@ -187,7 +187,7 @@ fn execute(context: &mut CommandContext<'_>, parser: &ParserContext<'_>) -> Resu
             ))
         },
     );
-    Ok(vec![format!("JOB {id}")].into())
+    Ok(CommandResult::JobStarted(id))
 }
 
 #[cfg(test)]
@@ -209,7 +209,7 @@ mod tests {
         assert_eq!(
             Put.completion(),
             Completion::LocalPath {
-                request: "COMPLETE_PUT",
+                kind: crate::ipc::pb::CompletionKind::LocalFile,
                 multiple_arguments: true
             }
         );

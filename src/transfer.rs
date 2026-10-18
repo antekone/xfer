@@ -36,6 +36,33 @@ pub struct TransferProgress {
     pub elapsed_ms: u64,
 }
 
+impl From<&crate::transfer::TransferProgress> for crate::ipc::pb::TransferProgress {
+    fn from(value: &crate::transfer::TransferProgress) -> Self {
+        Self {
+            file: value.file.clone(),
+            file_index: value.file_index as u64,
+            file_count: value.file_count as u64,
+            done: value.done,
+            total: value.total,
+            transferred: value.transferred,
+            elapsed_ms: value.elapsed_ms,
+        }
+    }
+}
+impl From<crate::ipc::pb::TransferProgress> for crate::transfer::TransferProgress {
+    fn from(value: crate::ipc::pb::TransferProgress) -> Self {
+        Self {
+            file: value.file,
+            file_index: value.file_index.min(usize::MAX as u64) as usize,
+            file_count: value.file_count.min(usize::MAX as u64) as usize,
+            done: value.done,
+            total: value.total,
+            transferred: value.transferred,
+            elapsed_ms: value.elapsed_ms,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct GetArgs {
     pub resume: bool,

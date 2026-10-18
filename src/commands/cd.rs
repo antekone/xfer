@@ -19,17 +19,17 @@ impl Command for Cd {
     }
     fn completion(&self) -> Completion {
         Completion::RemotePath {
-            request: "COMPLETE_CD",
+            kind: crate::ipc::pb::CompletionKind::RemoteDirectory,
             multiple_arguments: false,
         }
     }
 }
 
-fn execute_lines(app: &mut Daemon, parser: &ParserContext<'_>) -> Vec<String> {
+fn execute_lines(app: &mut Daemon, parser: &ParserContext<'_>) -> CommandResult {
     let mut words = parser.words();
     let path = words.next().map(str::to_owned);
     if words.next().is_some() {
-        return vec!["usage: cd [directory]".into()];
+        return vec!["usage: cd [directory]".into()].into();
     }
     let connection = app.connection.clone();
     let session = app.session.clone();
@@ -55,11 +55,11 @@ fn execute_lines(app: &mut Daemon, parser: &ParserContext<'_>) -> Vec<String> {
             }
         },
     );
-    vec![format!("JOB {id}")]
+    CommandResult::JobStarted(id)
 }
 
 fn execute(context: &mut CommandContext<'_>, parser: &ParserContext<'_>) -> Result<CommandResult> {
-    Ok(execute_lines(context.daemon()?, parser).into())
+    Ok(execute_lines(context.daemon()?, parser))
 }
 
 pub(crate) fn snapshot_directory(

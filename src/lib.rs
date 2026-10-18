@@ -7,6 +7,7 @@ pub mod cache;
 pub mod commands;
 pub mod credentials;
 pub mod daemon;
+pub mod ipc;
 pub mod error;
 pub mod listing;
 pub mod local_shell;

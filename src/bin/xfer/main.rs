@@ -27,7 +27,9 @@ use std::{
 use xfer::commands::{
     self, ClientApp, CommandContext, CommandResult, Completion, ExecutionSite, ParserContext,
 };
+use xfer::ipc::{self, pb, Op, Reply};
 use xfer::runtime_dir;
+type Connection = ipc::Client<UnixStream>;
 use zeroize::{Zeroize, Zeroizing};
 
 // ------------------------------------------------------------------------------------------------
@@ -59,151 +61,116 @@ async fn main() -> Result<()> {
 // ------------------------------------------------------------------------------------------------
 
 fn start_daemon_and_attach() -> Result<()> {
-    let (stream, reader) = daemon_client::start()?;
-    attached_session(stream, reader)
+    attached_session(daemon_client::start()?)
 }
 
 fn attach(id: Option<&str>) -> Result<()> {
     let all = instances()?;
+
     let selected = match id {
         Some(id) => select_instance(all, id)?,
         None => {
             let available = all.into_iter().filter(daemon_ready).collect::<Vec<_>>();
+
             if available.len() == 1 {
                 available.into_iter().next().unwrap()
             } else if available.is_empty() {
                 anyhow::bail!("no detached xfer daemons found")
             } else {
                 println!("{} detached xfer daemons found:", available.len());
+
                 for item in available {
                     println!("{}  pid={}  {}", item.id, item.pid, item.socket.display());
                 }
-                println!("Use: xfer attach <id>");
+
+                println!("use: xfer attach <id>");
                 return Ok(());
             }
         }
     };
-    let mut stream = UnixStream::connect(&selected.socket)?;
-    let reader = claim_attachment(&selected, &mut stream, Duration::from_secs(5))?;
-    attached_session(stream, reader)
+
+    let stream = UnixStream::connect(&selected.socket)?;
+    attached_session(claim_attachment(stream, Duration::from_secs(5))?)
 }
 
 fn select_instance(instances: Vec<Instance>, id: &str) -> Result<Instance> {
     if let Some(exact) = instances.iter().find(|instance| instance.id == id) {
         return Ok(exact.clone());
     }
+
     let mut matches = instances
         .into_iter()
         .filter(|instance| instance.id.starts_with(id));
+
     let selected = matches
         .next()
         .ok_or_else(|| anyhow::anyhow!("no daemon matching {id}"))?;
+
     if matches.next().is_some() {
         anyhow::bail!("ambiguous daemon ID {id}; use a longer prefix");
     }
+
     Ok(selected)
 }
 
 /// Claim the lease before treating startup as successful. A fresh child's
 /// lifetime guard stays armed until this handshake completes.
-fn claim_attachment(
-    selected: &Instance,
-    stream: &mut UnixStream,
-    timeout: Duration,
-) -> Result<BufReader<UnixStream>> {
+fn claim_attachment(stream: UnixStream, timeout: Duration) -> Result<Connection> {
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
-    stream.write_all(b"ATTACH\n")?;
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
-    if line.trim() == "BUSY" {
-        anyhow::bail!("daemon {} is already attached", selected.id);
-    }
-    if line.trim() != "ATTACHED" {
-        anyhow::bail!("attach failed: {}", line.trim());
-    }
-    stream.set_read_timeout(None)?;
-    stream.set_write_timeout(None)?;
-    Ok(reader)
+    let mut client = Connection::new(stream);
+    client.attach()?;
+    client.transport().set_read_timeout(None)?;
+    client.transport().set_write_timeout(None)?;
+    Ok(client)
 }
 
-/// Continue on the already claimed connection; fresh startup never enumerates
-/// discovery metadata or resolves an ID prefix a second time.
-fn attached_session(mut stream: UnixStream, mut reader: BufReader<UnixStream>) -> Result<()> {
-    let mut line = String::new();
+fn attached_session(mut client: Connection) -> Result<()> {
     let local_directory = std::env::current_dir()?;
     let local_directory = local_directory
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("local directory must be valid UTF-8"))?;
-    stream
-        .write_all(format!("LOCAL_CWD {}\n", serde_json::to_string(local_directory)?).as_bytes())?;
-    line.clear();
-    if reader.read_line(&mut line)? == 0 || line.trim() != "LOCAL_CWD_OK" {
-        anyhow::bail!("cannot set daemon local directory: {}", line.trim());
-    }
+    client.ok(Op::SetLocalCwd(pb::Path {
+        path: local_directory.into(),
+    }))?;
     let mut typeahead = Typeahead::default();
-    // Claim startup exactly once per daemon, not on every later attach.
-    stream.write_all(b"STARTUP\n")?;
-    line.clear();
-    if reader.read_line(&mut line)? == 0 {
-        anyhow::bail!("daemon disconnected");
-    }
-    match line.trim() {
-        "RUN_STARTUP" => {
-            if let Some(home) = xfer::home_dir() {
-                let path = std::path::absolute(home.join(".xferrc"))?;
-                let commands = read_startup_commands(&path)?;
-                if !commands.is_empty() {
-                    report_startup_file(&mut stream, &mut reader, &path)?;
-                }
-                for command in commands {
-                    // Configuration commands are not interactive history entries.
-                    if !dispatch_attached_command(
-                        &mut stream,
-                        &mut reader,
-                        &command,
-                        None,
-                        &mut typeahead,
-                    )? {
-                        return Ok(());
-                    }
+    let run_startup = match client.call(Op::ClaimStartup(pb::Empty {}))? {
+        Reply::Startup(result) => result.run,
+        _ => return client.unexpected(),
+    };
+    if run_startup {
+        if let Some(home) = xfer::home_dir() {
+            let path = std::path::absolute(home.join(".xferrc"))?;
+            let commands = read_startup_commands(&path)?;
+            if !commands.is_empty() {
+                report_startup_file(&mut client, &path)?;
+            }
+            for command in commands {
+                if !dispatch_attached_command(&mut client, &command, None, &mut typeahead)? {
+                    return Ok(());
                 }
             }
         }
-        "STARTUP_DONE" => {}
-        response => anyhow::bail!("invalid startup response: {response}"),
     }
-    // The daemon owns the configured history location; the client only reads/appends it.
-    stream.write_all(b"COMMAND show ui:history-file\n")?;
-    line.clear();
-    reader.read_line(&mut line)?;
-    let history_file = line
-        .strip_prefix("OUTPUT ui:history-file: ")
-        .and_then(|value| {
-            value
-                .split_once(" —")
-                .map(|(value, _)| value.trim().to_owned())
+    let history_file = client
+        .settings(Some("ui:history-file"))?
+        .into_iter()
+        .next()
+        .and_then(|setting| match setting.value {
+            Some(pb::setting::Value::Text(value)) => Some(value),
+            _ => None,
         });
-    line.clear();
-    reader.read_line(&mut line)?; // DONE
     println!("attached (type `status` for daemon info, `detach` to release it)");
     let mut history = history_persist_load(history_file.as_deref());
     loop {
-        let prompt = fetch_session_prompt(&mut stream, &mut reader)?;
-        let Some(command) = read_attached_command(
-            &mut stream,
-            &mut reader,
-            &prompt,
-            &mut history,
-            &mut typeahead,
-        )?
+        let prompt = fetch_session_prompt(&mut client)?;
+        let Some(command) =
+            read_attached_command(&mut client, &prompt, &mut history, &mut typeahead)?
         else {
             break;
         };
         if !dispatch_attached_command(
-            &mut stream,
-            &mut reader,
+            &mut client,
             &command,
             history_file.as_deref(),
             &mut typeahead,
@@ -324,16 +291,12 @@ fn history_persist_append(path: Option<&str>, command: &str) {
 // ------------------------------------------------------------------------------------------------
 
 fn daemon_ready(instance: &Instance) -> bool {
-    let Ok(mut stream) = UnixStream::connect(&instance.socket) else {
+    let Ok(stream) = UnixStream::connect(&instance.socket) else {
         return false;
     };
-
-    if stream.write_all(b"PROBE\n").is_err() {
-        return false;
-    }
-
-    let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line).is_ok() && line.trim() == "READY"
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+    Connection::new(stream).probe().unwrap_or(false)
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -361,11 +324,11 @@ fn common_completion_prefix(choices: &[String]) -> &str {
     &first[..length]
 }
 
-fn path_completion_context(command: &str) -> Option<(String, String, String)> {
+fn path_completion_context(command: &str) -> Option<(String, String, pb::CompletionKind)> {
     let command = command.trim_start();
     let verb = command.split_whitespace().next()?;
     let request = match commands::completion_for(verb) {
-        Completion::RemotePath { request, .. } | Completion::LocalPath { request, .. } => request,
+        Completion::RemotePath { kind, .. } | Completion::LocalPath { kind, .. } => kind,
         _ => return None,
     };
     let argument = command.strip_prefix(verb)?.trim_start();
@@ -420,47 +383,42 @@ fn path_completion_context(command: &str) -> Option<(String, String, String)> {
         head.push(' ');
         head.push_str(&shlex::try_quote(&token).ok()?);
     }
-    Some((head, path, request.to_owned()))
+    Some((head, path, request))
 }
 
-fn complete_path_command(
-    stream: &mut UnixStream,
-    reader: &mut BufReader<UnixStream>,
-    command: &mut String,
-) -> Result<Vec<String>> {
+fn complete_path_command(client: &mut Connection, command: &mut String) -> Result<Vec<String>> {
     let Some((head, path, method)) = path_completion_context(command) else {
         return Ok(Vec::new());
     };
-    stream.write_all(format!("{method} {}\n", serde_json::to_string(&path)?).as_bytes())?;
-    let mut response = String::new();
-    if reader.read_line(&mut response)? == 0 {
-        anyhow::bail!("daemon disconnected");
-    }
+    let result = client.call(Op::Complete(pb::CompletionRequest {
+        kind: method as i32,
+        input: path.clone(),
+    }));
     let mut notices = Vec::new();
     let mut choices = Vec::new();
     let mut complete_set = true;
-    if let Some(json) = response.strip_prefix("COMPLETION ") {
-        let result: xfer::cache::PathCompletion = serde_json::from_str(json)?;
-        for path in result.candidates {
-            // Terminal control characters cannot be safely inserted by this editor.
-            if !path.chars().any(char::is_control) {
-                choices.push(path);
+    match result {
+        Ok(Reply::Completion(result)) => {
+            choices.extend(
+                result
+                    .candidates
+                    .into_iter()
+                    .filter(|path| !path.chars().any(char::is_control)),
+            );
+            if result.truncated {
+                complete_set = false;
+                notices.push("completion listing limited; type a longer prefix".into());
             }
         }
-        if result.truncated {
-            complete_set = false;
-            notices.push("completion listing limited; type a longer prefix".to_owned());
-        }
-    } else if let Some(json) = response.strip_prefix("COMPLETION_ERROR ") {
-        let error: String = serde_json::from_str(json)?;
-        notices.push(
+        Ok(_) => return client.unexpected(),
+        Err(error) if error.is::<ipc::RemoteError>() => notices.push(
             error
+                .to_string()
                 .chars()
                 .map(|ch| if ch.is_control() { ' ' } else { ch })
                 .collect(),
-        );
-    } else {
-        anyhow::bail!("invalid completion response");
+        ),
+        Err(error) => return Err(error),
     }
     let common = common_completion_prefix(&choices);
     if complete_set && common.starts_with(&path) && common.len() > path.len() {
@@ -487,11 +445,7 @@ fn complete_path_command(
 
 /// Completion operates on the prefix at the caret; the editor keeps later
 /// arguments intact and replaces only the remainder of the active token.
-fn complete_command(
-    stream: &mut UnixStream,
-    reader: &mut BufReader<UnixStream>,
-    command: &mut String,
-) -> Result<Vec<String>> {
+fn complete_command(client: &mut Connection, command: &mut String) -> Result<Vec<String>> {
     let verb = command.split_whitespace().next().unwrap_or("");
     let completion = commands::completion_for(verb);
     if matches!(
@@ -499,7 +453,7 @@ fn complete_command(
         Completion::RemotePath { .. } | Completion::LocalPath { .. }
     ) && command.contains(char::is_whitespace)
     {
-        return complete_path_command(stream, reader, command);
+        return complete_path_command(client, command);
     }
     let matches = if !command.contains(char::is_whitespace) {
         commands::visible_names()
@@ -507,24 +461,11 @@ fn complete_command(
             .map(str::to_owned)
             .collect::<Vec<_>>()
     } else if completion == Completion::Settings {
-        stream.write_all(b"COMMAND show\n")?;
-        let mut choices = Vec::new();
-        let mut line = String::new();
-        loop {
-            line.clear();
-            if reader.read_line(&mut line)? == 0 {
-                anyhow::bail!("daemon disconnected");
-            }
-            if line.trim() == "DONE" {
-                break;
-            }
-            if let Some(name) = line
-                .strip_prefix("OUTPUT ")
-                .and_then(|v| v.split_once(": ").map(|(name, _)| name))
-            {
-                choices.push(name.to_owned());
-            }
-        }
+        let choices = client
+            .settings(None)?
+            .into_iter()
+            .map(|setting| setting.name)
+            .collect::<Vec<_>>();
         let prefix = command.trim_start().strip_prefix(verb).unwrap_or("").trim();
         choices
             .into_iter()
@@ -611,8 +552,7 @@ fn redraw_command(command: &mut CommandLine, prompt: &str, clear: bool) -> Resul
 }
 
 fn read_attached_command(
-    stream: &mut UnixStream,
-    reader: &mut BufReader<UnixStream>,
+    client: &mut Connection,
     prompt: &str,
     history: &mut Vec<String>,
     typeahead: &mut Typeahead,
@@ -682,7 +622,7 @@ fn read_attached_command(
             KeyCode::Char('l') if key.modifiers == KeyModifiers::CONTROL => clear = true,
             KeyCode::Tab => {
                 let mut prefix = command.prefix().to_owned();
-                let notices = complete_command(stream, reader, &mut prefix)?;
+                let notices = complete_command(client, &mut prefix)?;
                 command.complete(prefix);
                 history_cursor = None;
                 if !notices.is_empty() {
@@ -732,8 +672,7 @@ struct CopiedOutput {
 
 /// Binary-safe bounded IPC copy, shared by paged output and raw cat stdout.
 fn copy_job_output(
-    stream: &mut UnixStream,
-    reader: &mut BufReader<UnixStream>,
+    client: &mut Connection,
     id: u64,
     output: &mut dyn Write,
 ) -> Result<CopiedOutput> {
@@ -743,44 +682,25 @@ fn copy_job_output(
         last: None,
     };
     loop {
-        stream.write_all(format!("COMMAND read-output {id} {}\n", copied.bytes).as_bytes())?;
-        let mut response = String::new();
-        if reader.read_line(&mut response)? == 0 {
-            anyhow::bail!("daemon disconnected");
-        }
-        let chunk = response
-            .strip_prefix("OUTPUT CHUNK ")
-            .ok_or_else(|| anyhow::anyhow!("invalid output response"))?;
-        let (next, bytes) = chunk
-            .trim()
-            .split_once(' ')
-            .ok_or_else(|| anyhow::anyhow!("invalid output chunk"))?;
-        let next: u64 = next.parse()?;
-        let bytes: Vec<u8> = serde_json::from_str(bytes)?;
-        response.clear();
-        if reader.read_line(&mut response)? == 0 || response.trim() != "DONE" {
-            anyhow::bail!("incomplete output response");
-        }
-        if bytes.len() > 64 * 1024 || copied.bytes.checked_add(bytes.len() as u64) != Some(next) {
-            anyhow::bail!("invalid output offset or chunk size");
-        }
+        let chunk = client.output(id, copied.bytes)?;
+        let next = chunk.next_offset;
+        let bytes = &chunk.data;
         if bytes.is_empty() {
             break;
         }
-        output.write_all(&bytes)?;
+        output.write_all(bytes)?;
         copied.bytes = next;
         copied.rows += bytes.iter().filter(|&&byte| byte == b'\n').count();
         copied.last = bytes.last().copied();
+        if chunk.eof {
+            break;
+        }
     }
     output.flush()?;
     Ok(copied)
 }
 
-fn display_job_output(
-    stream: &mut UnixStream,
-    reader: &mut BufReader<UnixStream>,
-    id: u64,
-) -> Result<bool> {
+fn display_job_output(client: &mut Connection, id: u64) -> Result<bool> {
     use std::io::{Seek, SeekFrom};
     // Keep client memory bounded too: receive at most 64 KiB at a time.
     let path = std::env::temp_dir().join(format!(
@@ -798,13 +718,12 @@ fn display_job_output(
         .mode(0o600)
         .open(&path)?;
     let _cleanup = LocalOutput(path);
-    let copied = copy_job_output(stream, reader, id, &mut file)?;
-    stream.write_all(b"COMMAND show ui:auto-pager\n")?;
-    let mut response = String::new();
-    reader.read_line(&mut response)?;
-    let auto_pager = response.starts_with("OUTPUT ui:auto-pager: true");
-    response.clear();
-    reader.read_line(&mut response)?;
+    let copied = copy_job_output(client, id, &mut file)?;
+    let auto_pager = client
+        .settings(Some("ui:auto-pager"))?
+        .into_iter()
+        .next()
+        .is_some_and(|setting| setting.value == Some(pb::setting::Value::Boolean(true)));
     file.seek(SeekFrom::Start(0))?;
     let (_, height) = crossterm::terminal::size().unwrap_or((80, 24));
     if !auto_pager || copied.rows < height.saturating_sub(1) as usize {
@@ -1289,73 +1208,61 @@ fn render_transfer(
     fit_status_line(&format!("{prefix}{label}{metrics}"), width)
 }
 
-fn foreground_job(
-    stream: &mut UnixStream,
-    reader: &mut BufReader<UnixStream>,
-    id: u64,
-    typeahead: &mut Typeahead,
-) -> Result<()> {
+fn foreground_job(client: &mut Connection, id: u64, typeahead: &mut Typeahead) -> Result<()> {
     enable_raw_mode()?;
     let _raw_input = RawInputGuard;
     let mut display = ForegroundDisplay::default();
     let mut transfer_rate = TransferRate::default();
     loop {
-        stream.write_all(format!("COMMAND status {id}\n").as_bytes())?;
-        let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 {
-            anyhow::bail!("daemon disconnected");
-        }
-        let status = line
-            .strip_prefix("OUTPUT ")
-            .unwrap_or(&line)
-            .trim()
-            .to_owned();
-        line.clear();
-        if reader.read_line(&mut line)? == 0 {
-            anyhow::bail!("daemon disconnected");
-        }
-        let state = status.split_whitespace().nth(1);
-        let raw_output = status.split_whitespace().nth(2) == Some("RAW");
-        let human_status = if raw_output {
-            status.replacen(" RAW", "", 1)
-        } else {
-            status.clone()
+        let job = match client.job(id) {
+            Ok(job) => job,
+            Err(error)
+                if error
+                    .downcast_ref::<ipc::RemoteError>()
+                    .is_some_and(|error| error.code == pb::ErrorCode::NotFound) =>
+            {
+                print!("\r\x1b[2K");
+                disable_raw_mode()?;
+                println!("no such job");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
         };
-        if matches!(state, Some("Completed" | "Cancelled" | "Failed")) || status == "no such job" {
+        let state =
+            pb::JobState::try_from(job.state).map_err(|_| anyhow::anyhow!("invalid job state"))?;
+        let message = match &job.progress {
+            Some(pb::job::Progress::Indeterminate(value)) => value.message.clone(),
+            Some(pb::job::Progress::Determinate(value)) => {
+                format!("{}/{} {}", value.done, value.total, value.message)
+            }
+            Some(pb::job::Progress::Transfer(value)) => value.file.clone(),
+            None => String::new(),
+        };
+        let human_status = format!("[{id}] {state:?} {message}");
+        if matches!(
+            state,
+            pb::JobState::Completed | pb::JobState::Cancelled | pb::JobState::Failed
+        ) {
             print!("\r\x1b[2K");
             io::stdout().flush()?;
             disable_raw_mode()?;
-            if status == "no such job" {
-                println!("{status}");
-            } else {
-                // Show the result once, not both as terminal status and spool text.
-                if raw_output {
-                    let copied = copy_job_output(stream, reader, id, &mut io::stdout())?;
-                    // This is a terminal prompt separator, not part of the file:
-                    // avoid erasing an unterminated last line on prompt redraw.
-                    use std::io::IsTerminal;
-                    if io::stdout().is_terminal() && copied.last.is_some_and(|byte| byte != b'\n') {
-                        println!();
-                    }
-                    if state != Some("Completed") {
-                        eprintln!("{human_status}");
-                    }
-                } else if !display_job_output(stream, reader, id)? && state != Some("Completed") {
-                    println!("{status}");
+            if job.raw_output {
+                let copied = copy_job_output(client, id, &mut io::stdout())?;
+                use std::io::IsTerminal;
+                if io::stdout().is_terminal() && copied.last.is_some_and(|byte| byte != b'\n') {
+                    println!();
                 }
-                stream.write_all(format!("COMMAND ack-output {id}\n").as_bytes())?;
-                loop {
-                    line.clear();
-                    if reader.read_line(&mut line)? == 0 {
-                        anyhow::bail!("daemon disconnected");
-                    }
-                    if line.trim() == "DONE" {
-                        break;
-                    }
-                    let response = line.strip_prefix("OUTPUT ").unwrap_or(&line).trim();
-                    if response != "output acknowledged" {
-                        eprintln!("{response}");
-                    }
+                if state != pb::JobState::Completed {
+                    eprintln!("{human_status}");
+                }
+            } else if !display_job_output(client, id)? && state != pb::JobState::Completed {
+                println!("{human_status}");
+            }
+            if let Err(error) = client.ok(Op::AcknowledgeOutput(pb::JobId { id })) {
+                if error.is::<ipc::RemoteError>() {
+                    eprintln!("{error}");
+                } else {
+                    return Err(error);
                 }
             }
             return Ok(());
@@ -1365,10 +1272,14 @@ fn foreground_job(
             .ok()
             .filter(|width| *width > 0)
             .unwrap_or(80);
-        let transfer_status = if let Some((_, json)) = status.split_once(" TRANSFER ") {
-            serde_json::from_str::<xfer::transfer::TransferProgress>(json)
-                .ok()
-                .map(|stats| render_transfer(id, &stats, transfer_rate.sample(&stats), width))
+        let transfer_status = if let Some(pb::job::Progress::Transfer(value)) = job.progress {
+            let stats: xfer::transfer::TransferProgress = value.into();
+            Some(render_transfer(
+                id,
+                &stats,
+                transfer_rate.sample(&stats),
+                width,
+            ))
         } else {
             None
         };
@@ -1397,16 +1308,7 @@ fn foreground_job(
                             return Ok(());
                         }
                         (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                            stream.write_all(format!("COMMAND cancel {id}\n").as_bytes())?;
-                            loop {
-                                line.clear();
-                                if reader.read_line(&mut line)? == 0 {
-                                    anyhow::bail!("daemon disconnected");
-                                }
-                                if line.trim() == "DONE" {
-                                    break;
-                                }
-                            }
+                            client.ok(Op::Cancel(pb::JobId { id }))?;
                         }
                         _ => {}
                     }
@@ -1462,65 +1364,41 @@ fn read_connection_password(target: &str) -> Result<Option<xfer::credentials::Pa
 }
 
 fn send_connection_password(
-    stream: &mut UnixStream,
+    client: &mut Connection,
     target: String,
     password: xfer::credentials::Password,
-) -> Result<()> {
-    let credentials = xfer::credentials::PasswordConnect { target, password };
-    let json = Zeroizing::new(serde_json::to_string(&credentials)?);
-    stream.write_all(b"CONNECT_PASSWORD ")?;
-    stream.write_all(json.as_bytes())?;
-    stream.write_all(b"\n")?;
-    Ok(())
+) -> Result<pb::CommandResult> {
+    client.command_reply(Op::ConnectPassword(pb::PasswordConnect {
+        target,
+        password: password.expose().into(),
+    }))
 }
 
 /// Read daemon state for every shell escape, not a stale attach-time snapshot.
-fn read_local_directory(
-    stream: &mut UnixStream,
-    reader: &mut BufReader<UnixStream>,
-) -> Result<PathBuf> {
-    stream.write_all(b"LOCAL_CWD\n")?;
-    let mut response = String::new();
-    if reader.read_line(&mut response)? == 0 {
-        anyhow::bail!("daemon disconnected");
-    }
-    if let Some(error) = response.strip_prefix("LOCAL_CWD_ERROR ") {
-        let error: String = serde_json::from_str(error.trim())?;
-        anyhow::bail!("cannot read Local CWD: {error}");
-    }
-    let value = response.strip_prefix("LOCAL_CWD ").ok_or_else(|| {
-        anyhow::anyhow!("daemon cannot report Local CWD; restart it with the updated xfer")
-    })?;
-    let directory: PathBuf = serde_json::from_str(value.trim())?;
-    if !directory.is_absolute() {
-        anyhow::bail!("daemon returned a non-absolute Local CWD");
-    }
-    Ok(directory)
+fn read_local_directory(client: &mut Connection) -> Result<PathBuf> {
+    client.local_cwd()
 }
 
 struct AttachedCommandContext<'a> {
-    stream: &'a mut UnixStream,
-    reader: &'a mut BufReader<UnixStream>,
+    client: &'a mut Connection,
     typeahead: &'a mut Typeahead,
 }
 impl ClientApp for AttachedCommandContext<'_> {
     fn detach(&mut self) -> Result<()> {
-        self.stream.write_all(b"DETACH\n")?;
-        Ok(())
+        self.client.detach()
     }
     fn foreground(&mut self, id: u64) -> Result<()> {
-        foreground_job(self.stream, self.reader, id, self.typeahead)
+        foreground_job(self.client, id, self.typeahead)
     }
     fn run_shell(&mut self, source: &str) -> Result<std::process::ExitStatus> {
-        let directory = read_local_directory(self.stream, self.reader)?;
+        let directory = read_local_directory(self.client)?;
         xfer::local_shell::run(source, &directory)
     }
 }
 
 /// Shared execution path for rc lines and interactive commands.
 fn dispatch_attached_command(
-    stream: &mut UnixStream,
-    reader: &mut BufReader<UnixStream>,
+    client: &mut Connection,
     command: &str,
     history_file: Option<&str>,
     typeahead: &mut Typeahead,
@@ -1540,11 +1418,7 @@ fn dispatch_attached_command(
         history_persist_append(history_file, command);
     }
     if let Some(definition) = definition.filter(|command| command.site() == ExecutionSite::Client) {
-        let mut app = AttachedCommandContext {
-            stream,
-            reader,
-            typeahead,
-        };
+        let mut app = AttachedCommandContext { client, typeahead };
         match definition.execute(&mut CommandContext::Client { app: &mut app }, &parser) {
             Ok(CommandResult::Detach) => return Ok(false),
             Ok(CommandResult::Output(lines)) => {
@@ -1553,50 +1427,46 @@ fn dispatch_attached_command(
                 }
             }
             Err(error) => eprintln!("{error:#}"),
+            Ok(_) => anyhow::bail!("invalid result from client command"),
         }
         return Ok(true);
     }
-    let mut line = String::new();
-    stream.write_all(format!("COMMAND {command}\n").as_bytes())?;
+    let mut result = match client.command(command) {
+        Ok(result) => result,
+        Err(error) if error.is::<ipc::RemoteError>() => {
+            eprintln!("{error}");
+            return Ok(true);
+        }
+        Err(error) => return Err(error),
+    };
     let mut foreground = None;
     let mut edit_bookmarks = None;
     let mut password_sent = false;
-    let mut password_target: Option<String> = None;
     loop {
-        line.clear();
-        if reader.read_line(&mut line)? == 0 {
-            anyhow::bail!("daemon disconnected");
+        for line in result.lines {
+            println!("{line}");
         }
-        if line.trim() == "DONE" {
-            if let Some(target) = password_target.take() {
+        match result.action {
+            Some(pb::command_result::Action::JobStarted(job)) => {
+                foreground = Some(job.id);
+                break;
+            }
+            Some(pb::command_result::Action::EditBookmarks(path)) => {
+                edit_bookmarks = Some(path.path);
+                break;
+            }
+            Some(pb::command_result::Action::PasswordRequired(prompt)) => {
                 if password_sent {
                     anyhow::bail!("daemon requested a password twice");
                 }
                 typeahead.text.zeroize();
-                let Some(password) = read_connection_password(&target)? else {
+                let Some(password) = read_connection_password(&prompt.target)? else {
                     return Ok(true);
                 };
-                send_connection_password(stream, target, password)?;
+                result = send_connection_password(client, prompt.target, password)?;
                 password_sent = true;
-                continue;
             }
-            break;
-        }
-        if let Some(target) = line.strip_prefix("OUTPUT PASSWORD_REQUIRED ") {
-            password_target = Some(serde_json::from_str::<String>(target)?);
-            continue;
-        }
-        if let Some(id) = line
-            .strip_prefix("OUTPUT JOB ")
-            .and_then(|value| value.trim().parse().ok())
-        {
-            foreground = Some(id);
-            continue; // JOB is IPC control information, not user-visible output.
-        }
-        if let Some(path) = line.strip_prefix("OUTPUT BOOKMARK_EDIT ") {
-            edit_bookmarks = Some(path.trim_end_matches(['\r', '\n']).to_owned());
-        } else {
-            print!("{}", line.strip_prefix("OUTPUT ").unwrap_or(&line));
+            None => break,
         }
     }
     if let Some(path) = edit_bookmarks {
@@ -1606,16 +1476,8 @@ fn dispatch_attached_command(
         match shlex::split(&editor).filter(|args| !args.is_empty()) {
             Some(args) => match Command::new(&args[0]).args(&args[1..]).arg(&path).status() {
                 Ok(status) if status.success() => {
-                    stream.write_all(b"COMMAND bookmark reload\n")?;
-                    loop {
-                        line.clear();
-                        if reader.read_line(&mut line)? == 0 {
-                            anyhow::bail!("daemon disconnected");
-                        }
-                        if line.trim() == "DONE" {
-                            break;
-                        }
-                        print!("{}", line.strip_prefix("OUTPUT ").unwrap_or(&line));
+                    for line in client.command("bookmark reload")?.lines {
+                        println!("{line}");
                     }
                 }
                 Ok(status) => eprintln!("editor exited with {status}"),
@@ -1625,7 +1487,7 @@ fn dispatch_attached_command(
         }
     }
     if let Some(id) = foreground {
-        foreground_job(stream, reader, id, typeahead)?;
+        foreground_job(client, id, typeahead)?;
     }
     Ok(true)
 }
@@ -1643,17 +1505,13 @@ fn read_startup_commands(path: &std::path::Path) -> Result<Vec<String>> {
         .collect())
 }
 
-fn report_startup_file(
-    stream: &mut UnixStream,
-    reader: &mut BufReader<UnixStream>,
-    path: &std::path::Path,
-) -> Result<()> {
-    stream.write_all(format!("STARTUP_FILE {}\n", serde_json::to_string(path)?).as_bytes())?;
-    let mut response = String::new();
-    if reader.read_line(&mut response)? == 0 || response.trim() != "STARTUP_FILE_OK" {
-        anyhow::bail!("cannot report startup file: {}", response.trim());
-    }
-    Ok(())
+fn report_startup_file(client: &mut Connection, path: &std::path::Path) -> Result<()> {
+    client.ok(Op::StartupFile(pb::Path {
+        path: path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("startup path is not UTF-8"))?
+            .into(),
+    }))
 }
 
 fn session_prompt(info: &xfer::daemon::SessionInfo) -> String {
@@ -1679,40 +1537,61 @@ fn session_prompt(info: &xfer::daemon::SessionInfo) -> String {
     }
 }
 
-fn fetch_session_prompt(
-    stream: &mut UnixStream,
-    reader: &mut BufReader<UnixStream>,
-) -> Result<String> {
-    stream.write_all(b"SESSION\n")?;
-    let mut response = String::new();
-    if reader.read_line(&mut response)? == 0 {
-        anyhow::bail!("daemon disconnected");
-    }
-    let json = response
-        .strip_prefix("SESSION ")
-        .ok_or_else(|| anyhow::anyhow!("invalid session response"))?;
-    Ok(session_prompt(&serde_json::from_str(json)?))
+fn fetch_session_prompt(client: &mut Connection) -> Result<String> {
+    Ok(session_prompt(&client.session()?.into()))
 }
 
 #[cfg(test)]
 mod startup_tests {
     use super::*;
 
+    fn rpc_pair(
+        count: usize,
+        mut handle: impl FnMut(Op) -> Reply + Send + 'static,
+    ) -> (Connection, std::thread::JoinHandle<UnixStream>) {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let worker = std::thread::spawn(move || {
+            for expected_id in 1..=count as u64 {
+                let request: pb::Request = ipc::read_frame(&mut server).unwrap().unwrap();
+                assert_eq!(request.version, ipc::VERSION);
+                assert_eq!(request.id, expected_id);
+                let result = handle(request.operation.unwrap());
+                ipc::write_frame(
+                    &mut server,
+                    &pb::Response {
+                        version: ipc::VERSION,
+                        id: request.id,
+                        result: Some(result),
+                    },
+                )
+                .unwrap();
+            }
+            server
+        });
+        (Connection::new(client), worker)
+    }
+    fn text_reply(text: &str) -> Reply {
+        Reply::Command(pb::CommandResult {
+            lines: vec![text.into()],
+            action: None,
+        })
+    }
+
     #[test]
     fn attachment_handshake_is_bounded_and_sends_no_session_data_before_acceptance() {
-        let (mut stream, mut peer) = UnixStream::pair().unwrap();
-        let instance = Instance {
-            id: "test".into(),
-            pid: 1,
-            socket: "/unused".into(),
-        };
+        let (stream, mut peer) = UnixStream::pair().unwrap();
         let started = Instant::now();
-        assert!(claim_attachment(&instance, &mut stream, Duration::from_millis(100)).is_err());
+        assert!(claim_attachment(stream, Duration::from_millis(100)).is_err());
         assert!(started.elapsed() < Duration::from_secs(2));
-        stream.shutdown(std::net::Shutdown::Both).unwrap();
-        let mut bytes = Vec::new();
-        std::io::Read::read_to_end(&mut peer, &mut bytes).unwrap();
-        assert_eq!(bytes, b"ATTACH\n");
+        let request: pb::Request = ipc::read_frame(&mut peer).unwrap().unwrap();
+        assert!(matches!(request.operation, Some(Op::Attach(_))));
+        assert!(ipc::read_frame::<pb::Request>(&mut peer).unwrap().is_none());
     }
 
     #[test]
@@ -1997,21 +1876,20 @@ mod startup_tests {
         assert!(read_startup_commands(&path).unwrap().is_empty());
     }
     #[test]
-    fn startup_file_is_reported_with_json_escaping_and_acknowledged() {
-        let (mut client, server) = UnixStream::pair().unwrap();
-        let mut reader = BufReader::new(client.try_clone().unwrap());
+    fn startup_file_is_reported_with_protobuf_and_acknowledged() {
         let path = PathBuf::from("/tmp/home with spaces/\"quoted\"/.xferrc");
         let expected = path.clone();
-        let server = std::thread::spawn(move || {
-            let mut reader = BufReader::new(server);
-            let mut request = String::new();
-            reader.read_line(&mut request).unwrap();
-            let json = request.strip_prefix("STARTUP_FILE ").unwrap();
-            assert_eq!(serde_json::from_str::<PathBuf>(json).unwrap(), expected);
-            reader.get_mut().write_all(b"STARTUP_FILE_OK\n").unwrap();
+        let (mut client, worker) = rpc_pair(1, move |op| {
+            assert_eq!(
+                op,
+                Op::StartupFile(pb::Path {
+                    path: expected.to_str().unwrap().into()
+                })
+            );
+            Reply::Ok(pb::Empty {})
         });
-        report_startup_file(&mut client, &mut reader, &path).unwrap();
-        server.join().unwrap();
+        report_startup_file(&mut client, &path).unwrap();
+        worker.join().unwrap();
     }
 
     fn typed(code: KeyCode, modifiers: KeyModifiers) -> Event {
@@ -2084,25 +1962,18 @@ mod startup_tests {
 
     #[test]
     fn prompt_is_loaded_without_creating_a_job() {
-        let (mut client, server) = UnixStream::pair().unwrap();
-        let worker = std::thread::spawn(move || {
-            let mut reader = BufReader::new(server.try_clone().unwrap());
-            let mut server = server;
-            let mut request = String::new();
-            reader.read_line(&mut request).unwrap();
-            assert_eq!(request, "SESSION\n");
-            let info = xfer::daemon::SessionInfo {
+        let (mut client, worker) = rpc_pair(1, |op| {
+            assert!(matches!(op, Op::Session(_)));
+            Reply::Session(pb::Session {
                 daemon_pid: 123,
                 protocol: Some("s3".into()),
                 cwd: Some("/archive/".into()),
                 prompt: Some("custom[archive]> ".into()),
                 ..Default::default()
-            };
-            writeln!(server, "SESSION {}", serde_json::to_string(&info).unwrap()).unwrap();
+            })
         });
-        let mut reader = BufReader::new(client.try_clone().unwrap());
         assert_eq!(
-            fetch_session_prompt(&mut client, &mut reader).unwrap(),
+            fetch_session_prompt(&mut client).unwrap(),
             "custom[archive]> "
         );
         worker.join().unwrap();
@@ -2151,39 +2022,20 @@ mod startup_tests {
     }
 
     fn complete_with_candidates(command: &str, candidates: &[&str], truncated: bool) -> String {
-        let (mut client, server) = UnixStream::pair().unwrap();
-        let candidates = candidates.iter().map(|value| value.to_string()).collect();
-        let expected = if command.starts_with("lcd ") {
-            "COMPLETE_LCD "
-        } else if command.starts_with("put ") {
-            "COMPLETE_PUT "
-        } else if command.starts_with("ls ") {
-            "COMPLETE_LS "
-        } else if command.starts_with("get ") || command.starts_with("cat ") {
-            "COMPLETE_GET "
-        } else {
-            "COMPLETE_CD "
-        };
-        let worker = std::thread::spawn(move || {
-            let mut reader = BufReader::new(server.try_clone().unwrap());
-            let mut server = server;
-            let mut request = String::new();
-            reader.read_line(&mut request).unwrap();
-            assert!(request.starts_with(expected));
-            let result = xfer::cache::PathCompletion {
-                candidates,
-                truncated,
+        let candidates: Vec<String> = candidates.iter().map(|value| value.to_string()).collect();
+        let expected = path_completion_context(command).unwrap().2;
+        let (mut client, worker) = rpc_pair(1, move |op| {
+            let Op::Complete(request) = op else {
+                panic!("not a completion")
             };
-            writeln!(
-                server,
-                "COMPLETION {}",
-                serde_json::to_string(&result).unwrap()
-            )
-            .unwrap();
+            assert_eq!(request.kind, expected as i32);
+            Reply::Completion(pb::CompletionResult {
+                candidates: candidates.clone(),
+                truncated,
+            })
         });
-        let mut reader = BufReader::new(client.try_clone().unwrap());
         let mut command = command.to_owned();
-        complete_path_command(&mut client, &mut reader, &mut command).unwrap();
+        complete_path_command(&mut client, &mut command).unwrap();
         worker.join().unwrap();
         command
     }
@@ -2198,7 +2050,7 @@ mod startup_tests {
         ] {
             assert_eq!(
                 path_completion_context(input).unwrap(),
-                (head.into(), path.into(), "COMPLETE_PUT".into())
+                (head.into(), path.into(), pb::CompletionKind::LocalFile)
             );
         }
         assert!(path_completion_context("put -bad file").is_none());
@@ -2238,7 +2090,11 @@ mod startup_tests {
         ] {
             assert_eq!(
                 path_completion_context(input).unwrap(),
-                ("lcd".into(), path.into(), "COMPLETE_LCD".into())
+                (
+                    "lcd".into(),
+                    path.into(),
+                    pb::CompletionKind::LocalDirectory
+                )
             );
         }
         assert!(path_completion_context("lcd two arguments").is_none());
@@ -2273,12 +2129,12 @@ mod startup_tests {
             (
                 "get -c first.txt".into(),
                 "pho".into(),
-                "COMPLETE_GET".into()
+                pb::CompletionKind::RemotePath
             )
         );
         assert_eq!(
             path_completion_context("get -c ").unwrap(),
-            ("get -c".into(), "".into(), "COMPLETE_GET".into())
+            ("get -c".into(), "".into(), pb::CompletionKind::RemotePath)
         );
         let (head, path, _) = path_completion_context("get 'first file.txt' \"next fi").unwrap();
         assert_eq!(shlex::split(&head).unwrap(), vec!["get", "first file.txt"]);
@@ -2292,64 +2148,41 @@ mod startup_tests {
         );
     }
     #[test]
-    fn local_directory_lookup_reads_fresh_json_state_and_leaves_following_responses_intact() {
+    fn local_directory_lookup_reads_fresh_typed_state() {
         let directories = vec![
             PathBuf::from("/tmp/Pobrane"),
             PathBuf::from("/tmp/photo 'album'\n日本語"),
         ];
-        let expected = directories.clone();
-        let (mut client, mut server) = UnixStream::pair().unwrap();
-        let worker = std::thread::spawn(move || {
-            let mut reader = BufReader::new(server.try_clone().unwrap());
-            for directory in directories {
-                let mut request = String::new();
-                reader.read_line(&mut request).unwrap();
-                assert_eq!(request, "LOCAL_CWD\n");
-                writeln!(
-                    server,
-                    "LOCAL_CWD {}",
-                    serde_json::to_string(&directory).unwrap()
-                )
-                .unwrap();
-            }
-            writeln!(server, "SENTINEL").unwrap();
+        let mut replies = directories.clone().into_iter();
+        let (mut client, worker) = rpc_pair(2, move |op| {
+            assert!(matches!(op, Op::LocalCwd(_)));
+            Reply::LocalCwd(pb::Path {
+                path: replies.next().unwrap().to_str().unwrap().into(),
+            })
         });
-        let mut reader = BufReader::new(client.try_clone().unwrap());
-        for directory in expected {
-            assert_eq!(
-                read_local_directory(&mut client, &mut reader).unwrap(),
-                directory
-            );
+        for directory in directories {
+            assert_eq!(read_local_directory(&mut client).unwrap(), directory);
         }
-        let mut remaining = String::new();
-        reader.read_line(&mut remaining).unwrap();
-        assert_eq!(remaining, "SENTINEL\n");
         worker.join().unwrap();
     }
 
     #[test]
     fn local_directory_lookup_errors_never_fall_back_to_the_clients_startup_directory() {
-        for response in [
-            "",
-            "ERROR unknown request\n",
-            "LOCAL_CWD not-json\n",
-            "LOCAL_CWD \"relative/path\"\n",
-            "LOCAL_CWD_ERROR \"unavailable\"\n",
+        for reply in [
+            Reply::Ok(pb::Empty {}),
+            Reply::LocalCwd(pb::Path {
+                path: "relative/path".into(),
+            }),
+            Reply::Error(pb::Error {
+                code: pb::ErrorCode::OperationFailed as i32,
+                message: "unavailable".into(),
+            }),
         ] {
-            let (mut client, mut server) = UnixStream::pair().unwrap();
-            let worker = std::thread::spawn(move || {
-                let mut request = String::new();
-                BufReader::new(server.try_clone().unwrap())
-                    .read_line(&mut request)
-                    .unwrap();
-                assert_eq!(request, "LOCAL_CWD\n");
-                write!(server, "{response}").unwrap();
+            let (mut client, worker) = rpc_pair(1, move |op| {
+                assert!(matches!(op, Op::LocalCwd(_)));
+                reply.clone()
             });
-            let mut reader = BufReader::new(client.try_clone().unwrap());
-            assert!(
-                read_local_directory(&mut client, &mut reader).is_err(),
-                "{response:?}"
-            );
+            assert!(read_local_directory(&mut client).is_err());
             worker.join().unwrap();
         }
     }
@@ -2361,7 +2194,7 @@ mod startup_tests {
             (
                 "mkdir -p first".into(),
                 "second/sub".into(),
-                "COMPLETE_CD".into()
+                pb::CompletionKind::RemoteDirectory
             )
         );
         let completed =
@@ -2379,7 +2212,11 @@ mod startup_tests {
     fn cat_completion_handles_multiple_quoted_paths_and_literal_dash_names() {
         assert_eq!(
             path_completion_context("cat first.txt pho").unwrap(),
-            ("cat first.txt".into(), "pho".into(), "COMPLETE_GET".into())
+            (
+                "cat first.txt".into(),
+                "pho".into(),
+                pb::CompletionKind::RemotePath
+            )
         );
         let completed = complete_with_candidates("cat 'first file' -- -fi", &["-file name"], false);
         assert_eq!(
@@ -2396,26 +2233,20 @@ mod startup_tests {
             b"no newline".to_vec(),
         ];
         let expected = chunks.concat();
-        let (mut client, server) = UnixStream::pair().unwrap();
-        let worker = std::thread::spawn(move || {
-            let mut reader = BufReader::new(server);
-            let mut offset = 0;
-            for bytes in chunks.into_iter().chain(std::iter::once(Vec::new())) {
-                let mut request = String::new();
-                reader.read_line(&mut request).unwrap();
-                assert_eq!(request, format!("COMMAND read-output 42 {offset}\n"));
-                offset += bytes.len();
-                writeln!(
-                    reader.get_mut(),
-                    "OUTPUT CHUNK {offset} {}\nDONE",
-                    serde_json::to_string(&bytes).unwrap()
-                )
-                .unwrap();
-            }
+        let mut chunks = chunks.into_iter();
+        let mut offset = 0;
+        let (mut client, worker) = rpc_pair(4, move |op| {
+            assert_eq!(op, Op::ReadOutput(pb::OutputRequest { job_id: 42, offset }));
+            let data = chunks.next().unwrap_or_default();
+            offset += data.len() as u64;
+            Reply::Output(pb::OutputChunk {
+                next_offset: offset,
+                eof: data.is_empty(),
+                data,
+            })
         });
-        let mut reader = BufReader::new(client.try_clone().unwrap());
         let mut output = Vec::new();
-        let copied = copy_job_output(&mut client, &mut reader, 42, &mut output).unwrap();
+        let copied = copy_job_output(&mut client, 42, &mut output).unwrap();
         assert_eq!(output, expected);
         assert_eq!(copied.bytes as usize, expected.len());
         assert_eq!(copied.last, Some(b'e'));
@@ -2424,23 +2255,16 @@ mod startup_tests {
 
     #[test]
     fn raw_copy_rejects_inconsistent_offsets_even_at_eof() {
-        for bytes in [vec![], vec![1, 2], vec![0; 65537]] {
-            let (mut client, mut server) = UnixStream::pair().unwrap();
-            let worker = std::thread::spawn(move || {
-                let mut request = String::new();
-                BufReader::new(server.try_clone().unwrap())
-                    .read_line(&mut request)
-                    .unwrap();
-                writeln!(
-                    server,
-                    "OUTPUT CHUNK 1 {}\nDONE",
-                    serde_json::to_string(&bytes).unwrap()
-                )
-                .unwrap();
+        for data in [vec![], vec![1, 2], vec![0; 65537]] {
+            let (mut client, worker) = rpc_pair(1, move |_| {
+                Reply::Output(pb::OutputChunk {
+                    next_offset: 1,
+                    data: data.clone(),
+                    eof: true,
+                })
             });
-            let mut reader = BufReader::new(client.try_clone().unwrap());
             let mut output = Vec::new();
-            assert!(copy_job_output(&mut client, &mut reader, 1, &mut output).is_err());
+            assert!(copy_job_output(&mut client, 1, &mut output).is_err());
             assert!(output.is_empty());
             worker.join().unwrap();
         }
@@ -2505,7 +2329,7 @@ mod startup_tests {
             let command = format!("{prefix} pho");
             assert_eq!(
                 path_completion_context(&command).unwrap(),
-                (prefix.into(), "pho".into(), "COMPLETE_LS".into())
+                (prefix.into(), "pho".into(), pb::CompletionKind::RemotePath)
             );
             let completed = complete_with_candidates(&command, &["photo album/"], false);
             let mut expected = shlex::split(prefix).unwrap();
@@ -2559,36 +2383,14 @@ mod startup_tests {
 
     #[test]
     fn cd_completion_uses_daemon_rpc_and_quotes_paths_with_spaces() {
-        let (mut client, server) = UnixStream::pair().unwrap();
-        let worker = std::thread::spawn(move || {
-            let mut reader = BufReader::new(server.try_clone().unwrap());
-            let mut server = server;
-            let mut request = String::new();
-            reader.read_line(&mut request).unwrap();
-            assert_eq!(request, "COMPLETE_CD \"pho\"\n");
-            let completion = xfer::cache::PathCompletion {
-                candidates: vec!["photo album/".into()],
-                truncated: false,
-            };
-            writeln!(
-                server,
-                "COMPLETION {}",
-                serde_json::to_string(&completion).unwrap()
-            )
-            .unwrap();
-        });
-        let mut reader = BufReader::new(client.try_clone().unwrap());
-        let mut command = "cd pho".to_owned();
-        complete_path_command(&mut client, &mut reader, &mut command).unwrap();
-        assert_eq!(shlex::split(&command).unwrap(), vec!["cd", "photo album/"]);
-        worker.join().unwrap();
+        let result = complete_with_candidates("cd pho", &["photo album/"], false);
+        assert_eq!(shlex::split(&result).unwrap(), vec!["cd", "photo album/"]);
     }
 
     #[test]
     fn initial_command_expansion_appends_a_space_only_for_unique_matches() {
-        let (client, _server) = UnixStream::pair().unwrap();
-        let mut reader = BufReader::new(client.try_clone().unwrap());
-        let mut client = client;
+        let (stream, _server) = UnixStream::pair().unwrap();
+        let mut client = Connection::new(stream);
         for (before, expected) in [
             ("lc", "lcd "),
             ("l", "l"),
@@ -2597,52 +2399,67 @@ mod startup_tests {
             ("", ""),
         ] {
             let mut prefix = before.to_owned();
-            complete_command(&mut client, &mut reader, &mut prefix).unwrap();
-            assert_eq!(prefix, expected, "expanding {before:?}");
+            complete_command(&mut client, &mut prefix).unwrap();
+            assert_eq!(prefix, expected);
         }
     }
 
     #[test]
     fn completion_at_the_caret_preserves_later_arguments_and_uses_the_renamed_setting() {
-        for (text, before, expected_request, response, expected) in [
+        for (text, before, kind, candidate, expected) in [
             (
                 "put 'photo old.txt' later.txt",
                 "put 'pho",
-                "COMPLETE_PUT \"pho\"\n",
-                "COMPLETION {\"candidates\":[\"photo album.txt\"],\"truncated\":false}\n",
+                Some(pb::CompletionKind::LocalFile),
+                "photo album.txt",
                 "put 'photo album.txt' later.txt",
             ),
             (
                 "lcd 'photo old'",
                 "lcd 'pho",
-                "COMPLETE_LCD \"pho\"\n",
-                "COMPLETION {\"candidates\":[\"photo album/\"],\"truncated\":false}\n",
+                Some(pb::CompletionKind::LocalDirectory),
+                "photo album/",
                 "lcd 'photo album/'",
             ),
             (
                 "get -c 'photo album' second.txt",
                 "get -c 'pho",
-                "COMPLETE_GET \"pho\"\n",
-                "COMPLETION {\"candidates\":[\"photo album/\"],\"truncated\":false}\n",
+                Some(pb::CompletionKind::RemotePath),
+                "photo album/",
                 "get -c 'photo album/' second.txt",
             ),
             (
                 "set ui:ls-default-opt '-lF'",
                 "set ui:ls-default-opt",
-                "COMMAND show\n",
-                "OUTPUT ui:ls-default-options: -lF — options\nDONE\n",
+                None,
+                "ui:ls-default-options",
                 "set ui:ls-default-options '-lF'",
             ),
         ] {
-            let (mut client, server) = UnixStream::pair().unwrap();
-            let worker = std::thread::spawn(move || {
-                let mut reader = BufReader::new(server);
-                let mut request = String::new();
-                reader.read_line(&mut request).unwrap();
-                assert_eq!(request, expected_request);
-                reader.get_mut().write_all(response.as_bytes()).unwrap();
+            let (mut client, worker) = rpc_pair(1, move |op| {
+                if let Some(kind) = kind {
+                    assert_eq!(
+                        op,
+                        Op::Complete(pb::CompletionRequest {
+                            kind: kind as i32,
+                            input: "pho".into()
+                        })
+                    );
+                    Reply::Completion(pb::CompletionResult {
+                        candidates: vec![candidate.into()],
+                        truncated: false,
+                    })
+                } else {
+                    assert!(matches!(op, Op::Settings(_)));
+                    Reply::Settings(pb::SettingsResult {
+                        settings: vec![pb::Setting {
+                            name: candidate.into(),
+                            description: "options".into(),
+                            value: Some(pb::setting::Value::Text("-lF".into())),
+                        }],
+                    })
+                }
             });
-            let mut reader = BufReader::new(client.try_clone().unwrap());
             let mut command = CommandLine::new(text.into());
             command.key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
             for _ in before.chars() {
@@ -2650,7 +2467,7 @@ mod startup_tests {
             }
             assert_eq!(command.prefix(), before);
             let mut prefix = command.prefix().to_owned();
-            complete_command(&mut client, &mut reader, &mut prefix).unwrap();
+            complete_command(&mut client, &mut prefix).unwrap();
             command.complete(prefix);
             assert_eq!(command.as_str(), expected);
             worker.join().unwrap();
@@ -2669,32 +2486,18 @@ mod startup_tests {
             shlex::try_quote(pwd.to_str().unwrap()).unwrap(),
             shlex::try_quote(result.to_str().unwrap()).unwrap()
         );
-        let (mut client, mut server) = UnixStream::pair().unwrap();
-        client
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
         let expected = selected.clone();
-        let worker = std::thread::spawn(move || {
-            let mut request = String::new();
-            BufReader::new(server.try_clone().unwrap())
-                .read_line(&mut request)
-                .unwrap();
-            assert_eq!(request, "LOCAL_CWD\n");
-            writeln!(
-                server,
-                "LOCAL_CWD {}",
-                serde_json::to_string(&expected).unwrap()
-            )
-            .unwrap();
-            server
+        let (mut client, worker) = rpc_pair(1, move |op| {
+            assert!(matches!(op, Op::LocalCwd(_)));
+            Reply::LocalCwd(pb::Path {
+                path: expected.to_str().unwrap().into(),
+            })
         });
-        let mut reader = BufReader::new(client.try_clone().unwrap());
         assert!(dispatch_attached_command(
             &mut client,
-            &mut reader,
             &command,
             history.to_str(),
-            &mut Typeahead::default(),
+            &mut Typeahead::default()
         )
         .unwrap());
         assert_eq!(fs::read_to_string(&result).unwrap(), "some thing\n");
@@ -2703,12 +2506,10 @@ mod startup_tests {
             format!("{}\n", selected.display())
         );
         assert_eq!(fs::read_to_string(history).unwrap(), format!("{command}\n"));
-        // Only directory metadata is requested; Bash source never goes to the daemon.
         let mut server = worker.join().unwrap();
         server.set_nonblocking(true).unwrap();
-        let mut byte = [0];
         assert_eq!(
-            std::io::Read::read(&mut server, &mut byte)
+            std::io::Read::read(&mut server, &mut [0])
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::WouldBlock
@@ -2725,25 +2526,19 @@ mod startup_tests {
             "open smb://user:never-log-this@host/share",
             "open smb://user:@host/share",
         ];
-        let (mut client, server) = UnixStream::pair().unwrap();
-        let worker = std::thread::spawn(move || {
-            let mut reader = BufReader::new(server);
-            for command in commands {
-                let mut request = String::new();
-                reader.read_line(&mut request).unwrap();
-                assert_eq!(request, format!("COMMAND {command}\n"));
-                reader
-                    .get_mut()
-                    .write_all(b"OUTPUT declined\nDONE\n")
-                    .unwrap();
-            }
+        let mut expected = commands.into_iter();
+        let (mut client, worker) = rpc_pair(3, move |op| {
+            let Op::Command(command) = op else {
+                panic!("not a command")
+            };
+            assert_eq!(command.line, expected.next().unwrap());
+            assert!(!format!("{command:?}").contains("never-log-this"));
+            text_reply("declined")
         });
-        let mut reader = BufReader::new(client.try_clone().unwrap());
         for command in commands {
             assert!(!commands::should_record_history(command));
             assert!(dispatch_attached_command(
                 &mut client,
-                &mut reader,
                 command,
                 history.to_str(),
                 &mut Typeahead::default()
@@ -2751,17 +2546,16 @@ mod startup_tests {
             .unwrap());
         }
         worker.join().unwrap();
-        assert_eq!(fs::read_to_string(&history).unwrap(), "help\n");
+        assert_eq!(fs::read_to_string(history).unwrap(), "help\n");
     }
 
     #[test]
     fn empty_command_does_not_send_anything_to_daemon() {
-        let (mut client, mut server) = UnixStream::pair().unwrap();
-        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let (stream, mut server) = UnixStream::pair().unwrap();
+        let mut client = Connection::new(stream);
         for command in ["", " ", "\t  "] {
             assert!(dispatch_attached_command(
                 &mut client,
-                &mut reader,
                 command,
                 None,
                 &mut Typeahead::default()
@@ -2769,27 +2563,24 @@ mod startup_tests {
             .unwrap());
         }
         server.set_nonblocking(true).unwrap();
-        let mut byte = [0];
-        let error = std::io::Read::read(&mut server, &mut byte).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            std::io::Read::read(&mut server, &mut [0])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
     }
 
     #[test]
-    fn passwords_use_a_separate_json_request_not_command_text() {
-        let (mut client, server) = UnixStream::pair().unwrap();
-        let worker = std::thread::spawn(move || {
-            let mut reader = BufReader::new(server);
-            let mut request = String::new();
-            reader.read_line(&mut request).unwrap();
-            let json = request.strip_prefix("CONNECT_PASSWORD ").unwrap();
-            let credentials: xfer::credentials::PasswordConnect =
-                serde_json::from_str(json).unwrap();
+    fn passwords_use_a_separate_typed_request_not_command_text() {
+        let (mut client, worker) = rpc_pair(1, |op| {
+            let Op::ConnectPassword(credentials) = op else {
+                panic!("not a password request")
+            };
             assert_eq!(credentials.target, "server with spaces");
-            assert_eq!(
-                credentials.password.expose(),
-                "secret \"quotes\" \\ slashes"
-            );
-            assert_eq!(request.lines().count(), 1);
+            assert_eq!(credentials.password, "secret \"quotes\" \\ slashes");
+            assert!(!format!("{credentials:?}").contains("secret"));
+            text_reply("accepted")
         });
         send_connection_password(
             &mut client,
@@ -2801,20 +2592,44 @@ mod startup_tests {
     }
 
     #[test]
-    fn startup_and_interactive_commands_share_dispatch() {
-        let (mut client, server) = UnixStream::pair().unwrap();
-        let worker = std::thread::spawn(move || {
-            let mut read = BufReader::new(server.try_clone().unwrap());
-            let mut server = server;
-            let mut request = String::new();
-            read.read_line(&mut request).unwrap();
-            assert_eq!(request, "COMMAND set s3:region eu-west-1\n");
-            server.write_all(b"OUTPUT region changed\nDONE\n").unwrap();
+    fn command_semantic_errors_do_not_exit_the_interactive_client() {
+        let mut first = true;
+        let (mut client, worker) = rpc_pair(2, move |op| {
+            assert!(matches!(op, Op::Command(_)));
+            if std::mem::take(&mut first) {
+                Reply::Error(pb::Error {
+                    code: pb::ErrorCode::OperationFailed as i32,
+                    message: "cannot change local directory".into(),
+                })
+            } else {
+                text_reply("still attached")
+            }
         });
-        let mut reader = BufReader::new(client.try_clone().unwrap());
         assert!(dispatch_attached_command(
             &mut client,
-            &mut reader,
+            "lcd missing",
+            None,
+            &mut Typeahead::default()
+        )
+        .unwrap());
+        assert!(
+            dispatch_attached_command(&mut client, "help", None, &mut Typeahead::default())
+                .unwrap()
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn startup_and_interactive_commands_share_dispatch() {
+        let (mut client, worker) = rpc_pair(1, |op| {
+            let Op::Command(command) = op else {
+                panic!("not a command")
+            };
+            assert_eq!(command.line, "set s3:region eu-west-1");
+            text_reply("region changed")
+        });
+        assert!(dispatch_attached_command(
+            &mut client,
             "set s3:region eu-west-1",
             None,
             &mut Typeahead::default()

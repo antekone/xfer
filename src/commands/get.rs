@@ -25,17 +25,17 @@ impl Command for Get {
     }
     fn completion(&self) -> Completion {
         Completion::RemotePath {
-            request: "COMPLETE_GET",
+            kind: crate::ipc::pb::CompletionKind::RemotePath,
             multiple_arguments: true,
         }
     }
 }
 
-fn execute_lines(app: &mut Daemon, parser: &ParserContext<'_>) -> Vec<String> {
+fn execute_lines(app: &mut Daemon, parser: &ParserContext<'_>) -> CommandResult {
     let words = parser.words();
     let args = match GetArgs::parse(words) {
         Ok(args) => args,
-        Err(error) => return vec![error.to_string()],
+        Err(error) => return vec![error.to_string()].into(),
     };
     let connection = app.connection.clone();
     let directory = app.local_directory.clone();
@@ -50,11 +50,11 @@ fn execute_lines(app: &mut Daemon, parser: &ParserContext<'_>) -> Vec<String> {
             let args = expand_remote(active.as_ref(), args).await?;
             crate::transfer::get(active.as_ref(), args, directory, clobber, progress, output).await
         });
-    vec![format!("JOB {id}")]
+    CommandResult::JobStarted(id)
 }
 
 fn execute(context: &mut CommandContext<'_>, parser: &ParserContext<'_>) -> Result<CommandResult> {
-    Ok(execute_lines(context.daemon()?, parser).into())
+    Ok(execute_lines(context.daemon()?, parser))
 }
 
 struct Files(Vec<String>);

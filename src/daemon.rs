@@ -5,7 +5,7 @@
 use std::{
     collections::HashMap,
     env, fs,
-    io::{BufRead, BufReader, Write},
+    io::Write,
     os::unix::{
         fs::PermissionsExt,
         net::{UnixListener, UnixStream},
@@ -24,7 +24,7 @@ use crate::{
     core::{JobManager, JobState, SettingValue, Settings},
 };
 use anyhow::{Context, Result};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 // ------------------------------------------------------------------------------------------------
 
@@ -45,6 +45,30 @@ pub struct SessionInfo {
     pub host: String,
     #[serde(default)]
     pub prompt: Option<String>,
+}
+impl From<crate::ipc::pb::Session> for SessionInfo {
+    fn from(value: crate::ipc::pb::Session) -> Self {
+        Self {
+            daemon_pid: value.daemon_pid,
+            protocol: value.protocol,
+            cwd: value.cwd,
+            user: value.user,
+            host: value.host,
+            prompt: value.prompt,
+        }
+    }
+}
+impl From<SessionInfo> for crate::ipc::pb::Session {
+    fn from(value: SessionInfo) -> Self {
+        Self {
+            daemon_pid: value.daemon_pid,
+            protocol: value.protocol,
+            cwd: value.cwd,
+            user: value.user,
+            host: value.host,
+            prompt: value.prompt,
+        }
+    }
 }
 impl SessionInfo {
     pub(crate) fn disconnected() -> Self {
@@ -274,16 +298,6 @@ struct Shared {
     daemon: Arc<Mutex<Daemon>>,
 }
 
-/// Request prefixes answered from the completion cache or the local filesystem.
-const COMPLETION_PREFIXES: [&str; 6] = [
-    "COMPLETE_CD ",
-    "COMPLETE_LS ",
-    "COMPLETE_GET ",
-    "COMPLETE_BOOKMARK ",
-    "COMPLETE_LCD ",
-    "COMPLETE_PUT ",
-];
-
 /// Test harnesses spawn the daemon directly; their parent is the test binary,
 /// not the xfer client, so they must opt out of the parent check explicitly.
 pub const ALLOW_FOREIGN_PARENT_ENV: &str = "XFER_DAEMON_ALLOW_FOREIGN_PARENT";
@@ -438,268 +452,447 @@ impl Drop for DaemonSocket {
     }
 }
 
-/// One worker thread per client connection: handshake, then serve requests until
-/// detach, disconnect, or error. Releases the attach lease on every exit path.
-fn serve_connection(shared: Shared, stream: UnixStream, runtime: tokio::runtime::Handle) {
+/// One worker per connection. Every wire message is a bounded protobuf frame;
+/// protocol errors never reach command parsing or acquire the attachment lease.
+fn serve_connection(shared: Shared, mut stream: UnixStream, runtime: tokio::runtime::Handle) {
+    use crate::ipc::{self, pb, Op, Reply};
     let _runtime_guard = runtime.enter();
-    let mut reader = BufReader::new(stream.try_clone().expect("clone client socket"));
-    let mut request = Zeroizing::new(String::new());
-    let result = reader.read_line(&mut request);
-    let mut writer = stream;
-    if result.is_err() {
-        return;
-    }
-    if request.trim() == "PROBE" {
-        let _ = writer.write_all(if shared.attached.load(Ordering::Acquire) {
-            b"BUSY\n"
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let mut lease = None;
+    let mut last_id = 0;
+    while let Ok(Some(request)) = ipc::read_frame::<pb::Request>(&mut stream) {
+        let id = request.id;
+        let version_ok = request.version == ipc::VERSION;
+        let result = if !version_ok {
+            Err(rpc_error(
+                pb::ErrorCode::UnsupportedVersion,
+                "incompatible daemon IPC version; restart the daemon",
+            ))
+        } else if id == 0 || id <= last_id {
+            Err(rpc_error(
+                pb::ErrorCode::InvalidRequest,
+                "invalid IPC request ID",
+            ))
+        } else if let Some(operation) = request.operation {
+            last_id = id;
+            match operation {
+                Op::Probe(_) if lease.is_none() => {
+                    let result = Reply::Probe(pb::ProbeResult {
+                        available: !shared.shutdown.load(Ordering::Acquire)
+                            && !shared.attached.load(Ordering::Acquire),
+                    });
+                    let _ = send_response(&mut stream, id, Ok(result));
+                    return;
+                }
+                Op::Attach(_) if lease.is_none() => {
+                    // Serialize acquisition with lease release/shutdown decisions.
+                    let _state = shared.daemon.lock().expect("daemon state poisoned");
+                    if shared.shutdown.load(Ordering::Acquire) {
+                        Err(rpc_error(
+                            pb::ErrorCode::NotAttached,
+                            "daemon is shutting down",
+                        ))
+                    } else if shared
+                        .attached
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_err()
+                    {
+                        Err(rpc_error(pb::ErrorCode::Busy, "daemon is already attached"))
+                    } else {
+                        lease = Some(AttachmentLease(&shared));
+                        let _ = stream.set_read_timeout(None);
+                        Ok(Reply::Attached(pb::Empty {}))
+                    }
+                }
+                _ if lease.is_none() => Err(rpc_error(
+                    pb::ErrorCode::NotAttached,
+                    "attach before issuing requests",
+                )),
+                Op::Attach(_) | Op::Probe(_) => {
+                    Err(rpc_error(pb::ErrorCode::InvalidRequest, "already attached"))
+                }
+                Op::Detach(_) => {
+                    let _ = send_response(&mut stream, id, Ok(Reply::Ok(pb::Empty {})));
+                    break;
+                }
+                operation => handle_request(&shared, operation, &runtime),
+            }
         } else {
-            b"READY\n"
-        });
-        return;
-    }
-    if request.trim() != "ATTACH" {
-        let _ = writer.write_all(b"ERROR expected ATTACH\n");
-        return;
-    }
-    if shared
-        .attached
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        let _ = writer.write_all(b"BUSY\n");
-        return;
-    }
-    let _ = writer.write_all(b"ATTACHED\n");
-    let _ = writer.flush();
-    // The lease belongs to this connection until it explicitly detaches or closes.
-    loop {
-        request.zeroize();
-        match reader.read_line(&mut request) {
-            Ok(0) | Err(_) => break,
-            Ok(_) if request.trim() == "DETACH" => break,
-            Ok(_) => handle_request(&shared, &mut request, &mut writer, &runtime),
+            last_id = id;
+            Err(rpc_error(
+                pb::ErrorCode::InvalidRequest,
+                "missing or unsupported IPC operation",
+            ))
+        };
+        if send_response(&mut stream, id, result).is_err() || !version_ok {
+            break;
         }
     }
-    shared.attached.store(false, Ordering::Release);
-    if !shared
-        .daemon
-        .lock()
-        .expect("daemon state poisoned")
-        .has_running_jobs()
-    {
-        shared.shutdown.store(true, Ordering::Release);
+    // AttachmentLease releases ownership even on broken pipes and unwinding.
+}
+
+struct AttachmentLease<'a>(&'a Shared);
+impl Drop for AttachmentLease<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut daemon) = self.0.daemon.lock() {
+            self.0.attached.store(false, Ordering::Release);
+            if !daemon.has_running_jobs() {
+                self.0.shutdown.store(true, Ordering::Release);
+            }
+        } else {
+            self.0.attached.store(false, Ordering::Release);
+            self.0.shutdown.store(true, Ordering::Release);
+        }
     }
+}
+
+type RpcResult = std::result::Result<crate::ipc::Reply, crate::ipc::pb::Error>;
+fn rpc_error(code: crate::ipc::pb::ErrorCode, message: impl Into<String>) -> crate::ipc::pb::Error {
+    crate::ipc::pb::Error {
+        code: code as i32,
+        message: message.into(),
+    }
+}
+fn operation_error(error: impl std::fmt::Display) -> crate::ipc::pb::Error {
+    rpc_error(
+        crate::ipc::pb::ErrorCode::OperationFailed,
+        error.to_string(),
+    )
+}
+fn send_response(stream: &mut UnixStream, id: u64, result: RpcResult) -> std::io::Result<()> {
+    use crate::ipc::{self, pb, Reply};
+    use prost::Message;
+    let mut response = pb::Response {
+        version: ipc::VERSION,
+        id,
+        result: Some(result.unwrap_or_else(Reply::Error)),
+    };
+    if response.encoded_len() > ipc::MAX_FRAME {
+        response.result = Some(Reply::Error(rpc_error(
+            pb::ErrorCode::ResponseTooLarge,
+            "IPC response is too large; narrow the query or use a smaller page",
+        )));
+    }
+    ipc::write_frame(stream, &response)
+}
+
+fn command_reply(result: Result<crate::commands::CommandResult>) -> RpcResult {
+    use crate::{
+        commands::CommandResult as C,
+        ipc::{pb, Reply},
+    };
+    let value = result.map_err(operation_error)?;
+    let mut reply = pb::CommandResult::default();
+    reply.action = match value {
+        C::Output(lines) => {
+            reply.lines = lines;
+            None
+        }
+        C::JobStarted(id) => Some(pb::command_result::Action::JobStarted(pb::JobId { id })),
+        C::PasswordRequired(target) => Some(pb::command_result::Action::PasswordRequired(
+            pb::PasswordPrompt { target },
+        )),
+        C::EditBookmarks(path) => Some(pb::command_result::Action::EditBookmarks(pb::Path {
+            path: path.to_string_lossy().into_owned(),
+        })),
+        C::Detach => {
+            return Err(rpc_error(
+                pb::ErrorCode::InvalidRequest,
+                "detach is a client operation",
+            ))
+        }
+    };
+    Ok(Reply::Command(reply))
 }
 
 fn handle_request(
     shared: &Shared,
-    request: &mut Zeroizing<String>,
-    writer: &mut UnixStream,
+    operation: crate::ipc::Op,
     runtime: &tokio::runtime::Handle,
-) {
-    if request.trim() == "STARTUP" {
-        return handle_startup(shared, writer);
+) -> RpcResult {
+    use crate::ipc::{self, pb, Op, Reply};
+    if let Op::Complete(request) = operation {
+        return handle_completion(shared, request, runtime);
     }
-    if request.starts_with("STARTUP_FILE ") {
-        return handle_startup_file(shared, request, writer);
+    let mut daemon = shared.daemon.lock().expect("daemon state poisoned");
+    daemon.jobs.poll();
+    let ok = || Ok(Reply::Ok(pb::Empty {}));
+    let missing = || rpc_error(pb::ErrorCode::NotFound, "no such job");
+    match operation {
+        Op::ClaimStartup(_) => Ok(Reply::Startup(pb::StartupResult {
+            run: !shared.startup_claimed.swap(true, Ordering::AcqRel),
+        })),
+        Op::StartupFile(path) => {
+            daemon.set_startup_file(PathBuf::from(path.path));
+            ok()
+        }
+        Op::Session(_) => Ok(Reply::Session(daemon.session_info().into())),
+        Op::LocalCwd(_) => {
+            let path = daemon
+                .local_directory
+                .to_str()
+                .ok_or_else(|| operation_error("Local CWD is not UTF-8"))?;
+            Ok(Reply::LocalCwd(pb::Path { path: path.into() }))
+        }
+        Op::SetLocalCwd(path) => {
+            daemon
+                .set_local_directory(PathBuf::from(path.path))
+                .map_err(operation_error)?;
+            ok()
+        }
+        Op::Command(command) => command_reply(crate::commands::dispatch_daemon_result(
+            &mut daemon,
+            &command.line,
+        )),
+        Op::ConnectPassword(mut credentials) => {
+            let target = Zeroizing::new(std::mem::take(&mut credentials.target));
+            let password =
+                crate::credentials::Password::new(std::mem::take(&mut credentials.password));
+            command_reply(crate::commands::dispatch_connect_result(
+                &mut daemon,
+                &target,
+                Some(password),
+            ))
+        }
+        Op::Job(job) => Ok(Reply::Job(job_snapshot(
+            daemon.jobs.jobs.get(&job.id).ok_or_else(missing)?,
+        ))),
+        Op::Jobs(request) => {
+            // Retain only a bounded page of the lowest IDs after the cursor.
+            let limit = if request.limit == 0 {
+                ipc::JOB_PAGE
+            } else {
+                (request.limit as usize).min(ipc::JOB_PAGE)
+            };
+            let mut ids = std::collections::BinaryHeap::new();
+            let mut total = 0usize;
+            for &id in daemon.jobs.jobs.keys().filter(|&&id| id > request.after_id) {
+                total += 1;
+                ids.push(id);
+                if ids.len() > limit {
+                    ids.pop();
+                }
+            }
+            use prost::Message;
+            let mut jobs = Vec::new();
+            let mut bytes = 64usize; // envelope/cursor/length overhead
+            for id in ids.into_sorted_vec() {
+                let job = job_snapshot(&daemon.jobs.jobs[&id]);
+                let size = job.encoded_len().saturating_add(16);
+                if bytes.saturating_add(size) > ipc::MAX_FRAME {
+                    if jobs.is_empty() {
+                        return Err(rpc_error(
+                            pb::ErrorCode::ResponseTooLarge,
+                            "job metadata exceeds IPC frame limit",
+                        ));
+                    }
+                    break;
+                }
+                bytes += size;
+                jobs.push(job);
+            }
+            let next_after_id = if total > jobs.len() {
+                jobs.last().map(|job| job.id)
+            } else {
+                None
+            };
+            Ok(Reply::Jobs(pb::JobsResult {
+                jobs,
+                next_after_id,
+            }))
+        }
+        Op::ReadOutput(request) => {
+            let job = daemon.jobs.jobs.get(&request.job_id).ok_or_else(missing)?;
+            let length = match fs::metadata(job.output.path()) {
+                Ok(value) => value.len(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+                Err(error) => return Err(operation_error(error)),
+            };
+            if request.offset > length {
+                return Err(rpc_error(
+                    pb::ErrorCode::InvalidRequest,
+                    "output offset exceeds stored output",
+                ));
+            }
+            let data = job
+                .output
+                .read_bytes(request.offset)
+                .map_err(operation_error)?;
+            let next_offset = request
+                .offset
+                .checked_add(data.len() as u64)
+                .ok_or_else(|| operation_error("output offset overflow"))?;
+            // A running retry may truncate its spool between stat and read.
+            // A short read observed EOF even if the earlier length is stale;
+            // never emit an empty non-EOF chunk that makes clients spin/fail.
+            let eof = data.len() < ipc::OUTPUT_CHUNK || next_offset == length;
+            Ok(Reply::Output(pb::OutputChunk {
+                next_offset,
+                data,
+                eof,
+            }))
+        }
+        Op::AcknowledgeOutput(job) => {
+            let value = daemon.jobs.jobs.get(&job.id).ok_or_else(missing)?;
+            if value.state == JobState::Running {
+                return Err(operation_error(
+                    "cannot acknowledge output of a running job",
+                ));
+            }
+            match fs::remove_file(value.output.path()) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(operation_error(error)),
+            }
+            daemon.jobs.jobs.remove(&job.id);
+            ok()
+        }
+        Op::Cancel(job) => {
+            if !daemon.jobs.jobs.contains_key(&job.id) {
+                return Err(missing());
+            }
+            daemon.jobs.cancel(job.id);
+            ok()
+        }
+        Op::Settings(request) => {
+            use pb::setting::Value;
+            let mut names = daemon
+                .settings
+                .values
+                .keys()
+                .filter(|name| request.name.as_ref().is_none_or(|wanted| wanted == *name))
+                .collect::<Vec<_>>();
+            names.sort_unstable();
+            if names.is_empty() && request.name.is_some() {
+                return Err(rpc_error(pb::ErrorCode::NotFound, "unknown setting"));
+            }
+            let mut settings = Vec::new();
+            let mut bytes = 64usize;
+            for name in names {
+                let setting = &daemon.settings.values[name];
+                // Check textual sizes before copying, including values loaded
+                // from configuration rather than from bounded RPC requests.
+                let value_size = match &setting.value {
+                    SettingValue::Text(value) => value.len(),
+                    _ => 16,
+                };
+                let size = name
+                    .len()
+                    .saturating_add(setting.doc.len())
+                    .saturating_add(value_size)
+                    .saturating_add(32);
+                if bytes.saturating_add(size) > ipc::MAX_FRAME {
+                    return Err(rpc_error(
+                        pb::ErrorCode::ResponseTooLarge,
+                        "settings response is too large; request a specific setting",
+                    ));
+                }
+                bytes += size;
+                let value = match &setting.value {
+                    SettingValue::Bool(value) => Value::Boolean(*value),
+                    SettingValue::Int(value) => Value::Integer(*value),
+                    SettingValue::Text(value) => Value::Text(value.clone()),
+                    SettingValue::Secret(value) => Value::SecretIsSet(value.is_some()),
+                };
+                settings.push(pb::Setting {
+                    name: name.clone(),
+                    description: setting.doc.into(),
+                    value: Some(value),
+                });
+            }
+            Ok(Reply::Settings(pb::SettingsResult { settings }))
+        }
+        _ => Err(rpc_error(
+            pb::ErrorCode::InvalidRequest,
+            "invalid operation in attached session",
+        )),
     }
-    if request.trim() == "LOCAL_CWD" {
-        return handle_local_cwd_query(shared, writer);
-    }
-    if request.starts_with("LOCAL_CWD ") {
-        return handle_local_cwd_set(shared, request, writer);
-    }
-    if request.trim() == "SESSION" {
-        return handle_session(shared, writer);
-    }
-    if COMPLETION_PREFIXES
-        .iter()
-        .any(|prefix| request.starts_with(prefix))
-    {
-        return handle_completion(shared, request, writer, runtime);
-    }
-    if request.starts_with("CONNECT_PASSWORD ") {
-        return handle_connect_password(shared, request, writer);
-    }
-    if request.starts_with("COMMAND ") {
-        return handle_command(shared, request, writer);
-    }
-    let _ = writer.write_all(b"ERROR unknown request\n");
 }
 
-fn handle_startup(shared: &Shared, writer: &mut UnixStream) {
-    let response: &[u8] = if shared.startup_claimed.swap(true, Ordering::AcqRel) {
-        b"STARTUP_DONE\n"
-    } else {
-        b"RUN_STARTUP\n"
+fn job_snapshot(job: &crate::core::Job) -> crate::ipc::pb::Job {
+    use crate::{core::Progress, ipc::pb};
+    let elapsed_ms = job.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    let progress = match job.progress.borrow().clone() {
+        Progress::Indeterminate { message } => {
+            pb::job::Progress::Indeterminate(pb::Indeterminate { message })
+        }
+        Progress::Determinate {
+            done,
+            total,
+            message,
+        } => pb::job::Progress::Determinate(pb::Determinate {
+            done,
+            total,
+            message,
+        }),
+        Progress::Transfer(mut value) => {
+            value.elapsed_ms = elapsed_ms;
+            pb::job::Progress::Transfer((&value).into())
+        }
     };
-    let _ = writer.write_all(response);
-    let _ = writer.flush();
-}
-
-fn handle_startup_file(shared: &Shared, request: &str, writer: &mut UnixStream) {
-    match serde_json::from_str::<PathBuf>(request[13..].trim()) {
-        Ok(path) => {
-            shared
-                .daemon
-                .lock()
-                .expect("daemon state poisoned")
-                .set_startup_file(path);
-            let _ = writer.write_all(b"STARTUP_FILE_OK\n");
-        }
-        Err(_) => {
-            let _ = writer.write_all(b"ERROR invalid startup file path\n");
-        }
+    let state = match job.state {
+        JobState::Running => pb::JobState::Running,
+        JobState::Completed => pb::JobState::Completed,
+        JobState::Failed => pb::JobState::Failed,
+        JobState::Cancelled => pb::JobState::Cancelled,
+    } as i32;
+    pb::Job {
+        id: job.id,
+        title: job.title.clone(),
+        state,
+        raw_output: job.raw_output,
+        elapsed_ms,
+        progress: Some(progress),
     }
-    let _ = writer.flush();
-}
-
-fn handle_local_cwd_query(shared: &Shared, writer: &mut UnixStream) {
-    let result = serde_json::to_string(
-        &shared
-            .daemon
-            .lock()
-            .expect("daemon state poisoned")
-            .local_directory,
-    );
-    match result {
-        Ok(path) => {
-            let _ = writeln!(writer, "LOCAL_CWD {path}");
-        }
-        Err(error) => {
-            let _ = writeln!(
-                writer,
-                "LOCAL_CWD_ERROR {}",
-                serde_json::to_string(&error.to_string()).unwrap()
-            );
-        }
-    }
-    let _ = writer.flush();
-}
-
-fn handle_local_cwd_set(shared: &Shared, request: &str, writer: &mut UnixStream) {
-    let result = serde_json::from_str::<String>(request[10..].trim())
-        .map_err(anyhow::Error::from)
-        .and_then(|path| {
-            shared
-                .daemon
-                .lock()
-                .expect("daemon state poisoned")
-                .set_local_directory(PathBuf::from(path))
-        });
-    match result {
-        Ok(()) => {
-            let _ = writer.write_all(b"LOCAL_CWD_OK\n");
-        }
-        Err(error) => {
-            let _ = writeln!(
-                writer,
-                "LOCAL_CWD_ERROR {}",
-                serde_json::to_string(&error.to_string()).unwrap()
-            );
-        }
-    }
-    let _ = writer.flush();
-}
-
-fn handle_session(shared: &Shared, writer: &mut UnixStream) {
-    let info = shared
-        .daemon
-        .lock()
-        .expect("daemon state poisoned")
-        .session_info();
-    let _ = writeln!(writer, "SESSION {}", serde_json::to_string(&info).unwrap());
-    let _ = writer.flush();
 }
 
 fn handle_completion(
     shared: &Shared,
-    request: &str,
-    writer: &mut UnixStream,
+    request: crate::ipc::pb::CompletionRequest,
     runtime: &tokio::runtime::Handle,
-) {
-    let result = match serde_json::from_str::<String>(request.split_once(' ').unwrap().1.trim()) {
-        Ok(input)
-            if request.starts_with("COMPLETE_LCD ") || request.starts_with("COMPLETE_PUT ") =>
-        {
+) -> RpcResult {
+    use crate::ipc::{pb, Reply};
+    let kind = pb::CompletionKind::try_from(request.kind)
+        .map_err(|_| rpc_error(pb::ErrorCode::InvalidRequest, "unknown completion kind"))?;
+    let result = match kind {
+        pb::CompletionKind::LocalFile | pb::CompletionKind::LocalDirectory => {
             let directory = shared
                 .daemon
                 .lock()
                 .expect("daemon state poisoned")
                 .local_directory
                 .clone();
-            // Local filesystem only, independent of the backend and its
-            // connection lock. Re-read each time, using fresh Local CWD.
-            if request.starts_with("COMPLETE_PUT ") {
-                crate::local_path::complete_files(&directory, &input)
+            if kind == pb::CompletionKind::LocalFile {
+                crate::local_path::complete_files(&directory, &request.input)
             } else {
-                crate::local_path::complete_directories(&directory, &input)
+                crate::local_path::complete_directories(&directory, &request.input)
             }
         }
-        Ok(input) => {
-            // Do not hold the daemon-state mutex over network I/O.
-            let daemon = shared.daemon.lock().expect("daemon state poisoned");
-            if request.starts_with("COMPLETE_BOOKMARK ") {
-                daemon.bookmark_completion(&input)
-            } else {
-                runtime.block_on(daemon.path_completion(input, request.starts_with("COMPLETE_CD ")))
-            }
-        }
-        Err(_) => Err(anyhow::anyhow!("invalid completion request")),
-    };
-    match result {
-        Ok(completion) => {
-            let _ = writeln!(
-                writer,
-                "COMPLETION {}",
-                serde_json::to_string(&completion).unwrap()
-            );
-        }
-        Err(error) => {
-            let _ = writeln!(
-                writer,
-                "COMPLETION_ERROR {}",
-                serde_json::to_string(&error.to_string()).unwrap()
-            );
-        }
-    }
-    let _ = writer.flush();
-}
-
-fn handle_connect_password(
-    shared: &Shared,
-    request: &mut Zeroizing<String>,
-    writer: &mut UnixStream,
-) {
-    let response =
-        match serde_json::from_str::<crate::credentials::PasswordConnect>(request[17..].trim()) {
-            Ok(credentials) => shared
+        pb::CompletionKind::Bookmark => shared
+            .daemon
+            .lock()
+            .expect("daemon state poisoned")
+            .bookmark_completion(&request.input),
+        pb::CompletionKind::RemoteDirectory | pb::CompletionKind::RemotePath => {
+            let future = shared
                 .daemon
                 .lock()
                 .expect("daemon state poisoned")
-                .connect_command(&credentials.target, Some(credentials.password)),
-            // Parser errors may contain the password: never include them.
-            Err(_) => vec!["invalid password connection request".into()],
-        };
-    request.zeroize();
-    for line in response {
-        let _ = writeln!(writer, "OUTPUT {line}");
-    }
-    let _ = writer.write_all(b"DONE\n");
-    let _ = writer.flush();
-}
-
-fn handle_command(shared: &Shared, request: &str, writer: &mut UnixStream) {
-    let response = shared
-        .daemon
-        .lock()
-        .expect("daemon state poisoned")
-        .command(request[8..].trim());
-    for line in response {
-        let _ = writeln!(writer, "OUTPUT {line}");
-    }
-    let _ = writer.write_all(b"DONE\n");
-    let _ = writer.flush();
+                .path_completion(request.input, kind == pb::CompletionKind::RemoteDirectory);
+            runtime.block_on(future)
+        }
+        _ => {
+            return Err(rpc_error(
+                pb::ErrorCode::InvalidRequest,
+                "missing completion kind",
+            ))
+        }
+    };
+    let result = result.map_err(operation_error)?;
+    Ok(Reply::Completion(pb::CompletionResult {
+        candidates: result.candidates,
+        truncated: result.truncated,
+    }))
 }
 
 #[cfg(test)]

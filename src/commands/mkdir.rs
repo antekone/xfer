@@ -22,7 +22,7 @@ impl Command for Mkdir {
     }
     fn completion(&self) -> Completion {
         Completion::RemotePath {
-            request: "COMPLETE_CD",
+            kind: crate::ipc::pb::CompletionKind::RemoteDirectory,
             multiple_arguments: true,
         }
     }
@@ -103,7 +103,7 @@ fn execute(context: &mut CommandContext<'_>, parser: &ParserContext<'_>) -> Resu
             }
             Ok(String::new())
         });
-    Ok(vec![format!("JOB {id}")].into())
+    Ok(CommandResult::JobStarted(id))
 }
 
 #[cfg(test)]
@@ -206,7 +206,7 @@ mod tests {
         assert_eq!(
             Mkdir.completion(),
             Completion::RemotePath {
-                request: "COMPLETE_CD",
+                kind: crate::ipc::pb::CompletionKind::RemoteDirectory,
                 multiple_arguments: true
             }
         );

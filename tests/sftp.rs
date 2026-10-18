@@ -2,7 +2,7 @@
 //! without requiring an sshd account/password or modifying ~/.ssh/known_hosts.
 use std::{
     fs,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader},
     os::unix::{
         fs::{MetadataExt, PermissionsExt},
         net::UnixStream,
@@ -11,12 +11,12 @@ use std::{
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
+use xfer::ipc::{self, pb, Op, Reply};
 
 struct Daemon {
     child: Child,
     socket: PathBuf,
-    stream: UnixStream,
-    reader: BufReader<UnixStream>,
+    client: ipc::Client<UnixStream>,
     root: tempfile::TempDir,
 }
 impl Drop for Daemon {
@@ -154,37 +154,54 @@ exec {server} -d "$TEST_REMOTE_ROOT"
         let mut daemon = Self {
             child,
             socket,
-            reader: BufReader::new(stream.try_clone().unwrap()),
-            stream,
+            client: ipc::Client::new(stream),
             root,
         };
-        daemon.stream.write_all(b"ATTACH\n").unwrap();
-        assert_eq!(daemon.line(), "ATTACHED");
+        daemon.client.attach().unwrap();
         Some(daemon)
     }
-    fn line(&mut self) -> String {
-        let mut line = String::new();
-        assert_ne!(
-            self.reader.read_line(&mut line).unwrap(),
-            0,
-            "daemon disconnected"
-        );
-        line.trim_end().to_owned()
-    }
-    fn request(&mut self, request: &str) -> Vec<String> {
-        writeln!(self.stream, "{request}").unwrap();
-        let mut lines = Vec::new();
-        loop {
-            let line = self.line();
-            if line == "DONE" {
-                break;
-            }
-            lines.push(line.strip_prefix("OUTPUT ").unwrap().to_owned());
+    fn display(result: anyhow::Result<pb::CommandResult>) -> Vec<String> {
+        match result {
+            Ok(result) => match result.action {
+                Some(pb::command_result::Action::JobStarted(job)) => {
+                    vec![format!("JOB {}", job.id)]
+                }
+                Some(pb::command_result::Action::PasswordRequired(prompt)) => {
+                    vec![format!("password required for {}", prompt.target)]
+                }
+                Some(_) => panic!("unexpected action"),
+                None => result.lines,
+            },
+            Err(error) => vec![error.to_string()],
         }
-        lines
     }
     fn command(&mut self, command: &str) -> Vec<String> {
-        self.request(&format!("COMMAND {command}"))
+        Self::display(self.client.command(command))
+    }
+    fn password(&mut self, target: &str, password: &str) -> Vec<String> {
+        Self::display(
+            self.client
+                .command_reply(Op::ConnectPassword(pb::PasswordConnect {
+                    target: target.into(),
+                    password: password.into(),
+                })),
+        )
+    }
+    fn complete(
+        &mut self,
+        kind: pb::CompletionKind,
+        input: &str,
+    ) -> anyhow::Result<xfer::cache::PathCompletion> {
+        match self.client.call(Op::Complete(pb::CompletionRequest {
+            kind: kind as i32,
+            input: input.into(),
+        }))? {
+            Reply::Completion(value) => Ok(xfer::cache::PathCompletion {
+                candidates: value.candidates,
+                truncated: value.truncated,
+            }),
+            _ => panic!("unexpected reply"),
+        }
     }
     fn finish(&mut self, response: Vec<String>, succeeds: bool) -> Vec<String> {
         let id = response[0]
@@ -206,28 +223,25 @@ exec {server} -d "$TEST_REMOTE_ROOT"
         self.command(&format!("output {id}"))
     }
     fn connect(&mut self, password: &str, succeeds: bool) {
-        let payload = serde_json::json!({"target": "test", "password": password});
-        let response = self.request(&format!("CONNECT_PASSWORD {payload}"));
+        let response = self.password("test", password);
         self.finish(response, succeeds);
     }
     fn reattach(&mut self) {
         let socket = &self.socket;
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let mut stream = UnixStream::connect(socket).unwrap();
+            let stream = UnixStream::connect(socket).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
-            stream.write_all(b"ATTACH\n").unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut response = String::new();
-            reader.read_line(&mut response).unwrap();
-            if response.trim() == "ATTACHED" {
-                self.stream = stream;
-                self.reader = reader;
-                return;
+            let mut client = ipc::Client::new(stream);
+            match client.attach() {
+                Ok(()) => {
+                    self.client = client;
+                    return;
+                }
+                Err(error) => assert!(Instant::now() < deadline, "cannot reattach: {error}"),
             }
-            assert!(Instant::now() < deadline, "cannot reattach: {response}");
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -242,8 +256,12 @@ fn interactive_password_sftp_navigation_listing_completion_and_resumed_download(
         return;
     };
     assert_eq!(
-        daemon.command("open test"),
-        vec!["PASSWORD_REQUIRED \"test\""]
+        daemon.client.command("open test").unwrap().action,
+        Some(pb::command_result::Action::PasswordRequired(
+            pb::PasswordPrompt {
+                target: "test".into()
+            }
+        ))
     );
     assert!(daemon.command("jobs").is_empty());
     daemon.connect("test-secret", true);
@@ -287,10 +305,9 @@ fn interactive_password_sftp_navigation_listing_completion_and_resumed_download(
         .unwrap();
     assert_eq!(large_line.split_whitespace().nth(6), Some("200000"));
 
-    daemon.stream.write_all(b"COMPLETE_CD \"pho\"\n").unwrap();
-    let line = daemon.line();
-    let completion: xfer::cache::PathCompletion =
-        serde_json::from_str(line.strip_prefix("COMPLETION ").unwrap()).unwrap();
+    let completion = daemon
+        .complete(pb::CompletionKind::RemoteDirectory, "pho")
+        .unwrap();
     assert_eq!(completion.candidates, vec!["photos/"]);
     let response = daemon.command("cd 'linked photos'");
     daemon.finish(response, true);
@@ -308,13 +325,12 @@ fn interactive_password_sftp_navigation_listing_completion_and_resumed_download(
 
     let downloads = daemon.root.path().join("downloads");
     fs::create_dir(&downloads).unwrap();
-    writeln!(
-        daemon.stream,
-        "LOCAL_CWD {}",
-        serde_json::to_string(&downloads).unwrap()
-    )
-    .unwrap();
-    assert_eq!(daemon.line(), "LOCAL_CWD_OK");
+    daemon
+        .client
+        .ok(Op::SetLocalCwd(pb::Path {
+            path: downloads.to_str().unwrap().into(),
+        }))
+        .unwrap();
     fs::write(downloads.join("hello world.txt"), b"hello ").unwrap();
     let response = daemon.command("get -c 'hello world.txt'");
     daemon.finish(response, true);
@@ -332,8 +348,7 @@ fn interactive_password_sftp_navigation_listing_completion_and_resumed_download(
     daemon.connect("wrong password", false);
     assert!(daemon.command("status").contains(&format!("CWD: {home}")));
     // Cancellation drops both the in-flight SSH process and its password helper.
-    let payload = serde_json::json!({"target": "stall", "password": "test-secret"});
-    let response = daemon.request(&format!("CONNECT_PASSWORD {payload}"));
+    let response = daemon.password("stall", "test-secret");
     let id = response[0].strip_prefix("JOB ").unwrap().to_owned();
     std::thread::sleep(Duration::from_millis(50));
     daemon.command(&format!("cancel {id}"));
@@ -440,20 +455,19 @@ fn password_is_reused_for_transport_recovery_even_without_an_attached_client() {
     let cwd = format!("CWD: {}/photos/", daemon.remote().display());
     let downloads = daemon.root.path().join("downloads");
     fs::create_dir(&downloads).unwrap();
-    writeln!(
-        daemon.stream,
-        "LOCAL_CWD {}",
-        serde_json::to_string(&downloads).unwrap()
-    )
-    .unwrap();
-    assert_eq!(daemon.line(), "LOCAL_CWD_OK");
+    daemon
+        .client
+        .ok(Op::SetLocalCwd(pb::Path {
+            path: downloads.to_str().unwrap().into(),
+        }))
+        .unwrap();
     let pids = fs::read_to_string(daemon.root.path().join("ssh-pids")).unwrap();
     let pid = pids.lines().last().unwrap().parse::<i32>().unwrap();
     // SAFETY: kill the private fake-SSH/SFTP process recorded by this fixture.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
     let response = daemon.command("get image.txt");
     // Reauthentication must work in the daemon, without prompting a client.
-    daemon.stream.write_all(b"DETACH\n").unwrap();
+    daemon.client.detach().unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if fs::read(downloads.join("image.txt")).is_ok_and(|data| data == b"image") {
@@ -607,10 +621,9 @@ fn ls_flags_control_names_classification_metadata_visibility_and_sorting() {
     assert_eq!(ls(&mut daemon, "ls adir/"), Vec::<String>::new());
     // Hidden records remain in the shared typed cache despite display filtering.
     ls(&mut daemon, "ls");
-    daemon.stream.write_all(b"COMPLETE_LS \".s\"\n").unwrap();
-    let line = daemon.line();
-    let completion: xfer::cache::PathCompletion =
-        serde_json::from_str(line.strip_prefix("COMPLETION ").unwrap()).unwrap();
+    let completion = daemon
+        .complete(pb::CompletionKind::RemotePath, ".s")
+        .unwrap();
     assert_eq!(completion.candidates, vec![".secret"]);
     daemon.command("set ui:ls-default-options '-laFSr'");
     assert_eq!(
@@ -650,24 +663,18 @@ fn cat_reads_remote_files_as_exact_bytes_and_recovers_a_dead_transport() {
         }
         let mut data = Vec::new();
         loop {
-            let response = daemon.command(&format!("read-output {id} {}", data.len()));
-            let (next, bytes) = response[0]
-                .strip_prefix("CHUNK ")
-                .unwrap()
-                .split_once(' ')
-                .unwrap();
-            let bytes: Vec<u8> = serde_json::from_str(bytes).unwrap();
-            assert!(bytes.len() <= 64 * 1024);
-            assert_eq!(next.parse::<usize>().unwrap(), data.len() + bytes.len());
-            if bytes.is_empty() {
+            let chunk = daemon.client.output(id, data.len() as u64).unwrap();
+            assert!(chunk.data.len() <= ipc::OUTPUT_CHUNK);
+            assert_eq!(chunk.next_offset, (data.len() + chunk.data.len()) as u64);
+            data.extend_from_slice(&chunk.data);
+            if chunk.eof {
                 break;
             }
-            data.extend(bytes);
         }
-        assert_eq!(
-            daemon.command(&format!("ack-output {id}")),
-            vec!["output acknowledged"]
-        );
+        daemon
+            .client
+            .ok(Op::AcknowledgeOutput(pb::JobId { id }))
+            .unwrap();
         data
     }
     let Some(mut daemon) = Daemon::start() else {
@@ -713,16 +720,10 @@ fn cat_reads_remote_files_as_exact_bytes_and_recovers_a_dead_transport() {
 #[test]
 fn mkdir_creates_remote_directories_parents_and_refreshes_completion_after_reconnect() {
     fn complete(daemon: &mut Daemon, path: &str) -> Vec<String> {
-        writeln!(
-            daemon.stream,
-            "COMPLETE_CD {}",
-            serde_json::to_string(path).unwrap()
-        )
-        .unwrap();
-        let response = daemon.line();
-        let result: xfer::cache::PathCompletion =
-            serde_json::from_str(response.strip_prefix("COMPLETION ").unwrap()).unwrap();
-        result.candidates
+        daemon
+            .complete(pb::CompletionKind::RemoteDirectory, path)
+            .unwrap()
+            .candidates
     }
     let Some(mut daemon) = Daemon::start() else {
         return;
@@ -835,9 +836,7 @@ fn mkdir_rejects_permission_failures_but_parents_accepts_existing_readonly_direc
 #[test]
 fn local_cwd_query_tracks_lcd_and_symlink_resolution_without_changing_remote_cwd() {
     fn local_cwd(daemon: &mut Daemon) -> PathBuf {
-        writeln!(daemon.stream, "LOCAL_CWD").unwrap();
-        let response = daemon.line();
-        serde_json::from_str(response.strip_prefix("LOCAL_CWD ").unwrap()).unwrap()
+        daemon.client.local_cwd().unwrap()
     }
     let Some(mut daemon) = Daemon::start() else {
         return;
@@ -873,14 +872,9 @@ fn local_cwd_query_tracks_lcd_and_symlink_resolution_without_changing_remote_cwd
 #[test]
 fn lcd_completion_reads_fresh_local_directories_even_without_a_remote_connection() {
     fn complete(daemon: &mut Daemon, path: &str) -> xfer::cache::PathCompletion {
-        writeln!(
-            daemon.stream,
-            "COMPLETE_LCD {}",
-            serde_json::to_string(path).unwrap()
-        )
-        .unwrap();
-        let response = daemon.line();
-        serde_json::from_str(response.strip_prefix("COMPLETION ").unwrap()).unwrap()
+        daemon
+            .complete(pb::CompletionKind::LocalDirectory, path)
+            .unwrap()
     }
     let Some(mut daemon) = Daemon::start() else {
         return;
@@ -922,8 +916,9 @@ fn lcd_completion_reads_fresh_local_directories_even_without_a_remote_connection
         complete(&mut daemon, "pho").candidates,
         vec!["photo album 日本語/"]
     );
-    writeln!(daemon.stream, "COMPLETE_LCD \"missing/\"").unwrap();
-    assert!(daemon.line().starts_with("COMPLETION_ERROR "));
+    assert!(daemon
+        .complete(pb::CompletionKind::LocalDirectory, "missing/")
+        .is_err());
     assert!(daemon
         .command("status")
         .contains(&format!("CWD: {}/", daemon.remote().display())));
@@ -936,16 +931,10 @@ fn lcd_completion_reads_fresh_local_directories_even_without_a_remote_connection
 #[test]
 fn put_completion_is_local_file_only_and_selected_files_upload_from_local_cwd() {
     fn complete(daemon: &mut Daemon, input: &str) -> Vec<String> {
-        writeln!(
-            daemon.stream,
-            "COMPLETE_PUT {}",
-            serde_json::to_string(input).unwrap()
-        )
-        .unwrap();
-        let response = daemon.line();
-        let completion: xfer::cache::PathCompletion =
-            serde_json::from_str(response.strip_prefix("COMPLETION ").unwrap()).unwrap();
-        completion.candidates
+        daemon
+            .complete(pb::CompletionKind::LocalFile, input)
+            .unwrap()
+            .candidates
     }
     let Some(mut daemon) = Daemon::start() else {
         return;
@@ -977,10 +966,9 @@ fn put_completion_is_local_file_only_and_selected_files_upload_from_local_cwd() 
     assert_eq!(home, vec!["~/Downloads/home.txt"]);
     daemon.connect("test-secret", true);
     // Prime remote completion to verify upload invalidates its old snapshot.
-    writeln!(daemon.stream, "COMPLETE_GET \"photo album\"").unwrap();
-    let response = daemon.line();
-    let old: xfer::cache::PathCompletion =
-        serde_json::from_str(response.strip_prefix("COMPLETION ").unwrap()).unwrap();
+    let old = daemon
+        .complete(pb::CompletionKind::RemotePath, "photo album")
+        .unwrap();
     assert!(old.candidates.is_empty());
     let response = daemon.command(&format!(
         "put {} {}",
@@ -993,10 +981,9 @@ fn put_completion_is_local_file_only_and_selected_files_upload_from_local_cwd() 
         fs::read(daemon.remote().join("home.txt")).unwrap(),
         b"home file"
     );
-    writeln!(daemon.stream, "COMPLETE_GET \"photo album\"").unwrap();
-    let response = daemon.line();
-    let updated: xfer::cache::PathCompletion =
-        serde_json::from_str(response.strip_prefix("COMPLETION ").unwrap()).unwrap();
+    let updated = daemon
+        .complete(pb::CompletionKind::RemotePath, "photo album")
+        .unwrap();
     assert_eq!(updated.candidates, file);
     assert_eq!(complete(&mut daemon, "-da"), vec!["-dash"]);
     let response = daemon.command("put -- -dash");

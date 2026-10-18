@@ -1,4 +1,5 @@
-//! Protocol-internal spool reads and acknowledgement.
+//! Human-readable spool inspection retained for embedded/console callers.
+//! Socket IPC uses typed output-read/acknowledgement messages, not these lines.
 use super::{small, CommandContext, CommandResult, ParserContext, SmallCommand};
 use crate::{core::JobState, daemon::Daemon};
 use anyhow::Result;

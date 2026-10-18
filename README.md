@@ -387,6 +387,16 @@ the peer UID is not sufficient. Failed startups are killed and reaped rather
 than left running after a timeout. The separate parent-executable guard still
 uses Linux `/proc`, so these peer checks alone are not a complete BSD/macOS port.
 
+The connected socket uses versioned, length-prefixed **Protobuf RPC**, defined in
+[`proto/xfer.proto`](proto/xfer.proto). Typed requests/results cover command
+control, sessions, completion, settings, jobs/progress, errors, and binary output;
+the TUI no longer parses wire markers such as `OUTPUT` or `DONE`. The shared Rust
+client lives in `src/ipc.rs`, with no GUI dependencies. Cargo generates bindings
+using a Rust compiler (`protox`), so no system `protoc` is needed to build xfer.
+See [the IPC contract](docs/ipc.md) for framing, limits, Java binding generation,
+credential handling, and future GUI extension points. Restart older daemons:
+the former text RPC protocol is not kept as a parallel compatibility mode.
+
 Each daemon binds a socket in its own uniquely allocated private instance
 directory; it never unlinks another instance's socket to make room. Discovery is
 read-only and remains available for `xfer attach`; ambiguous ID prefixes are

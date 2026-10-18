@@ -16,7 +16,7 @@ impl Command for Connect {
     }
     fn completion(&self) -> Completion {
         Completion::RemotePath {
-            request: "COMPLETE_BOOKMARK",
+            kind: crate::ipc::pb::CompletionKind::Bookmark,
             multiple_arguments: false,
         }
     }
@@ -34,17 +34,13 @@ fn execute(context: &mut CommandContext<'_>, parser: &ParserContext<'_>) -> Resu
     let Some(target) = parser.words().next() else {
         return Ok(vec!["usage: connect <protocol://target | bookmark>".into()].into());
     };
-    let lines = match start(app, target, password.take()) {
-        Ok(id) => vec![format!("JOB {id}")],
+    match start(app, target, password.take()) {
+        Ok(id) => Ok(CommandResult::JobStarted(id)),
         Err(error) if error.is::<crate::credentials::PasswordRequired>() => {
-            vec![format!(
-                "PASSWORD_REQUIRED {}",
-                serde_json::to_string(target).unwrap()
-            )]
+            Ok(CommandResult::PasswordRequired(target.to_owned()))
         }
-        Err(error) => return Err(error),
-    };
-    Ok(lines.into())
+        Err(error) => Err(error),
+    }
 }
 
 fn start(

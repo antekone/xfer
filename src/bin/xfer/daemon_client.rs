@@ -1,10 +1,10 @@
 //! Startup channel for the exact daemon spawned by this client. Discovery is
 //! deliberately not involved: it is only for attaching to existing instances.
-use super::Instance;
+use super::{Connection, Instance};
 use anyhow::{bail, Context, Result};
 use std::{
     env, io,
-    io::{BufReader, Read},
+    io::Read,
     os::{
         fd::AsRawFd,
         unix::{net::UnixStream, process::CommandExt},
@@ -29,7 +29,7 @@ impl Drop for StartingDaemon {
     }
 }
 
-pub(super) fn start() -> Result<(UnixStream, BufReader<UnixStream>)> {
+pub(super) fn start() -> Result<Connection> {
     let executable = env::current_exe()?;
     let mut command = Command::new(&executable);
 
@@ -38,10 +38,7 @@ pub(super) fn start() -> Result<(UnixStream, BufReader<UnixStream>)> {
         .with_context(|| format!("start daemon {}", executable.display()))
 }
 
-fn start_command(
-    mut command: Command,
-    timeout: Duration,
-) -> Result<(UnixStream, BufReader<UnixStream>)> {
+fn start_command(mut command: Command, timeout: Duration) -> Result<Connection> {
     let child = command
         .process_group(0) // terminal signals must not reach the daemon
         .stdin(Stdio::null())
@@ -57,7 +54,7 @@ fn start_command(
     let deadline = Instant::now() + timeout;
     let instance = wait_for_ready(child, deadline)?;
 
-    let mut stream = UnixStream::connect(&instance.socket).context("connect to spawned daemon")?;
+    let stream = UnixStream::connect(&instance.socket).context("connect to spawned daemon")?;
     verify_peer(&stream, child.id())?;
     if let Some(status) = child.try_wait()? {
         bail!("daemon exited during startup ({status})");
@@ -66,11 +63,11 @@ fn start_command(
     let remaining = deadline
         .checked_duration_since(Instant::now())
         .context("timed out attaching to spawned daemon")?;
-    let reader = super::claim_attachment(&instance, &mut stream, remaining)?;
+    let client = super::claim_attachment(stream, remaining)?;
     // Do not resolve the ID through discovery again: this exact, verified,
     // claimed connection is the attachment. Dropping Child does not kill it.
     starting.0.take();
-    Ok((stream, reader))
+    Ok(client)
 }
 
 fn wait_for_ready(child: &mut Child, deadline: Instant) -> Result<Instance> {

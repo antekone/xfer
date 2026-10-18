@@ -1,0 +1,144 @@
+syntax = "proto3";
+package xfer.ipc.v1;
+option java_package = "org.xfer.ipc.v1";
+option java_multiple_files = true;
+
+// Unix sockets carry u32 big-endian length + one Request/Response protobuf.
+// IDs are nonzero, sequential per connection; a response repeats its request ID.
+// Both envelopes must carry version 1. Never reuse removed field/enum numbers.
+// Framing limit: 1 MiB. Output chunks: <=65536 bytes. Job pages: <=256 entries.
+message Empty {}
+message Path { string path = 1; }
+message JobId { uint64 id = 1; }
+message Command { string line = 1 [debug_redact = true]; }
+message PasswordConnect { string target = 1 [debug_redact = true]; string password = 2 [debug_redact = true]; }
+message CompletionRequest { CompletionKind kind = 1; string input = 2; }
+enum CompletionKind {
+  COMPLETION_UNSPECIFIED = 0;
+  REMOTE_DIRECTORY = 1;
+  REMOTE_PATH = 2;
+  BOOKMARK = 3;
+  LOCAL_DIRECTORY = 4;
+  LOCAL_FILE = 5;
+}
+message OutputRequest { uint64 job_id = 1; uint64 offset = 2; }
+message JobsRequest { uint64 after_id = 1; uint32 limit = 2; }
+message SettingsRequest { optional string name = 1; }
+message Request {
+  uint32 version = 1;
+  uint64 id = 2;
+  oneof operation {
+    Empty attach = 10;
+    Empty probe = 11;
+    Empty detach = 12;
+    Empty claim_startup = 13;
+    Path startup_file = 14;
+    Empty session = 15;
+    Empty local_cwd = 16;
+    Path set_local_cwd = 17;
+    CompletionRequest complete = 18;
+    Command command = 19;
+    PasswordConnect connect_password = 20;
+    JobId job = 21;
+    OutputRequest read_output = 22;
+    JobId acknowledge_output = 23;
+    JobId cancel = 24;
+    JobsRequest jobs = 25;
+    SettingsRequest settings = 26;
+  }
+}
+message Response {
+  uint32 version = 1;
+  uint64 id = 2;
+  oneof result {
+    Empty attached = 10;
+    ProbeResult probe = 11;
+    Empty ok = 12;
+    StartupResult startup = 13;
+    Session session = 14;
+    Path local_cwd = 15;
+    CompletionResult completion = 16;
+    CommandResult command = 17;
+    Job job = 18;
+    OutputChunk output = 19;
+    JobsResult jobs = 20;
+    SettingsResult settings = 21;
+    Error error = 30;
+  }
+}
+message ProbeResult { bool available = 1; }
+message StartupResult { bool run = 1; }
+message Session {
+  uint32 daemon_pid = 1;
+  optional string protocol = 2;
+  optional string cwd = 3;
+  // A non-secret presentation template for the existing TUI.
+  optional string prompt = 4;
+  string user = 5;
+  string host = 6;
+}
+message CompletionResult { repeated string candidates = 1; bool truncated = 2; }
+message CommandResult {
+  repeated string lines = 1;
+  oneof action {
+    JobId job_started = 10;
+    PasswordPrompt password_required = 11;
+    Path edit_bookmarks = 12;
+  }
+}
+message PasswordPrompt { string target = 1; }
+enum JobState {
+  JOB_STATE_UNSPECIFIED = 0;
+  RUNNING = 1;
+  COMPLETED = 2;
+  FAILED = 3;
+  CANCELLED = 4;
+}
+message Job {
+  uint64 id = 1;
+  string title = 2;
+  JobState state = 3;
+  bool raw_output = 4;
+  uint64 elapsed_ms = 5;
+  oneof progress {
+    Indeterminate indeterminate = 10;
+    Determinate determinate = 11;
+    TransferProgress transfer = 12;
+  }
+}
+message Indeterminate { string message = 1; }
+message Determinate { uint64 done = 1; uint64 total = 2; string message = 3; }
+message TransferProgress {
+  string file = 1;
+  uint64 file_index = 2;
+  uint64 file_count = 3;
+  uint64 done = 4;
+  uint64 total = 5;
+  uint64 transferred = 6;
+  uint64 elapsed_ms = 7;
+}
+message OutputChunk { uint64 next_offset = 1; bytes data = 2 [debug_redact = true]; bool eof = 3; }
+message JobsResult { repeated Job jobs = 1; optional uint64 next_after_id = 2; }
+message Setting {
+  string name = 1;
+  string description = 2;
+  oneof value {
+    bool boolean = 10;
+    sint64 integer = 11;
+    string text = 12;
+    // Only presence is exposed; actual stored credentials are never returned.
+    bool secret_is_set = 13;
+  }
+}
+message SettingsResult { repeated Setting settings = 1; }
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  INVALID_REQUEST = 1;
+  UNSUPPORTED_VERSION = 2;
+  BUSY = 3;
+  NOT_ATTACHED = 4;
+  NOT_FOUND = 5;
+  OPERATION_FAILED = 6;
+  RESPONSE_TOO_LARGE = 7;
+}
+message Error { ErrorCode code = 1; string message = 2; }

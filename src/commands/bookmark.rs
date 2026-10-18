@@ -16,10 +16,10 @@ impl Command for Bookmark {
     }
 }
 
-fn execute_lines(app: &mut Daemon, parser: &ParserContext<'_>) -> Vec<String> {
+fn execute_lines(app: &mut Daemon, parser: &ParserContext<'_>) -> CommandResult {
     let mut words = parser.words();
     match words.next() {
-        None => match crate::bookmarks::load(std::path::Path::new(
+        None => (match crate::bookmarks::load(std::path::Path::new(
             app.settings.text("bookmarks:file").unwrap(),
         )) {
             Ok(entries) if entries.is_empty() => vec!["no bookmarks".into()],
@@ -28,24 +28,26 @@ fn execute_lines(app: &mut Daemon, parser: &ParserContext<'_>) -> Vec<String> {
                 .map(|(alias, bookmark)| bookmark.summary(&alias))
                 .collect(),
             Err(error) => vec![error.to_string()],
-        },
+        })
+        .into(),
         Some("edit") => {
             let path = std::path::Path::new(app.settings.text("bookmarks:file").unwrap());
             match crate::bookmarks::prepare_for_editor(path) {
-                Ok(()) => vec![format!("BOOKMARK_EDIT {}", path.display())],
-                Err(error) => vec![format!("cannot prepare bookmarks: {error}")],
+                Ok(()) => CommandResult::EditBookmarks(path.to_owned()),
+                Err(error) => vec![format!("cannot prepare bookmarks: {error}")].into(),
             }
         }
-        Some("reload") => match crate::bookmarks::load(std::path::Path::new(
+        Some("reload") => (match crate::bookmarks::load(std::path::Path::new(
             app.settings.text("bookmarks:file").unwrap(),
         )) {
             Ok(_) => vec!["bookmarks validated; connections use the latest file".into()],
             Err(error) => vec![error.to_string()],
-        },
-        _ => vec!["usage: bookmark [edit | reload]".into()],
+        })
+        .into(),
+        _ => vec!["usage: bookmark [edit | reload]".into()].into(),
     }
 }
 
 fn execute(context: &mut CommandContext<'_>, parser: &ParserContext<'_>) -> Result<CommandResult> {
-    Ok(execute_lines(context.daemon()?, parser).into())
+    Ok(execute_lines(context.daemon()?, parser))
 }

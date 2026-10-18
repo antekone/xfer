@@ -33,7 +33,7 @@ impl Command for Cat {
     }
     fn completion(&self) -> Completion {
         Completion::RemotePath {
-            request: "COMPLETE_GET",
+            kind: crate::ipc::pb::CompletionKind::RemotePath,
             multiple_arguments: true,
         }
     }
@@ -86,7 +86,7 @@ fn execute(context: &mut CommandContext<'_>, parser: &ParserContext<'_>) -> Resu
             Ok(String::new())
         },
     );
-    Ok(vec![format!("JOB {id}")].into())
+    Ok(CommandResult::JobStarted(id))
 }
 
 struct Sink<'a> {

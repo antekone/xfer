@@ -130,7 +130,7 @@ impl Command for Ls {
     }
     fn completion(&self) -> Completion {
         Completion::RemotePath {
-            request: "COMPLETE_LS",
+            kind: crate::ipc::pb::CompletionKind::RemotePath,
             multiple_arguments: false,
         }
     }
@@ -140,13 +140,13 @@ impl Command for Ls {
     }
 }
 
-fn execute_lines(app: &mut Daemon, parser: &ParserContext<'_>) -> Vec<String> {
+fn execute_lines(app: &mut Daemon, parser: &ParserContext<'_>) -> CommandResult {
     let args = match LsArgs::with_defaults(
         app.settings.text("ui:ls-default-options").unwrap_or("-lF"),
         parser.words(),
     ) {
         Ok(args) => args,
-        Err(error) => return vec![error.to_string()],
+        Err(error) => return vec![error.to_string()].into(),
     };
     let connection = app.connection.clone();
     let snapshot = std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -188,7 +188,7 @@ fn execute_lines(app: &mut Daemon, parser: &ParserContext<'_>) -> Vec<String> {
                 Ok(String::new())
             }
         });
-    vec![format!("JOB {id}")]
+    CommandResult::JobStarted(id)
 }
 
 struct WildmatListing<'a> {
@@ -212,7 +212,7 @@ impl ListingSink for WildmatListing<'_> {
 }
 
 fn execute(context: &mut CommandContext<'_>, parser: &ParserContext<'_>) -> Result<CommandResult> {
-    Ok(execute_lines(context.daemon()?, parser).into())
+    Ok(execute_lines(context.daemon()?, parser))
 }
 
 pub(crate) fn snapshot_listing_path(
