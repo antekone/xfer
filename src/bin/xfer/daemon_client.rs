@@ -136,11 +136,12 @@ fn wait_for_ready(child: &mut Child, deadline: Instant) -> Result<Instance> {
     }
 }
 
-// Compare the kernel-recorded listener PID, never an application-supplied PID
+// Compare the kernel-reported peer PID, never an application-supplied PID
 // or merely the peer UID (another daemon may run as the same user).
 fn verify_peer(stream: &UnixStream, expected_pid: u32) -> Result<()> {
     #[cfg(any(
         target_os = "linux",
+        target_os = "macos",
         target_os = "freebsd",
         target_os = "netbsd",
         target_os = "openbsd",
@@ -148,6 +149,9 @@ fn verify_peer(stream: &UnixStream, expected_pid: u32) -> Result<()> {
     {
         #[cfg(target_os = "linux")]
         type PeerCredentials = libc::ucred;
+        // Darwin returns a single pid_t rather than a credential structure.
+        #[cfg(target_os = "macos")]
+        type PeerCredentials = libc::pid_t;
         #[cfg(target_os = "freebsd")]
         type PeerCredentials = libc::xucred;
         #[cfg(target_os = "netbsd")]
@@ -157,6 +161,8 @@ fn verify_peer(stream: &UnixStream, expected_pid: u32) -> Result<()> {
 
         #[cfg(any(target_os = "linux", target_os = "openbsd"))]
         let (level, option) = (libc::SOL_SOCKET, libc::SO_PEERCRED);
+        #[cfg(target_os = "macos")]
+        let (level, option) = (libc::SOL_LOCAL, libc::LOCAL_PEERPID);
         #[cfg(target_os = "freebsd")]
         let (level, option) = (libc::SOL_LOCAL, libc::LOCAL_PEERCRED);
         // NetBSD's <sys/un.h> defines SOL_LOCAL as 0; libc currently exports
@@ -188,6 +194,8 @@ fn verify_peer(stream: &UnixStream, expected_pid: u32) -> Result<()> {
         let credentials = unsafe { credentials.assume_init() };
         #[cfg(any(target_os = "linux", target_os = "openbsd"))]
         let pid = credentials.pid;
+        #[cfg(target_os = "macos")]
+        let pid = credentials;
         #[cfg(target_os = "netbsd")]
         let pid = credentials.unp_pid;
         #[cfg(target_os = "freebsd")]
@@ -207,6 +215,7 @@ fn verify_peer(stream: &UnixStream, expected_pid: u32) -> Result<()> {
 
     #[cfg(not(any(
         target_os = "linux",
+        target_os = "macos",
         target_os = "freebsd",
         target_os = "netbsd",
         target_os = "openbsd",
@@ -299,6 +308,7 @@ mod tests {
 
     #[cfg(any(
         target_os = "linux",
+        target_os = "macos",
         target_os = "freebsd",
         target_os = "netbsd",
         target_os = "openbsd",
@@ -316,6 +326,7 @@ mod tests {
 
     #[cfg(any(
         target_os = "linux",
+        target_os = "macos",
         target_os = "freebsd",
         target_os = "netbsd",
         target_os = "openbsd",

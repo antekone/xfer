@@ -378,13 +378,14 @@ daemon publishes its discovery metadata atomically and sends a single JSON
 readiness message on its private stdout pipe. The parent waits up to five
 seconds for readiness, then connects directly to the announced socket; it never
 uses discovery or ID-prefix matching for this initial attachment. On Linux,
-FreeBSD, NetBSD, and OpenBSD it also verifies the kernel-reported socket peer PID
-against the spawned child: `SO_PEERCRED` on Linux/OpenBSD, `LOCAL_PEERCRED` on
-FreeBSD (including the `xucred` version check), and `LOCAL_PEEREID` on NetBSD.
+macOS, FreeBSD, NetBSD, and OpenBSD it also verifies the kernel-reported socket
+peer PID against the spawned child: `SO_PEERCRED` on Linux/OpenBSD,
+`LOCAL_PEERPID` on macOS, `LOCAL_PEERCRED` on FreeBSD (including the `xucred`
+version check), and `LOCAL_PEEREID` on NetBSD.
 Unavailable or invalid credentials fail startup on those platforms; matching only
 the peer UID is not sufficient. Failed startups are killed and reaped rather
 than left running after a timeout. The separate parent-executable guard still
-uses Linux `/proc`, so these peer checks alone are not a complete BSD port.
+uses Linux `/proc`, so these peer checks alone are not a complete BSD/macOS port.
 
 Each daemon binds a socket in its own uniquely allocated private instance
 directory; it never unlinks another instance's socket to make room. Discovery is
