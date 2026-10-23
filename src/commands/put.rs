@@ -66,7 +66,10 @@ struct Plan {
     size: u64,
 }
 fn expand_local(files: Vec<String>, directory: &Path) -> Result<Vec<String>> {
-    if !files.iter().any(|file| has_wildmat(file)) {
+    if !files
+        .iter()
+        .any(|file| !file.starts_with("./") && has_wildmat(file))
+    {
         return Ok(files);
     }
     let mut available = fs::read_dir(directory)
@@ -82,7 +85,7 @@ fn expand_local(files: Vec<String>, directory: &Path) -> Result<Vec<String>> {
     available.sort();
     let mut expanded = Vec::new();
     for input in files {
-        if !has_wildmat(&input) {
+        if input.starts_with("./") || !has_wildmat(&input) {
             expanded.push(input);
             continue;
         }

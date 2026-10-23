@@ -13,24 +13,35 @@ use futures_util::StreamExt;
 use openssh_sftp_client::{metadata::MetaData, Sftp as Client, SftpOptions};
 use percent_encoding::percent_decode_str;
 use std::{
-    fs::File,
     future::Future,
-    io::Read,
-    io::SeekFrom,
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
     sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncSeekExt},
+    io::AsyncReadExt,
     process::{Child, Command},
     sync::{Mutex as AsyncMutex, MutexGuard},
     task::JoinHandle,
 };
 
+mod transfer;
+use transfer::{download_on, upload_on};
+
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct Sftp;
+
+pub(crate) fn request_window(settings: &Settings) -> Result<usize> {
+    match settings
+        .values
+        .get("sftp:max-requests")
+        .map(|setting| &setting.value)
+    {
+        Some(SettingValue::Int(value)) if (1..=256).contains(value) => Ok(*value as usize),
+        _ => Err(permanent("sftp:max-requests must be an integer in 1..=256")),
+    }
+}
 
 fn permanent(message: impl Into<String>) -> anyhow::Error {
     NonRetryableError(message.into()).into()
@@ -275,9 +286,15 @@ impl Backend for Sftp {
             SettingValue::Int(30),
             "SSH connection/authentication timeout (seconds)",
         );
+        settings.register(
+            "sftp:max-requests",
+            SettingValue::Int(64),
+            "Concurrent SFTP read/write requests (1..256; reconnect to apply)",
+        );
     }
 
     async fn connect(&self, options: ConnectOptions) -> Result<Box<dyn Connection>> {
+        let max_requests = request_window(&options.settings)?;
         let target = Target::parse(
             options
                 .bookmark
@@ -299,6 +316,7 @@ impl Backend for Sftp {
         let recipe = ConnectRecipe {
             target,
             timeout,
+            max_requests,
             password: options.password.or_else(|| {
                 options
                     .bookmark
@@ -326,6 +344,7 @@ impl Backend for Sftp {
 struct ConnectRecipe {
     target: Target,
     timeout: u64,
+    max_requests: usize,
     password: Option<crate::credentials::Password>,
     program: PathBuf,
 }
@@ -360,7 +379,7 @@ impl ConnectRecipe {
         let mut stage = "start SFTP subsystem";
 
         let result = tokio::time::timeout(Duration::from_secs(timeout), async {
-            let sftp = Client::new(stdin, stdout, SftpOptions::new())
+            let sftp = Client::new(stdin, stdout, SftpOptions::new().flush_interval(Duration::ZERO))
                 .await
                 .context(stage)?;
 
@@ -712,12 +731,21 @@ struct SessionLease<'a> {
     slot: MutexGuard<'a, Option<SftpSession>>,
 }
 
+#[derive(Debug)]
+struct DiscardSession(String);
+impl std::fmt::Display for DiscardSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for DiscardSession {}
+
 impl SessionLease<'_> {
     fn finish<T>(self, result: Result<T>) -> Result<T> {
         let Self { session, mut slot } = self;
         if !result
             .as_ref()
-            .is_err_and(|error| error.is::<TransportError>())
+            .is_err_and(|error| error.is::<TransportError>() || error.is::<DiscardSession>())
         {
             *slot = Some(session);
         }
@@ -773,7 +801,14 @@ impl Connection for SftpConnection {
     async fn upload(&self, local: &Path, path: &str, overwrite: bool) -> Result<()> {
         let path = self.resolve_listing_path(path)?;
         let lease = self.acquire().await?;
-        let result = upload_on(&lease.session.sftp, local, &path, overwrite).await;
+        let result = upload_on(
+            &lease.session.sftp,
+            local,
+            &path,
+            overwrite,
+            self.recipe.max_requests,
+        )
+        .await;
         lease.finish(result)
     }
 
@@ -789,7 +824,15 @@ impl Connection for SftpConnection {
         }
         let path = self.resolve_listing_path(path)?;
         let lease = self.acquire().await?;
-        let result = download_on(&lease.session.sftp, &path, offset, expected, sink).await;
+        let result = download_on(
+            &lease.session.sftp,
+            &path,
+            offset,
+            expected,
+            sink,
+            self.recipe.max_requests,
+        )
+        .await;
         lease.finish(result)
     }
 
@@ -947,69 +990,6 @@ async fn list_on(sftp: &Client, path: &str, output: &mut dyn ListingSink) -> Res
     Ok(count)
 }
 
-async fn upload_on(sftp: &Client, local: &Path, remote: &str, overwrite: bool) -> Result<()> {
-    let mut input = File::open(local).map_err(|error| local_error(local, error))?;
-    let mut options = sftp.options();
-    options.write(true);
-
-    if overwrite {
-        options.create(true).truncate(true);
-    } else {
-        options.create_new(true);
-    }
-
-    let mut output = operation(options.open(remote)).await?;
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let read = input
-            .read(&mut buffer)
-            .map_err(|error| local_error(local, error))?;
-
-        if read == 0 {
-            break;
-        }
-
-        operation(output.write_all(&buffer[..read])).await?;
-    }
-
-    operation(output.close()).await
-}
-
-async fn download_on(
-    sftp: &Client,
-    path: &str,
-    offset: u64,
-    expected: &RemoteFile,
-    sink: &mut dyn DownloadSink,
-) -> Result<()> {
-    if offset > expected.size {
-        return Err(permanent("resume offset exceeds remote size"));
-    }
-
-    let mut file = operation(sftp.open(path)).await?;
-    unchanged(&operation(file.metadata()).await?, expected)?;
-    let mut position = offset;
-
-    while position < expected.size {
-        // Explicit offsets also handle servers returning short reads.
-        file.seek(SeekFrom::Start(position)).await?;
-        let length = (expected.size - position).min(64 * 1024) as u32;
-        let bytes = operation(file.read(length, Default::default()))
-            .await?
-            .filter(|bytes| !bytes.is_empty())
-            .ok_or_else(|| permanent("remote file ended early; partial file was retained"))?;
-        if bytes.len() as u64 > expected.size - position {
-            return Err(permanent("SFTP server returned too much data"));
-        }
-        sink.write(&bytes)?;
-        position += bytes.len() as u64;
-    }
-
-    unchanged(&operation(file.metadata()).await?, expected)?;
-    operation(file.close()).await?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1057,6 +1037,7 @@ mod tests {
                 directory: remote.to_str().unwrap().into(),
             },
             timeout: 5,
+            max_requests: 2,
             password: Some(crate::credentials::Password::new("fixture secret".into())),
             program,
         };
@@ -1561,4 +1542,59 @@ mod tests {
             "ssh: connect to host server port 22: Connection refused"
         ));
     }
+    #[test]
+    fn pipeline_window_settings_are_bounded_and_registered() {
+        let mut settings = Settings::new();
+        Sftp.register_settings(&mut settings);
+        assert_eq!(request_window(&settings).unwrap(), 64);
+        for value in [1, 256] {
+            settings
+                .set("sftp:max-requests", &value.to_string())
+                .unwrap();
+            assert_eq!(request_window(&settings).unwrap(), value as usize);
+        }
+        for value in [0, -1, 257] {
+            settings
+                .set("sftp:max-requests", &value.to_string())
+                .unwrap();
+            assert!(request_window(&settings)
+                .unwrap_err()
+                .is::<NonRetryableError>());
+        }
+    }
+    #[tokio::test]
+    async fn failed_pipeline_sink_discards_session_but_preserves_the_original_error() {
+        struct Reject;
+        impl DownloadSink for Reject {
+            fn write(&mut self, _: &[u8]) -> Result<()> {
+                Err(permanent("test local disk failure"))
+            }
+        }
+        let Some((root, connection)) = reconnect_fixture().await else {
+            return;
+        };
+        let expected = connection.stat_file("file.bin").await.unwrap();
+        let error = connection
+            .download("file.bin", 0, &expected, &mut Reject)
+            .await
+            .unwrap_err();
+        assert!(error.is::<NonRetryableError>());
+        assert!(error.is::<DiscardSession>());
+        assert_eq!(error.to_string(), "test local disk failure");
+        assert!(connection.session.lock().await.is_none());
+        assert_eq!(
+            connection.stat_file("file.bin").await.unwrap().size,
+            200_000
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("pids"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+        assert_eq!(connection.recipe.max_requests, 2);
+        Box::new(connection).disconnect().await.unwrap();
+    }
+
 }

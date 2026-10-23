@@ -7,10 +7,12 @@ description = "Event-driven terminal transfer client scaffold"
 
 [dependencies]
 anyhow = "1"
+bytes = "1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
 directories = "6"
 prost = "0.14"
+regex = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "process", "io-util", "net"] }
 tokio-util = "0.7"
 async-trait = "0.1"

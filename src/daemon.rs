@@ -535,6 +535,20 @@ struct AttachmentLease<'a>(&'a Shared);
 impl Drop for AttachmentLease<'_> {
     fn drop(&mut self) {
         if let Ok(mut daemon) = self.0.daemon.lock() {
+            // Modal snapshots belong to this attachment, not background work.
+            // Abrupt EOF/unwind must not leave scans or private files orphaned.
+            let directory_jobs = daemon
+                .jobs
+                .jobs
+                .iter()
+                .filter_map(|(&id, job)| job.directory.is_some().then_some(id))
+                .collect::<Vec<_>>();
+            for id in directory_jobs {
+                daemon.jobs.cancel(id);
+                if let Some(job) = daemon.jobs.jobs.remove(&id) {
+                    let _ = fs::remove_file(job.output.path());
+                }
+            }
             self.0.attached.store(false, Ordering::Release);
             if !daemon.has_running_jobs() {
                 self.0.shutdown.store(true, Ordering::Release);
@@ -619,6 +633,149 @@ fn handle_request(
     let ok = || Ok(Reply::Ok(pb::Empty {}));
     let missing = || rpc_error(pb::ErrorCode::NotFound, "no such job");
     match operation {
+        Op::StartDirectory(request) => {
+            let source = pb::DirectorySource::try_from(request.source)
+                .ok()
+                .filter(|v| *v != pb::DirectorySource::Unspecified)
+                .ok_or_else(|| {
+                    rpc_error(pb::ErrorCode::InvalidRequest, "unknown directory source")
+                })?;
+            let filter = pb::DirectoryFilter::try_from(request.filter).map_err(|_| {
+                rpc_error(pb::ErrorCode::InvalidRequest, "unknown directory filter")
+            })?;
+            let local = daemon.local_directory.clone();
+            let connection = daemon.connection.clone();
+            let slot = Arc::new(Mutex::new(None));
+            let result_slot = slot.clone();
+            let id = daemon.jobs.start_task(
+                "file selector directory listing".into(),
+                move |_, _| async move {
+                    let snapshot = if source == pb::DirectorySource::Local {
+                        crate::directory::Snapshot::local(&local, filter).await?
+                    } else {
+                        let active = connection.lock().await;
+                        let active = active
+                            .as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("not connected; use connect first"))?;
+                        let path = active.resolve_directory(Some("."))?;
+                        let mut snapshot = crate::directory::Snapshot::new(path.clone(), filter)?;
+                        active.list(&path, &mut snapshot).await?;
+                        snapshot.finish()?;
+                        snapshot
+                    };
+                    let snapshot = snapshot.alphabetical()?.await?;
+                    *result_slot.lock().expect("directory result poisoned") = Some(snapshot);
+                    Ok(String::new())
+                },
+            );
+            daemon.jobs.jobs.get_mut(&id).unwrap().directory = Some(slot);
+            Ok(Reply::DirectoryStarted(pb::JobId { id }))
+        }
+        Op::FilterDirectory(request) => {
+            let order = pb::DirectorySort::try_from(request.sort).map_err(|_| {
+                rpc_error(
+                    pb::ErrorCode::InvalidRequest,
+                    "unknown directory sort order",
+                )
+            })?;
+            if request.regexp.len() > 4096 {
+                return Err(rpc_error(
+                    pb::ErrorCode::InvalidRequest,
+                    "file filter exceeds 4096 bytes",
+                ));
+            }
+            let regexp = regex::RegexBuilder::new(&request.regexp)
+                .size_limit(1024 * 1024)
+                .dfa_size_limit(1024 * 1024)
+                .build()
+                .map_err(|error| {
+                    rpc_error(
+                        pb::ErrorCode::InvalidRequest,
+                        format!(
+                            "invalid regexp: {}",
+                            error
+                                .to_string()
+                                .lines()
+                                .last()
+                                .unwrap_or("invalid expression")
+                        ),
+                    )
+                })?;
+            let job = daemon.jobs.jobs.get(&request.job_id).ok_or_else(missing)?;
+            if job.state != JobState::Completed {
+                return Err(operation_error("directory snapshot is not complete"));
+            }
+            let input = job
+                .directory
+                .as_ref()
+                .ok_or_else(|| {
+                    rpc_error(
+                        pb::ErrorCode::InvalidRequest,
+                        "not a directory snapshot job",
+                    )
+                })?
+                .lock()
+                .expect("directory result poisoned");
+            let future = input
+                .as_ref()
+                .ok_or_else(|| operation_error("directory snapshot is unavailable"))?
+                .filtered(regexp, order)
+                .map_err(operation_error)?;
+            drop(input);
+            let slot = Arc::new(Mutex::new(None));
+            let result_slot = slot.clone();
+            let id = daemon.jobs.start_task(
+                "file selector regexp filter".into(),
+                move |_, _| async move {
+                    let snapshot = future.await?;
+                    *result_slot.lock().expect("directory result poisoned") = Some(snapshot);
+                    Ok(String::new())
+                },
+            );
+            daemon.jobs.jobs.get_mut(&id).unwrap().directory = Some(slot);
+            Ok(Reply::DirectoryStarted(pb::JobId { id }))
+        }
+        Op::ReadDirectory(request) => {
+            let job = daemon.jobs.jobs.get(&request.job_id).ok_or_else(missing)?;
+            let slot = job.directory.as_ref().ok_or_else(|| {
+                rpc_error(
+                    pb::ErrorCode::InvalidRequest,
+                    "not a directory snapshot job",
+                )
+            })?;
+            if job.state != JobState::Completed {
+                return Err(operation_error("directory snapshot is not complete"));
+            }
+            let snapshot = slot.lock().expect("directory result poisoned");
+            let snapshot = snapshot
+                .as_ref()
+                .ok_or_else(|| operation_error("directory snapshot is unavailable"))?;
+            Ok(Reply::DirectoryPage(
+                snapshot
+                    .page(request.offset, request.limit)
+                    .map_err(operation_error)?,
+            ))
+        }
+        Op::CloseDirectory(job) => {
+            let value = daemon.jobs.jobs.get(&job.id).ok_or_else(missing)?;
+            if value.directory.is_none() {
+                return Err(rpc_error(
+                    pb::ErrorCode::InvalidRequest,
+                    "not a directory snapshot job",
+                ));
+            }
+            let output = value.output.path().to_owned();
+            // The task owns a cancellation token and its private partial snapshot.
+            // Removing its public job immediately is safe: late events are ignored.
+            daemon.jobs.cancel(job.id);
+            daemon.jobs.jobs.remove(&job.id);
+            match fs::remove_file(output) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(operation_error(error)),
+            }
+            ok()
+        }
         Op::ClaimStartup(_) => Ok(Reply::Startup(pb::StartupResult {
             run: !shared.startup_claimed.swap(true, Ordering::AcqRel),
         })),
@@ -1297,5 +1454,54 @@ mod tests {
         daemon.command("disconnect");
         finish(&mut daemon).await;
         assert!(daemon.connection.lock().await.is_none());
+    }
+    #[tokio::test]
+    async fn attachment_release_cancels_modal_scans_but_not_background_jobs() {
+        let daemon = Daemon::bootstrap().unwrap();
+        let connection = daemon.connection.clone();
+        let _busy = connection.lock().await;
+        let shared = Shared {
+            attached: Arc::new(AtomicBool::new(true)),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            startup_claimed: Arc::new(AtomicBool::new(false)),
+            daemon: Arc::new(Mutex::new(daemon)),
+        };
+        let reply = handle_request(
+            &shared,
+            crate::ipc::Op::StartDirectory(crate::ipc::pb::DirectoryRequest {
+                source: crate::ipc::pb::DirectorySource::Remote as i32,
+                filter: 0,
+            }),
+            &tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+        let crate::ipc::Reply::DirectoryStarted(id) = reply else {
+            panic!()
+        };
+        let (slot, background) = {
+            let mut daemon = shared.daemon.lock().unwrap();
+            let slot = Arc::downgrade(daemon.jobs.jobs[&id.id].directory.as_ref().unwrap());
+            let background = daemon
+                .jobs
+                .start_operation("background".into(), std::future::pending());
+            (slot, background)
+        };
+        tokio::task::yield_now().await;
+        drop(AttachmentLease(&shared));
+        assert!(!shared.attached.load(Ordering::Acquire));
+        assert!(!shared.shutdown.load(Ordering::Acquire));
+        {
+            let daemon = shared.daemon.lock().unwrap();
+            assert!(!daemon.jobs.jobs.contains_key(&id.id));
+            assert!(daemon.jobs.jobs.contains_key(&background));
+        }
+        for _ in 0..20 {
+            if slot.upgrade().is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(slot.upgrade().is_none());
+        shared.daemon.lock().unwrap().jobs.cancel(background);
     }
 }

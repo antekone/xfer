@@ -263,6 +263,84 @@ impl<S: Read + Write> Client<S> {
             _ => self.unexpected(),
         }
     }
+    /// Start a fresh directory snapshot. Poll its job before reading pages;
+    /// close_directory also cancels in-progress scans and releases their files.
+    pub fn start_directory(
+        &mut self,
+        source: pb::DirectorySource,
+        filter: pb::DirectoryFilter,
+    ) -> Result<u64> {
+        match self.call(Op::StartDirectory(pb::DirectoryRequest {
+            source: source as i32,
+            filter: filter as i32,
+        }))? {
+            Reply::DirectoryStarted(value) if value.id != 0 => Ok(value.id),
+            _ => self.unexpected(),
+        }
+    }
+    pub fn directory_page(
+        &mut self,
+        job_id: u64,
+        offset: u64,
+        limit: u32,
+    ) -> Result<pb::DirectoryPage> {
+        match self.call(Op::ReadDirectory(pb::DirectoryPageRequest {
+            job_id,
+            offset,
+            limit,
+        }))? {
+            Reply::DirectoryPage(value)
+                if value.entries.len() <= 256
+                    && (limit == 0 || value.entries.len() <= limit as usize)
+                    && offset.checked_add(value.entries.len() as u64)
+                        == Some(value.next_offset)
+                    && value.next_offset <= value.total
+                    && value.eof == (value.next_offset == value.total)
+                    && (value.eof || !value.entries.is_empty())
+                    && value
+                        .entries
+                        .iter()
+                        .map(|entry| entry.index)
+                        .collect::<std::collections::HashSet<_>>()
+                        .len()
+                        == value.entries.len()
+                    && value.entries.iter().all(|entry| {
+                        !entry.name.is_empty()
+                            && entry.name.len() <= 64 * 1024
+                            && !matches!(entry.name.as_str(), "." | "..")
+                            && !entry.name.contains('/')
+                            && !entry.name.chars().any(char::is_control)
+                            && !(entry.directory && entry.regular_file)
+                    }) =>
+            {
+                Ok(value)
+            }
+            _ => self.unexpected(),
+        }
+    }
+    /// Build a filtered view of a completed snapshot, retaining original entry
+    /// indices for selections. This is a cancellable job, not a backend rescan.
+    pub fn filter_directory(&mut self, job_id: u64, regexp: &str) -> Result<u64> {
+        self.filter_directory_sorted(job_id, regexp, pb::DirectorySort::NameAsc)
+    }
+    pub fn filter_directory_sorted(
+        &mut self,
+        job_id: u64,
+        regexp: &str,
+        sort: pb::DirectorySort,
+    ) -> Result<u64> {
+        match self.call(Op::FilterDirectory(pb::DirectoryRegexRequest {
+            job_id,
+            regexp: regexp.into(),
+            sort: sort as i32,
+        }))? {
+            Reply::DirectoryStarted(value) if value.id != 0 => Ok(value.id),
+            _ => self.unexpected(),
+        }
+    }
+    pub fn close_directory(&mut self, job_id: u64) -> Result<()> {
+        self.ok(Op::CloseDirectory(pb::JobId { id: job_id }))
+    }
     pub fn unexpected<T>(&mut self) -> Result<T> {
         self.failed = true;
         bail!("unexpected daemon IPC response");
@@ -530,5 +608,81 @@ mod tests {
         let chunk = client.output(1, 0).unwrap();
         assert_eq!(chunk.data, data);
         assert!(chunk.eof);
+    }
+    #[test]
+    fn invalid_directory_pages_poison_the_client_instead_of_spinning_or_inserting_unsafe_names() {
+        for page in [
+            pb::DirectoryPage {
+                total: 1,
+                eof: false,
+                ..Default::default()
+            },
+            pb::DirectoryPage {
+                next_offset: 1,
+                total: 0,
+                eof: true,
+                ..Default::default()
+            },
+            pb::DirectoryPage {
+                entries: vec![pb::DirectoryEntry {
+                    name: "../escape".into(),
+                    ..Default::default()
+                }],
+                next_offset: 1,
+                total: 1,
+                eof: true,
+                ..Default::default()
+            },
+            pb::DirectoryPage {
+                entries: vec![pb::DirectoryEntry {
+                    name: "a\ncommand".into(),
+                    ..Default::default()
+                }],
+                next_offset: 1,
+                total: 1,
+                eof: true,
+                ..Default::default()
+            },
+        ] {
+            let bytes = response(1, Reply::DirectoryPage(page));
+            let mut client = Client::new(Scripted {
+                input: Cursor::new(bytes),
+                output: Vec::new(),
+            });
+            assert!(client.directory_page(1, 0, 100).is_err());
+            assert!(client.failed);
+        }
+    }
+    #[test]
+    fn sorted_directory_pages_allow_nonmonotonic_stable_ids_but_reject_duplicates() {
+        for (second, valid) in [(0, true), (99, false)] {
+            let page = pb::DirectoryPage {
+                entries: vec![
+                    pb::DirectoryEntry {
+                        name: "b".into(),
+                        index: 99,
+                        size: Some(123),
+                        ..Default::default()
+                    },
+                    pb::DirectoryEntry {
+                        name: "a".into(),
+                        index: second,
+                        size: Some(0),
+                        ..Default::default()
+                    },
+                ],
+                next_offset: 2,
+                total: 2,
+                eof: true,
+                ..Default::default()
+            };
+            let bytes = response(1, Reply::DirectoryPage(page));
+            let mut client = Client::new(Scripted {
+                input: Cursor::new(bytes),
+                output: Vec::new(),
+            });
+            assert_eq!(client.directory_page(1, 0, 256).is_ok(), valid);
+            assert_eq!(client.failed, !valid);
+        }
     }
 }

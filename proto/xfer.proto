@@ -24,6 +24,24 @@ enum CompletionKind {
 message OutputRequest { uint64 job_id = 1; uint64 offset = 2; }
 message JobsRequest { uint64 after_id = 1; uint32 limit = 2; }
 message SettingsRequest { optional string name = 1; }
+// Fresh, non-recursive snapshots. Poll the returned job, then read pages.
+// CloseDirectory cancels/removes the snapshot job, including while scanning.
+enum DirectorySource { DIRECTORY_SOURCE_UNSPECIFIED = 0; LOCAL = 1; REMOTE = 2; }
+enum DirectoryFilter { ALL = 0; DIRECTORIES = 1; REGULAR_FILES = 2; }
+message DirectoryRequest { DirectorySource source = 1; DirectoryFilter filter = 2; }
+message DirectoryPageRequest { uint64 job_id = 1; uint64 offset = 2; uint32 limit = 3; }
+// index is the stable original snapshot index, even in a filtered view.
+message DirectoryEntry { string name = 1; bool directory = 2; bool regular_file = 3; uint64 index = 4; optional uint64 size = 5; }
+enum DirectorySort { NAME_ASC = 0; NAME_DESC = 1; SIZE_DESC = 2; SIZE_ASC = 3; }
+message DirectoryRegexRequest { uint64 job_id = 1; string regexp = 2; DirectorySort sort = 3; }
+message DirectoryPage {
+  repeated DirectoryEntry entries = 1;
+  uint64 next_offset = 2;
+  bool eof = 3;
+  uint64 total = 4;
+  uint64 skipped = 5;
+  string path = 6;
+}
 message Request {
   uint32 version = 1;
   uint64 id = 2;
@@ -45,6 +63,10 @@ message Request {
     JobId cancel = 24;
     JobsRequest jobs = 25;
     SettingsRequest settings = 26;
+    DirectoryRequest start_directory = 27;
+    DirectoryPageRequest read_directory = 28;
+    JobId close_directory = 29;
+    DirectoryRegexRequest filter_directory = 30;
   }
 }
 message Response {
@@ -63,6 +85,8 @@ message Response {
     OutputChunk output = 19;
     JobsResult jobs = 20;
     SettingsResult settings = 21;
+    JobId directory_started = 22;
+    DirectoryPage directory_page = 23;
     Error error = 30;
   }
 }

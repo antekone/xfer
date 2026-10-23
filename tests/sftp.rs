@@ -1027,3 +1027,121 @@ fn stored_sftp_bookmark_password_uses_askpass_without_prompt_or_credential_outpu
     let response = daemon.command("close");
     daemon.finish(response, true);
 }
+
+#[test]
+fn remote_picker_snapshots_include_hidden_names_and_literal_wildcard_files_transfer_exactly() {
+    let Some(mut daemon) = Daemon::start() else {
+        return;
+    };
+    fs::write(daemon.remote().join(".hidden"), b"hidden").unwrap();
+    fs::write(daemon.remote().join("literal*.txt"), b"exact").unwrap();
+    fs::write(daemon.remote().join("literal-extra.txt"), b"not-selected").unwrap();
+    daemon.connect("test-secret", true);
+    let id = daemon
+        .client
+        .start_directory(pb::DirectorySource::Remote, pb::DirectoryFilter::All)
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while daemon.client.job(id).unwrap().state == pb::JobState::Running as i32 {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let page = daemon.client.directory_page(id, 0, 256).unwrap();
+    assert!(page.eof);
+    assert_eq!(
+        page.entries
+            .iter()
+            .find(|entry| entry.name == "literal*.txt")
+            .unwrap()
+            .size,
+        Some(5)
+    );
+    assert_eq!(
+        page.entries
+            .iter()
+            .find(|entry| entry.name == "photos")
+            .unwrap()
+            .size,
+        None
+    );
+
+    assert!(page.entries.iter().any(|entry| entry.name == ".hidden"));
+    assert!(page
+        .entries
+        .iter()
+        .any(|entry| entry.name == "photos" && entry.directory));
+    assert!(!page
+        .entries
+        .iter()
+        .any(|entry| entry.name.contains('/') || entry.name == "image.txt"));
+    daemon.client.close_directory(id).unwrap();
+    let local = daemon.root.path().join("literal downloads");
+    fs::create_dir(&local).unwrap();
+    daemon.command(&format!(
+        "lcd {}",
+        shlex::try_quote(local.to_str().unwrap()).unwrap()
+    ));
+    let response = daemon.command("get './literal*.txt'");
+    daemon.finish(response, true);
+    assert_eq!(fs::read(local.join("literal*.txt")).unwrap(), b"exact");
+    assert!(!local.join("literal-extra.txt").exists());
+    fs::remove_file(daemon.remote().join("literal*.txt")).unwrap();
+    let response = daemon.command("put './literal*.txt'");
+    daemon.finish(response, true);
+    assert_eq!(
+        fs::read(daemon.remote().join("literal*.txt")).unwrap(),
+        b"exact"
+    );
+}
+
+#[test]
+fn pipelined_sftp_round_trips_multiple_windows_and_validates_settings_before_jobs() {
+    let Some(mut daemon) = Daemon::start() else {
+        return;
+    };
+    daemon.client.command("set sftp:max-requests 0").unwrap();
+    assert!(daemon
+        .client
+        .command("open sftp://user@example.invalid")
+        .is_err());
+    assert!(!daemon.root.path().join("ssh-pids").exists());
+    assert!(daemon.command("jobs").is_empty());
+    daemon.client.command("set sftp:max-requests 64").unwrap();
+    let data = (0..12 * 1024 * 1024 + 123)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    fs::write(daemon.remote().join("blob.bin"), &data).unwrap();
+    let local = daemon.root.path().join("pipeline-downloads");
+    fs::create_dir(&local).unwrap();
+    fs::write(local.join("blob.bin"), &data[..7777]).unwrap();
+    daemon.connect("test-secret", true);
+    daemon.command(&format!(
+        "lcd {}",
+        shlex::try_quote(local.to_str().unwrap()).unwrap()
+    ));
+    let response = daemon.command("get -c blob.bin");
+    daemon.finish(response, true);
+    assert_eq!(fs::read(local.join("blob.bin")).unwrap(), data);
+    fs::rename(local.join("blob.bin"), local.join("upload.bin")).unwrap();
+    let response = daemon.command("put upload.bin");
+    daemon.finish(response, true);
+    assert_eq!(fs::read(daemon.remote().join("upload.bin")).unwrap(), data);
+    let response = daemon.command("put upload.bin");
+    daemon.finish(response, false);
+    assert_eq!(fs::read(daemon.remote().join("upload.bin")).unwrap(), data);
+    daemon.command("set xfer:clobber true");
+    fs::write(local.join("upload.bin"), b"replace").unwrap();
+    let response = daemon.command("put upload.bin");
+    daemon.finish(response, true);
+    assert_eq!(
+        fs::read(daemon.remote().join("upload.bin")).unwrap(),
+        b"replace"
+    );
+    assert_eq!(
+        fs::read_to_string(daemon.root.path().join("ssh-pids"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+}

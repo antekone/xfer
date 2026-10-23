@@ -469,3 +469,140 @@ fn job_pages_also_obey_the_byte_budget_before_building_large_responses() {
         expected
     );
 }
+
+#[test]
+fn directory_snapshots_are_fresh_paged_and_closed_without_completion_limits() {
+    let root = tempfile::tempdir().unwrap();
+    let files = root.path().join("files");
+    fs::create_dir(&files).unwrap();
+    for index in 0..2500 {
+        fs::write(files.join(format!("file{index}")), b"").unwrap();
+    }
+    fs::write(files.join(".hidden 日本語"), b"").unwrap();
+    fs::create_dir(files.join("subdir")).unwrap();
+    fs::write(files.join("subdir/not-recursive"), b"").unwrap();
+    let server = Server::start(root.path());
+    let mut client = server.attach();
+    client
+        .ok(Op::SetLocalCwd(pb::Path {
+            path: files.to_str().unwrap().into(),
+        }))
+        .unwrap();
+    let id = client
+        .start_directory(pb::DirectorySource::Local, pb::DirectoryFilter::All)
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while client.job(id).unwrap().state == pb::JobState::Running as i32 {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        client.job(id).unwrap().state,
+        pb::JobState::Completed as i32
+    );
+    fs::write(files.join("created-after-snapshot"), b"").unwrap();
+    let mut offset = 0;
+    let mut names = Vec::new();
+    loop {
+        let page = client.directory_page(id, offset, 97).unwrap();
+        assert_eq!(page.total, 2502);
+        assert!(page.entries.len() <= 97);
+        assert_eq!(page.path, files.to_str().unwrap());
+        names.extend(page.entries.into_iter().map(|entry| entry.name));
+        offset = page.next_offset;
+        if page.eof {
+            break;
+        }
+    }
+    assert_eq!(names.len(), 2502);
+    assert!(names.windows(2).all(|pair| pair[0] <= pair[1]));
+    let reversed = client
+        .filter_directory_sorted(id, ".*", pb::DirectorySort::NameDesc)
+        .unwrap();
+    while client.job(reversed).unwrap().state == pb::JobState::Running as i32 {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let reverse_page = client.directory_page(reversed, 0, 97).unwrap();
+    assert_eq!(reverse_page.entries[0].name, *names.last().unwrap());
+    assert!(reverse_page
+        .entries
+        .windows(2)
+        .all(|pair| pair[0].index > pair[1].index));
+    assert!(reverse_page
+        .entries
+        .iter()
+        .all(|entry| entry.directory || entry.size == Some(0)));
+    client.close_directory(reversed).unwrap();
+
+    assert!(names.contains(&".hidden 日本語".to_string()));
+    assert!(!names
+        .iter()
+        .any(|name| name.contains("not-recursive") || name == "created-after-snapshot"));
+    assert!(client.directory_page(id, offset + 1, 1).is_err());
+    assert!(client.session().is_ok());
+    let filtered = client.filter_directory(id, r"^file24[0-9]{2}$").unwrap();
+    while client.job(filtered).unwrap().state == pb::JobState::Running as i32 {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let matches = client.directory_page(filtered, 0, 256).unwrap();
+    assert_eq!(matches.total, 100);
+    for entry in &matches.entries {
+        assert_eq!(
+            entry.index,
+            names.iter().position(|name| name == &entry.name).unwrap() as u64
+        );
+    }
+    assert!(client.filter_directory(id, "[").is_err());
+    assert!(client
+        .call(Op::FilterDirectory(pb::DirectoryRegexRequest {
+            job_id: id,
+            regexp: ".*".into(),
+            sort: 999
+        }))
+        .is_err());
+
+    assert!(client.filter_directory(id, &"x".repeat(4097)).is_err());
+    assert!(client.session().is_ok());
+    client.close_directory(filtered).unwrap();
+    client.close_directory(id).unwrap();
+    assert!(client.job(id).is_err());
+    let id = client
+        .start_directory(pb::DirectorySource::Local, pb::DirectoryFilter::Directories)
+        .unwrap();
+    while client.job(id).unwrap().state == pb::JobState::Running as i32 {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let page = client.directory_page(id, 0, 0).unwrap();
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.entries[0].name, "subdir");
+    // Close also works immediately, without waiting for a new scan to finish.
+    client.close_directory(id).unwrap();
+    let id = client
+        .start_directory(pb::DirectorySource::Local, pb::DirectoryFilter::All)
+        .unwrap();
+    client.close_directory(id).unwrap();
+    assert!(client.job(id).is_err());
+    let error = client
+        .call(Op::StartDirectory(pb::DirectoryRequest {
+            source: 0,
+            filter: 0,
+        }))
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<ipc::RemoteError>().unwrap().code,
+        pb::ErrorCode::InvalidRequest
+    );
+    assert!(client.session().is_ok());
+    // Snapshot-specific close/read operations cannot remove unrelated jobs.
+    let result = client.command("pwd").unwrap();
+    let Some(pb::command_result::Action::JobStarted(ordinary)) = result.action else {
+        panic!()
+    };
+    assert!(client.close_directory(ordinary.id).is_err());
+    assert!(client.directory_page(ordinary.id, 0, 1).is_err());
+    assert!(client.job(ordinary.id).is_ok());
+    assert!(client.session().is_ok());
+}

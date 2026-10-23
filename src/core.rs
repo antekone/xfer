@@ -170,6 +170,8 @@ pub struct Job {
     pub progress: watch::Receiver<Progress>,
     pub output: OutputStore,
     pub(crate) raw_output: bool,
+    pub(crate) directory:
+        Option<std::sync::Arc<std::sync::Mutex<Option<crate::directory::Snapshot>>>>,
     pub(crate) started: time::Instant,
     _handle: JoinHandle<()>,
 }
@@ -328,6 +330,7 @@ impl JobManager {
                 progress,
                 output,
                 raw_output,
+                directory: None,
                 _handle: handle,
                 started: time::Instant::now(),
             },
@@ -397,6 +400,7 @@ impl JobManager {
                 progress,
                 output: OutputStore::new(id),
                 raw_output: false,
+                directory: None,
                 _handle: handle,
                 started: time::Instant::now(),
             },

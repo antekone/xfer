@@ -78,6 +78,9 @@ fn start(
             bookmark.as_ref(),
         )?;
     }
+    if token == "sftp" {
+        crate::sftp::request_window(&app.settings)?;
+    }
     if token == "smb" {
         crate::smb::validate_target(
             bookmark

@@ -126,6 +126,44 @@ impl CommandLine {
         self.cursor += clean.len();
     }
 
+    /// Append quoted operands without replacing manual arguments, regardless
+    /// of caret position. Reject unfinished quoting rather than changing it.
+    fn insert_selection(&mut self, tokens: &str) -> Result<()> {
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        if shlex::split(&self.text).is_none() {
+            anyhow::bail!("finish quotes or escapes before appending selected filenames");
+        }
+        let separated = self.text.chars().next_back().is_some_and(|ch| {
+            matches!(ch, ' ' | '\t' | '\r' | '\n')
+                && self.text[..self.text.len() - ch.len_utf8()]
+                    .chars()
+                    .rev()
+                    .take_while(|&c| c == '\\')
+                    .count()
+                    % 2
+                    == 0
+        });
+        let separator = !self.text.is_empty() && !separated;
+        if self
+            .text
+            .len()
+            .saturating_add(tokens.len())
+            .saturating_add(usize::from(separator))
+            > ipc::MAX_FRAME - 1024
+        {
+            anyhow::bail!("selected filenames would exceed the command IPC limit");
+        }
+        if separator {
+            self.text.push(' ');
+        }
+        self.text.push_str(tokens);
+        self.cursor = self.text.len();
+        self.view_start = 0;
+        Ok(())
+    }
+
     /// Replace the completed prefix and the remainder of its active token,
     /// preserving subsequent arguments and placing the caret after completion.
     fn complete(&mut self, prefix: String) {
@@ -529,6 +567,37 @@ fn redraw_command(command: &mut CommandLine, prompt: &str, clear: bool) -> Resul
     Ok(())
 }
 
+fn selector_context(
+    client: &mut Connection,
+    command: &str,
+) -> Result<(pb::DirectorySource, pb::DirectoryFilter)> {
+    use pb::{DirectoryFilter as F, DirectorySource as S};
+    if command.starts_with('!') {
+        return Ok((S::Local, F::All));
+    }
+    let verb = command.split_whitespace().next().unwrap_or("");
+    match commands::completion_for(verb) {
+        Completion::LocalPath {
+            kind: pb::CompletionKind::LocalFile,
+            ..
+        } => Ok((S::Local, F::RegularFiles)),
+        Completion::LocalPath { .. } => Ok((S::Local, F::Directories)),
+        Completion::RemotePath {
+            kind: pb::CompletionKind::RemoteDirectory,
+            ..
+        } => Ok((S::Remote, F::Directories)),
+        Completion::RemotePath { .. } => Ok((S::Remote, F::All)),
+        _ => Ok((
+            if client.session()?.protocol.is_some() {
+                S::Remote
+            } else {
+                S::Local
+            },
+            F::All,
+        )),
+    }
+}
+
 pub(super) fn read_attached_command(
     client: &mut Connection,
     prompt: &str,
@@ -601,6 +670,24 @@ pub(super) fn read_attached_command(
                 command.clear();
             }
             KeyCode::Char('l') if key.modifiers == KeyModifiers::CONTROL => clear = true,
+            KeyCode::Char('s') if key.modifiers == KeyModifiers::CONTROL => {
+                use super::file_selector::{self, Selection};
+                let (source, filter) = selector_context(client, command.as_str())?;
+                match file_selector::select(client, source, filter) {
+                    Ok(Selection::Accepted(tokens)) => match command.insert_selection(&tokens) {
+                        Ok(()) => history_cursor = None,
+                        Err(error) => print!("\r\nfile selector: {error}\r\n"),
+                    },
+                    Ok(Selection::Cancelled) => {}
+                    Ok(Selection::Notice(message)) => {
+                        print!("\r\nfile selector: {}\r\n", printable(&message))
+                    }
+                    Err(error) if error.is::<ipc::RemoteError>() => {
+                        print!("\r\nfile selector: {}\r\n", printable(&error.to_string()))
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
             KeyCode::Tab => {
                 let mut prefix = command.prefix().to_owned();
                 let notices = complete_command(client, &mut prefix)?;
@@ -678,6 +765,104 @@ mod tests {
     use crate::test_support::rpc_pair;
     use crossterm::event::KeyEvent;
     use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn selector_appends_and_preserves_all_manual_arguments_regardless_of_caret() {
+        for (text, prefix, expected) in [
+            ("get", "get", "get 'a b' 界.txt"),
+            ("get ", "get ", "get 'a b' 界.txt"),
+            ("get old", "get old", "get old 'a b' 界.txt"),
+            ("get old later", "get ol", "get old later 'a b' 界.txt"),
+            (
+                "get 'manual file' later",
+                "get 'man",
+                "get 'manual file' later 'a b' 界.txt",
+            ),
+            ("get abc\\ ", "get abc\\ ", "get abc\\  'a b' 界.txt"),
+            ("get foo\u{a0}", "get ", "get foo\u{a0} 'a b' 界.txt"),
+            (
+                "get 界日本.txt later ",
+                "get 界",
+                "get 界日本.txt later 'a b' 界.txt",
+            ),
+        ] {
+            let mut line = CommandLine::new(text.into());
+            line.cursor = prefix.len();
+            line.insert_selection("'a b' 界.txt").unwrap();
+            assert_eq!(line.as_str(), expected, "input {text}, prefix {prefix}");
+            let mut expected_words = shlex::split(text).unwrap();
+            expected_words.extend(["a b".into(), "界.txt".into()]);
+            assert_eq!(shlex::split(line.as_str()).unwrap(), expected_words);
+            assert_eq!(line.cursor, line.text.len());
+        }
+        let mut line = CommandLine::new("get 'unfinished".into());
+        assert!(line.insert_selection("chosen").is_err());
+        assert_eq!(line.as_str(), "get 'unfinished");
+    }
+    #[test]
+    fn empty_or_oversized_selection_never_changes_text_or_caret() {
+        let mut line = CommandLine::new("get 界.txt later".into());
+        line.cursor = "get 界".len();
+        let original = (line.text.clone(), line.cursor, line.view_start);
+        line.insert_selection("").unwrap();
+        assert_eq!((line.text.clone(), line.cursor, line.view_start), original);
+        assert!(line.insert_selection(&"x".repeat(ipc::MAX_FRAME)).is_err());
+        assert_eq!((line.text.clone(), line.cursor, line.view_start), original);
+    }
+    #[test]
+    fn selector_scope_uses_command_registry_and_disconnected_fallback() {
+        let (mut client, worker) = rpc_pair(2, |_| Reply::Session(pb::Session::default()));
+        for (command, source, filter) in [
+            (
+                "put ",
+                pb::DirectorySource::Local,
+                pb::DirectoryFilter::RegularFiles,
+            ),
+            (
+                "lcd ",
+                pb::DirectorySource::Local,
+                pb::DirectoryFilter::Directories,
+            ),
+            (
+                "!cat ",
+                pb::DirectorySource::Local,
+                pb::DirectoryFilter::All,
+            ),
+            (
+                "cd ",
+                pb::DirectorySource::Remote,
+                pb::DirectoryFilter::Directories,
+            ),
+            (
+                "get -c ",
+                pb::DirectorySource::Remote,
+                pb::DirectoryFilter::All,
+            ),
+            ("", pb::DirectorySource::Local, pb::DirectoryFilter::All),
+            (
+                "help ",
+                pb::DirectorySource::Local,
+                pb::DirectoryFilter::All,
+            ),
+        ] {
+            assert_eq!(
+                selector_context(&mut client, command).unwrap(),
+                (source, filter)
+            );
+        }
+        worker.join().unwrap();
+        let (mut client, worker) = rpc_pair(1, |_| {
+            Reply::Session(pb::Session {
+                protocol: Some("sftp".into()),
+                ..Default::default()
+            })
+        });
+        assert_eq!(
+            selector_context(&mut client, "").unwrap().0,
+            pb::DirectorySource::Remote
+        );
+        worker.join().unwrap();
+    }
 
     #[test]
     fn persistent_history_loads_appends_and_ignores_empty_commands() {

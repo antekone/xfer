@@ -1,5 +1,6 @@
 mod cli;
 mod daemon_client;
+mod file_selector;
 mod line_reader;
 #[cfg(test)]
 mod test_support;

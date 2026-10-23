@@ -55,6 +55,7 @@ The configuration format is `name: value`, including namespaced keys:
 ssl:skip-validation: false
 ui:auto-pager: true
 sftp:connect-timeout: 30
+sftp:max-requests: 64
 s3:region: us-east-1
 smb:max-credits: 32
 ```
@@ -504,6 +505,38 @@ remain non-retryable. Connection errors include the target, failed setup step,
 underlying cause, SSH exit status (when available), and captured SSH stderr;
 supplied passwords are redacted.
 
+Downloads and uploads pipeline up to **64 concurrent requests** by default,
+using bounded 64 KiB application chunks rather than waiting for each individual
+chunk's round trip. The protocol library respects the server's negotiated
+read/write limits, including older servers with smaller packets. Downloads write
+completed chunks in file order, so interrupted transfers retain a contiguous
+prefix for exact resume. Uploads use explicit non-overlapping offsets, zero-copy
+protocol buffers, and wait for every write acknowledgement and close before
+reporting success. New requests are submitted immediately as the window refills.
+
+`sftp:max-requests` accepts **1..256** (default **64**). It is frozen when connecting;
+reconnect after changing it. For a high-latency/high-bandwidth link, try `128` or
+`256`; `1` restores serial operation for troubleshooting. The default window holds
+at most 4 MiB of chunk payload (16 MiB at 256), plus bounded protocol buffers.
+Actual throughput still depends on the SSH channel, encryption CPU, server, disk,
+and network; no setting can exceed their limits. Rebuild and restart an old
+running daemon to use the new transfer code—reattaching alone does not update it.
+
+Uploads open a regular local file without following its final symlink, freeze its
+length, and check size plus high-resolution modification/change times afterward.
+A changed source fails instead of silently growing/truncating the upload. These
+checks are not an atomic snapshot. Failed/cancelled uploads can leave remote
+partial files and do not resume in place; exclusive creation remains the default,
+with overwrite only when `xfer:clobber` is enabled. Interrupted pipelines discard
+their session even for permanent local errors, preventing abandoned requests from
+contaminating the next operation while preserving the original error/retry policy.
+
+The deterministic SFTP protocol test models 65 ms reply latency, compares request
+windows 1/16/64 in both directions, and checks exact bytes, short/out-of-order
+responses, clobber behavior, changed files, cancellation, and legacy packet limits.
+Run it with `cargo test --lib sftp::transfer::tests -- --nocapture`. This is a
+controlled latency test, not a claimed speed for every remote server.
+
 SFTP downloads compare the opened file's size and modification time before/after
 reading and on retries. Unlike S3's `If-Match` conditional reads, these checks are
 not atomic and timestamps have second resolution: same-size changes with an
@@ -811,6 +844,79 @@ with `builddylib-ci/` and `builddylib-remote-ci/` becomes `cd builddylib-`.
 Common prefixes are computed before shell quoting, on Unicode character
 boundaries. A partial/limited cached listing does not auto-extend the prefix,
 since it may be missing other matches.
+
+### Ctrl-S filename selector
+
+At the command prompt, **Ctrl-S** opens a full-screen text listbox for the
+current directory. It is non-recursive and includes hidden entries:
+
+```text
+> [X] first file.txt
+  [ ] folder/
+  [X] 日本語.txt
+```
+
+- **Up/Down** or **j/k** moves the focus; **PageUp/Ctrl-B**, **PageDown/Ctrl-F**,
+  and **Home/End** scroll.
+- **Space** selects/deselects the focused entry.
+- **s** cycles sorting: **name A–Z** (default), **name Z–A**, **largest first**,
+  **smallest first**. Names use case-sensitive Unicode ordering; equal sizes
+  are ordered by name, and unavailable sizes always sort last.
+- **/** enters live regexp filtering, initially `.*` (everything). The first
+  typed text replaces the previous pattern; Backspace edits and Ctrl-U clears.
+  Results update while typing. **Enter** applies the filter without closing the
+  dialog; **Esc** reverts to the previously applied filter. Invalid expressions
+  show an error, keep the last valid preview, and cannot be applied.
+- Outside filtering mode, **Enter** appends selected names as separate,
+  shell-quoted arguments. It does **not** execute the command; press Enter again
+  at the command prompt to submit it.
+- Outside filtering mode, **Esc** or **Ctrl-C** cancels, preserving the original
+  command and caret.
+  Accepting an empty selection also leaves the command unchanged.
+
+`put` selects regular files in the daemon's logical Local CWD, excluding final
+symlinks and special files. `lcd` selects local directories; `cd` and other
+remote-directory commands select remote directories. `!` commands use the
+logical Local CWD. Other commands use the remote directory when connected,
+otherwise the local directory. Directories are displayed/inserted with `/`.
+
+The size column shows human-readable file sizes, `<DIR>` for directories, and
+`?` when a file size is unavailable. The footer counts checked files and sums
+their known sizes, including checked entries hidden by the current regexp.
+Directories are counted separately and never scanned recursively for totals;
+unknown file sizes are reported explicitly rather than treated as zero. Empty
+files have a known size of `0 B`. Totals use overflow-safe arithmetic.
+
+Acceptance always preserves the existing command and all manually entered
+filenames, appending at the end regardless of caret position. A separator is
+added when needed, so `get manual.txt` cannot become `get manual.txtselected.txt`.
+Unfinished quotes/escapes must be closed before appending; otherwise the line is
+left unchanged with a diagnostic. Cancelling preserves both text and caret.
+Names starting with `-` or `~`, or containing `*`/`?`, get an explicit `./` prefix so they cannot
+be mistaken for options, home expansion, or basename wildcard patterns.
+`get`/`put` treat `./`-prefixed operands literally, including wildcard characters.
+
+Regexp matching uses Rust `regex` syntax on basenames (case-sensitive by
+default; `(?i)` enables case-insensitive matching). Patterns are limited to
+4096 UTF-8 bytes with bounded regex compilation memory; look-around and
+backreferences are unsupported. Filtering streams over the original disk-backed
+snapshot in cancellable jobs; sorting uses bounded-memory external merge runs.
+Neither operation rescans the remote server or truncates to
+TAB's completion limit. Selections retain their identity across filters, even
+when filtered out, and all selected entries are appended on acceptance.
+
+Each opening takes a fresh disk-backed snapshot, independent of TAB's bounded
+completion cache. Entries initially sort by name A–Z; there is no fixed entry-count
+limit, and only a visible page is held in client memory. Loading is cancellable;
+partial/failed listings are never offered as complete results. Unsafe control
+characters, non-UTF-8 names and unrepresentable names are skipped with a count.
+Selections are limited to 64 KiB of quoted arguments, and insertion must fit the
+1 MiB IPC command limit. Closing the selector releases its private snapshot.
+Terminal resizing is supported, and the original screen and input mode are
+restored on close. Ctrl-S is not active in password prompts or foreground jobs.
+
+The real-terminal regression test is `cargo test --test selector_pty`; it needs
+Python 3 and an installed OpenSSH `sftp-server` and otherwise skips explicitly.
 
 ### Prompt and daemon status
 

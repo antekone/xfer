@@ -68,7 +68,11 @@ impl ListingSink for Files {
 }
 
 async fn expand_remote(connection: &dyn Connection, args: GetArgs) -> Result<GetArgs> {
-    if !args.files.iter().any(|file| has_wildmat(file)) {
+    if !args
+        .files
+        .iter()
+        .any(|file| !file.starts_with("./") && has_wildmat(file))
+    {
         return Ok(args);
     }
     let mut files = Files(Vec::new());
@@ -76,7 +80,7 @@ async fn expand_remote(connection: &dyn Connection, args: GetArgs) -> Result<Get
     files.0.sort();
     let mut expanded = Vec::new();
     for input in args.files {
-        if !has_wildmat(&input) {
+        if input.starts_with("./") || !has_wildmat(&input) {
             expanded.push(input);
             continue;
         }

@@ -22,3 +22,4 @@ pub mod core;
 
 mod local_path;
 mod prompt;
+mod directory;

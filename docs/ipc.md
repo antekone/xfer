@@ -76,6 +76,8 @@ The schema provides typed operations for:
 - Session information and logical Local CWD (query/set).
 - Completion, with an enum distinguishing bookmarks, remote paths/directories,
   and local files/directories. Results include a truncation flag.
+- Fresh non-recursive local/remote directory snapshot jobs, bounded entry pages,
+  regexp-filtered views, and explicit close/cancellation (used by Ctrl-S).
 - Executing the existing command language through the single command registry.
 - Supplying an interactive connection password separately from command text.
 - Reading a job or a bounded, ordered page of jobs; typed job state and
@@ -104,6 +106,77 @@ present when more jobs remain. This is a live view, not an immutable snapshot:
 new jobs may appear and acknowledged jobs may disappear between pages.
 Responses over the framing cap yield `RESPONSE_TOO_LARGE`; narrow the query or
 request a smaller page.
+
+## Directory snapshots
+
+`start_directory` accepts a `DirectorySource` (`LOCAL` or `REMOTE`) and a
+`DirectoryFilter` (`ALL`, `DIRECTORIES`, or `REGULAR_FILES`). It returns
+`directory_started` containing a job ID. Poll the normal `job` operation until
+completion before calling `read_directory`. Failures/cancellation are reported
+through job state/progress, not partial directory pages. These scans do not
+retry automatically and never change either working directory.
+
+A snapshot contains immediate children of the current logical directory,
+including dotfiles, initially sorted by name A–Z. It is immutable once
+complete and is collected into private disk-backed data/index files (directory
+0700, files 0600), not an unbounded in-memory array or the completion cache.
+Remote paths are resolved once while holding the backend connection lease.
+Local `REGULAR_FILES` excludes final symlinks and special files; directory
+symlinks can be included for local directory navigation.
+
+`read_directory` takes `job_id`, an entry-index `offset` (initially zero), and
+`limit` (zero defaults to 256; larger values are clamped). Responses contain at
+most 256 entries and may be shorter to fit the frame byte limit. Each entry has
+`name`, `directory`, `regular_file`, `index`, and optional `size` fields.
+`size` is a reported regular-file byte count; absence means unavailable, not
+zero. Directories and non-regular local entries do not have recursive sizes. `index` is the stable
+original snapshot index, not the entry's position in a filtered view; preserve
+selection by this ID when changing filters. `next_offset` equals offset plus
+entry count; `eof` is true exactly at `total`. An empty non-EOF page is invalid.
+The response also includes the resolved directory `path` and a `skipped` count
+for unsafe/non-UTF-8/unrepresentable names. Names are basenames without slashes,
+`.`/`..`, or control characters, and are at most 64 KiB. The TUI adds directory
+slashes and quotes names itself; clients must never parse rendered `ls` output.
+
+`filter_directory` takes a completed snapshot's `job_id` and a `regexp` and
+plus optional `sort` (`NAME_ASC`, `NAME_DESC`, `SIZE_DESC`, `SIZE_ASC`; default
+`NAME_ASC`) and returns another `directory_started` job. Poll it and read pages just like the
+original snapshot. It streams a private disk-backed view from the original
+snapshot, preserving entry indices, sizes, path, and skipped count. Name sorts
+are case-sensitive; size sorts put unavailable sizes last in either direction,
+with name A–Z tie-breaking. Equal names are tied by type and original index.
+The stable indices need not be monotonic in a sorted page, but are unique. `total` and
+page offsets refer to the filtered view, while entry indices still identify
+original entries. Filtering must not use a partial completion listing or fetch
+the backend again. The TUI always filters the original snapshot, not its last
+filtered subset, so replacing a filter can reveal previously excluded entries.
+
+Sorting uses private numbered merge runs with at most 2048 entries/about 1 MiB
+per in-memory run, a constant number of open files, and cooperative yields during
+collection/merge/output. No full-directory vector or path list is retained;
+errors/cancellation remove partial runs through snapshot ownership. Default
+snapshot indices are assigned after initial name sorting and retained through
+all later filtered/sorted views.
+
+Patterns use Rust `regex` syntax, Unicode enabled, case-sensitive by default.
+Empty patterns and `.*` match everything. Patterns over 4096 UTF-8 bytes, invalid
+syntax, and compiled expressions exceeding the 1 MiB compilation budget return
+`INVALID_REQUEST` without poisoning the connection. Regex DFA memory is also
+bounded to 1 MiB. Superseded filter jobs can be closed immediately; previews and
+applied views are independently owned jobs and must each be closed. Parent
+snapshot close does not invalidate already built views.
+
+`close_directory` cancels and removes the snapshot job even if it is still
+scanning, releasing private files. It cannot close unrelated jobs. Normal
+acknowledgement also removes a completed snapshot job. Detach, EOF, and lease
+unwind automatically cancel/discard all snapshot jobs owned by that attachment,
+without cancelling normal background transfers. Frontends should still close
+snapshots promptly rather than waiting for disconnect.
+
+These operations are additive in version 1. Older daemons reject them as an
+unsupported operation; existing operations and clients keep their contracts.
+A full file-browser metadata/action API and change subscriptions remain future
+work; these minimal name/type pages do not implement a GUI.
 
 ## Credentials and diagnostics
 
@@ -149,7 +222,7 @@ clients cannot safely ignore require version negotiation or a version bump.
 
 Version 1 is deliberately request/response with job polling, preserving the
 functional TUI. It does not send unsolicited events or support multiple attached
-frontends. Push subscriptions, capabilities, structured directory-entry pages,
-and simultaneous GUI/TUI ownership are future API extensions—not implemented
+frontends. Push subscriptions, capabilities, richer file-browser metadata/actions,
+and simultaneous GUI/TUI ownership remain future API extensions—not implemented
 GUI features. Do not send unsolicited frames to version-1 clients: their client
 expects the response ID for the outstanding request.
