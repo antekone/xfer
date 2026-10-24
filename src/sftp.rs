@@ -798,6 +798,29 @@ impl Connection for SftpConnection {
         lease.finish(result)
     }
 
+    async fn rename_file(&self, source: &str, destination: &str, overwrite: bool) -> Result<()> {
+        crate::backend::validate_rename_paths(source, destination)?;
+        let source = self.resolve_listing_path(source)?;
+        let destination = self.resolve_listing_path(destination)?;
+        let lease = self.acquire().await?;
+        let result = async {
+            let mut fs = lease.session.sftp.fs();
+            remote_file(&operation(fs.symlink_metadata(&source)).await?)?;
+            if source == destination {
+                return Ok(());
+            }
+            if overwrite && lease.session.sftp.support_posix_rename() {
+                operation(fs.rename(&source, &destination)).await
+            } else {
+                // Never delete-then-rename. On older servers a free destination
+                // still works with -f, but an existing destination stays protected.
+                operation(fs.rename_noreplace(&source, &destination)).await
+            }
+        }
+        .await;
+        lease.finish(result)
+    }
+
     async fn upload(&self, local: &Path, path: &str, overwrite: bool) -> Result<()> {
         let path = self.resolve_listing_path(path)?;
         let lease = self.acquire().await?;

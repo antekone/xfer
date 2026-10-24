@@ -1,5 +1,6 @@
 //! S3 backend, including AWS client configuration, routing, and diagnostics.
 mod mkdir;
+mod rename;
 
 use crate::{
     backend::{Backend, ConnectOptions, Connection},
@@ -221,6 +222,9 @@ impl Connection for S3Connection {
     }
     fn pwd(&self) -> Result<String> {
         Ok(self.location.path())
+    }
+    async fn rename_file(&self, source: &str, destination: &str, overwrite: bool) -> Result<()> {
+        self.move_object(source, destination, overwrite).await
     }
     async fn create_directory(&self, path: &str, parents: bool) -> Result<()> {
         self.mkdir(path, parents).await
@@ -737,6 +741,39 @@ where
         }
     }
     anyhow::anyhow!(details.join("; "))
+}
+
+fn operation_error<E>(
+    operation: &str,
+    error: &aws_sdk_s3::error::SdkError<E>,
+    redactions: &[String],
+) -> anyhow::Error
+where
+    E: aws_sdk_s3::error::ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
+{
+    let diagnostic = probe_error(operation, error, redactions);
+    let code = error.as_service_error().and_then(|service| service.code());
+    let transient = matches!(
+        code,
+        Some(
+            "RequestTimeout"
+                | "RequestTimeoutException"
+                | "SlowDown"
+                | "Throttling"
+                | "ThrottlingException"
+                | "RequestLimitExceeded"
+        )
+    );
+    let permanent = error.raw_response().is_some_and(|response| {
+        let status = response.status().as_u16();
+        ((300..500).contains(&status) && !matches!(status, 408 | 409 | 425 | 429))
+            || matches!(status, 501 | 505)
+    });
+    if permanent && !transient {
+        NonRetryableError(diagnostic.to_string()).into()
+    } else {
+        diagnostic
+    }
 }
 
 fn validate_endpoint(value: &str) -> Result<()> {

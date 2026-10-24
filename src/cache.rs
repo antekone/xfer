@@ -301,6 +301,13 @@ impl Connection for CachedConnection {
         self.cache.lock().unwrap().clear();
         result
     }
+    async fn rename_file(&self, source: &str, destination: &str, overwrite: bool) -> Result<()> {
+        // Clear both source/destination parents and aliases, even on cancellation.
+        self.cache.lock().unwrap().clear();
+        let result = self.inner.rename_file(source, destination, overwrite).await;
+        self.cache.lock().unwrap().clear();
+        result
+    }
     async fn disconnect(self: Box<Self>) -> Result<()> {
         self.inner.disconnect().await
     }
@@ -633,5 +640,80 @@ mod tests {
         cache.options.ttl = Duration::ZERO;
         cache.insert("/disabled/".into(), snapshot);
         assert!(cache.get("/disabled/").is_none());
+    }
+    #[tokio::test]
+    async fn rename_invalidates_snapshots_on_success_failure_and_cancellation() {
+        struct RenameFake {
+            changed: Arc<AtomicBool>,
+            calls: Arc<AtomicUsize>,
+            mode: u8,
+        }
+        #[async_trait]
+        impl Connection for RenameFake {
+            fn protocol(&self) -> &'static str {
+                "test"
+            }
+            fn resolve_directory(&self, _: Option<&str>) -> Result<String> {
+                Ok("/".into())
+            }
+            async fn list(&self, _: &str, output: &mut dyn ListingSink) -> Result<u64> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                output.emit(Content::File(FileInfo {
+                    name: if self.changed.load(Ordering::Relaxed) {
+                        "after"
+                    } else {
+                        "before"
+                    }
+                    .into(),
+                    size: Some(1),
+                    unix: None,
+                    modified: None,
+                }))?;
+                Ok(1)
+            }
+            async fn rename_file(&self, _: &str, _: &str, _: bool) -> Result<()> {
+                self.changed.store(true, Ordering::Relaxed);
+                if self.mode == 1 {
+                    anyhow::bail!("lost reply");
+                }
+                if self.mode == 2 {
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            }
+        }
+        for mode in 0..3 {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let cached = CachedConnection::new(
+                Box::new(RenameFake {
+                    changed: Arc::new(AtomicBool::new(false)),
+                    calls: calls.clone(),
+                    mode,
+                }),
+                options(),
+            );
+            assert_eq!(
+                cached.complete_paths("").await.unwrap().candidates,
+                vec!["../", "before"]
+            );
+            if mode == 2 {
+                assert!(tokio::time::timeout(
+                    Duration::from_millis(10),
+                    cached.rename_file("before", "after", false)
+                )
+                .await
+                .is_err());
+            } else {
+                assert_eq!(
+                    cached.rename_file("before", "after", false).await.is_ok(),
+                    mode == 0
+                );
+            }
+            assert_eq!(
+                cached.complete_paths("").await.unwrap().candidates,
+                vec!["../", "after"]
+            );
+            assert_eq!(calls.load(Ordering::Relaxed), 2);
+        }
     }
 }

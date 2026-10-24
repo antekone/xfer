@@ -914,6 +914,107 @@ impl Connection for WebdavConnection {
         }
         unchanged(&self.stat(&location, false).await?, expected)
     }
+    async fn rename_file(&self, source: &str, destination: &str, overwrite: bool) -> Result<()> {
+        crate::backend::validate_rename_paths(source, destination)?;
+        let source = self.cwd.resolve(source)?;
+        let destination = self.cwd.resolve(destination)?;
+        let entry = self.stat(&source, false).await?;
+        if entry.directory {
+            return Err(permanent("mv expects a WebDAV file, not a collection"));
+        }
+        if source == destination {
+            return Ok(());
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "destination",
+            HeaderValue::from_str(destination.url(&self.base, false).as_str())
+                .map_err(|_| permanent("invalid WebDAV move destination"))?,
+        );
+        let mut replace = false;
+        if overwrite {
+            match self.stat(&destination, false).await {
+                Ok(target) => {
+                    if target.directory {
+                        return Err(permanent("mv cannot replace a WebDAV collection"));
+                    }
+                    let tag = target
+                        .etag
+                        .filter(|tag| !tag.starts_with("W/"))
+                        .ok_or_else(|| {
+                            permanent("replacing a WebDAV file requires a strong destination ETag")
+                        })?;
+                    let url = destination.url(&self.base, false);
+                    // Verify support non-destructively. Some deployed servers
+                    // silently ignore absolute resource tags; MOVE Overwrite:T
+                    // could then delete a substituted collection recursively.
+                    let mut probe = HeaderMap::new();
+                    probe.insert(
+                        "if",
+                        HeaderValue::from_str(&format!("<{url}> (Not [{tag}])"))
+                            .map_err(|_| invalid_xml())?,
+                    );
+                    let response = self
+                        .request(Method::HEAD, url.clone(), probe, empty_body())
+                        .await?;
+                    if response.status() != StatusCode::PRECONDITION_FAILED {
+                        return Err(permanent("safe WebDAV replacement requires enforced tagged If conditions; destination may have changed or server lacks support"));
+                    }
+                    let mut condition = format!("<{url}> ([{tag}])");
+                    if let Some(source_tag) =
+                        entry.etag.as_ref().filter(|tag| !tag.starts_with("W/"))
+                    {
+                        condition.push_str(&format!(
+                            " <{}> ([{source_tag}])",
+                            source.url(&self.base, false)
+                        ));
+                    }
+                    headers.insert(
+                        "if",
+                        HeaderValue::from_str(&condition).map_err(|_| invalid_xml())?,
+                    );
+                    replace = true;
+                }
+                Err(error) if has_status(&error, &[404]) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        headers.insert(
+            "overwrite",
+            HeaderValue::from_static(if replace { "T" } else { "F" }),
+        );
+        // For replacing moves use resource-tagged conditions above: some
+        // servers wrongly apply HTTP If-Match to both source and destination.
+        if !replace {
+            if let Some(etag) = entry.etag.filter(|tag| !tag.starts_with("W/")) {
+                headers.insert(
+                    header::IF_MATCH,
+                    HeaderValue::from_str(&etag).map_err(|_| invalid_xml())?,
+                );
+            } else if let Some(modified) = entry.modified {
+                headers.insert(
+                    header::IF_UNMODIFIED_SINCE,
+                    HeaderValue::from_str(
+                        &modified.format("%a, %d %b %Y %H:%M:%S GMT").to_string(),
+                    )
+                    .unwrap(),
+                );
+            }
+        }
+        let response = self
+            .request(
+                Method::from_bytes(b"MOVE").unwrap(),
+                source.url(&self.base, false),
+                headers,
+                empty_body(),
+            )
+            .await?;
+        if matches!(response.status().as_u16(), 201 | 204) {
+            Ok(())
+        } else {
+            Err(http_error(response.status().as_u16()))
+        }
+    }
     async fn upload(&self, local: &Path, path: &str, overwrite: bool) -> Result<()> {
         let location = self.cwd.resolve(path)?;
         if location.0.is_empty() || directory_input(path) {

@@ -72,6 +72,11 @@ pub trait Connection: Send + Sync {
     async fn create_directory(&self, _path: &str, _parents: bool) -> Result<()> {
         Err(NonRetryableError(format!("mkdir is not implemented for {}", self.protocol())).into())
     }
+    /// Rename one regular file to an exact filename. No directory expansion or
+    /// automatic replay: a lost reply may mean the mutation already succeeded.
+    async fn rename_file(&self, _source: &str, _destination: &str, _overwrite: bool) -> Result<()> {
+        Err(NonRetryableError(format!("mv is not implemented for {}", self.protocol())).into())
+    }
     async fn complete_directories(&self, _input: &str) -> Result<crate::cache::PathCompletion> {
         bail!(
             "directory completion is not available for {}",
@@ -96,4 +101,21 @@ pub trait Backend: Send + Sync {
     async fn connect(&self, _options: ConnectOptions) -> Result<Box<dyn Connection>> {
         bail!("{} backend is not implemented yet", self.protocol())
     }
+}
+
+/// Shared exact-file syntax, also enforced by backends used without the CLI.
+pub(crate) fn validate_rename_paths(source: &str, destination: &str) -> Result<()> {
+    for path in [source, destination] {
+        if path.is_empty()
+            || path.len() > 64 * 1024
+            || path.chars().any(char::is_control)
+            || matches!(path.rsplit('/').next(), Some("" | "." | ".."))
+        {
+            return Err(NonRetryableError(
+                "mv requires two exact file paths (at most 64 KiB each), not directories (no trailing slash)".into(),
+            )
+            .into());
+        }
+    }
+    Ok(())
 }

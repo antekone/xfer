@@ -1,12 +1,9 @@
 //! Directory creation for S3's virtual namespace, without creating buckets or
 //! replacing any existing object (including a nonempty trailing-slash object).
-use super::{probe_error, S3Connection};
+use super::{operation_error, S3Connection};
 use crate::error::NonRetryableError;
 use anyhow::Result;
-use aws_sdk_s3::{
-    error::{ProvideErrorMetadata, SdkError},
-    primitives::ByteStream,
-};
+use aws_sdk_s3::primitives::ByteStream;
 
 impl S3Connection {
     pub(super) async fn mkdir(&self, path: &str, parents: bool) -> Result<()> {
@@ -20,7 +17,7 @@ impl S3Connection {
             .bucket(bucket)
             .send()
             .await
-            .map_err(|error| directory_error("HeadBucket", &error, &self.redactions))?;
+            .map_err(|error| operation_error("HeadBucket", &error, &self.redactions))?;
         if target.prefix.is_empty() {
             return if parents {
                 Ok(())
@@ -64,7 +61,7 @@ impl S3Connection {
             .max_keys(1)
             .send()
             .await
-            .map_err(|error| directory_error("ListObjectsV2", &error, &self.redactions))?;
+            .map_err(|error| operation_error("ListObjectsV2", &error, &self.redactions))?;
         Ok(!result.contents().is_empty() || !result.common_prefixes().is_empty())
     }
 
@@ -94,42 +91,13 @@ impl S3Connection {
                     Err(already_exists(prefix))
                 }
             }
-            Err(error) => Err(directory_error("PutObject", &error, &self.redactions)),
+            Err(error) => Err(operation_error("PutObject", &error, &self.redactions)),
         }
     }
 }
 
 fn already_exists(prefix: &str) -> anyhow::Error {
     NonRetryableError(format!("remote directory already exists: {prefix:?}")).into()
-}
-
-fn directory_error<E>(operation: &str, error: &SdkError<E>, redactions: &[String]) -> anyhow::Error
-where
-    E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
-{
-    let diagnostic = probe_error(operation, error, redactions);
-    let code = error.as_service_error().and_then(|service| service.code());
-    let transient = matches!(
-        code,
-        Some(
-            "RequestTimeout"
-                | "RequestTimeoutException"
-                | "SlowDown"
-                | "Throttling"
-                | "ThrottlingException"
-                | "RequestLimitExceeded"
-        )
-    );
-    let permanent = error.raw_response().is_some_and(|response| {
-        let status = response.status().as_u16();
-        ((300..500).contains(&status) && !matches!(status, 408 | 409 | 425 | 429))
-            || matches!(status, 501 | 505)
-    });
-    if permanent && !transient {
-        NonRetryableError(diagnostic.to_string()).into()
-    } else {
-        diagnostic
-    }
 }
 
 #[cfg(test)]

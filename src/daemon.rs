@@ -147,7 +147,7 @@ impl Daemon {
         settings.register(
             "xfer:clobber",
             SettingValue::Bool(false),
-            "Allow get to overwrite local files and put to overwrite remote files",
+            "Allow get to overwrite local files and put/mv to overwrite remote files",
         );
         crate::commands::ls::register_settings(&mut settings);
         crate::cache::CacheOptions::register(&mut settings);

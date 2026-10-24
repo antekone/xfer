@@ -142,6 +142,19 @@ impl Client {
             }
         }
     }
+    pub(super) async fn rename_file(
+        &mut self,
+        tree: &Tree,
+        from: &str,
+        to: &str,
+        overwrite: bool,
+    ) -> smb2::Result<()> {
+        let options = smb2::RenameOptions::new().replace_if_exists(overwrite);
+        match self {
+            Self::Named(client) => client.rename_with(tree, from, to, options).await,
+            Self::Anonymous(client) => tree.rename_with(&mut client.0, from, to, options).await,
+        }
+    }
     pub(super) async fn create_directory(&mut self, tree: &Tree, path: &str) -> smb2::Result<()> {
         match self {
             Self::Named(client) => client.create_directory(tree, path).await,

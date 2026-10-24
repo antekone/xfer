@@ -236,6 +236,18 @@ impl Fs {
         inner(self, from.as_ref(), to.as_ref()).await
     }
 
+    /// Rename without replacing an existing destination, using SFTP v3 RENAME.
+    /// Unlike [`Self::rename`], this never selects the POSIX rename extension,
+    /// which permits overwriting. The server must refuse an existing target.
+    pub async fn rename_noreplace(
+        &mut self,
+        from: impl AsRef<Path>,
+        to: impl AsRef<Path>,
+    ) -> Result<(), Error> {
+        self.linking_impl(from.as_ref(), to.as_ref(), WriteEnd::send_rename_request)
+            .await
+    }
+
     /// Reads a symbolic link, returning the file that the link points to.
     pub async fn read_link(&mut self, path: impl AsRef<Path>) -> Result<PathBuf, Error> {
         async fn inner(this: &mut Fs, path: &Path) -> Result<PathBuf, Error> {

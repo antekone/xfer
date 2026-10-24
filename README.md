@@ -9,7 +9,7 @@ client/daemon runtime:
 - `Ctrl-Z` backgrounds the foreground job; `jobs` and `fg [id]` manage jobs;
 - pager mode with vi-style navigation, `$VISUAL` handoff, and the `ui:auto-pager` setting;
 - typed settings and backend interfaces, with S3/SFTP/SMB/WebDAV listing/download support
-  and SFTP/SMB/WebDAV uploads.
+  and SFTP/SMB/WebDAV uploads, plus file renaming on all four backends.
 
 Run it with:
 
@@ -61,8 +61,74 @@ smb:max-credits: 32
 ```
 
 S3, SFTP, SMB, and WebDAV support connect, navigation, listing and downloads.
-SFTP, SMB, and WebDAV also support uploads with `put`; S3 uploads and mirroring
-are not implemented yet.
+SFTP, SMB, and WebDAV also support uploads with `put`; all four backends support
+file renaming with `mv`. S3 uploads and mirroring are not implemented yet.
+
+## Renaming remote files
+
+```text
+mv 'old name.txt' 'new name.txt'
+mv file.txt subdirectory/file.txt
+mv -f replacement.txt existing.txt
+mv -- -old-name -new-name
+```
+
+`mv [-f] [--] <source> <destination>` renames **one regular file to an exact
+filename**. Both operands are relative to the remote CWD unless absolute; the
+CWD is never changed. There is no wildcard expansion, multiple-source operation,
+recursive directory/prefix move, or implicit basename insertion for a destination
+directory. Specify `subdir/name`, not `subdir/`. Final source symlinks/reparse
+points are refused where the backend exposes that information. Use quotes for
+spaces and `--` before names starting with `-`. TAB completion works for both
+operands, and completion caches are cleared on success, failure, and cancellation.
+
+Existing destinations are protected by default. `-f`/`--force` or a frozen
+`xfer:clobber: true` permits replacing a file. Moving a file to its own canonical
+path succeeds without changing it (after checking it exists). Moves run as normal
+cancellable/backgroundable jobs, **without automatic retries**: a disconnected or
+cancelled request may already have completed on the server. Inspect both paths
+before repeating an ambiguous operation. No delete-then-rename overwrite fallback
+is used.
+
+- **SFTP:** standard v3 RENAME for no-replace behavior, even when the server also
+  advertises POSIX rename. Overwrites require `posix-rename@openssh.com`; the
+  extension is never used for a protected move. Without it, `-f` can still move
+  to a free name but never replaces an existing one. Cross-filesystem moves may fail.
+- **SMB:** native rename with the server's replace-if-exists option, for named and
+  anonymous sessions. Both files must be in the same share; cross-share copies
+  are not emulated. Case-only renames work on case-insensitive servers.
+- **WebDAV:** same-origin MOVE with an encoded absolute Destination and explicit
+  Overwrite header; no redirect replay, upload, or DELETE fallback. Source ETag
+  conditions are sent when available (mtime fallback on protected moves).
+  Replacing an existing file also
+  requires a strong destination ETag and enforced tagged WebDAV If conditions.
+  A non-mutating HEAD with an intentionally false condition checks support first;
+  servers that ignore these conditions are refused for existing-file replacement
+  (including WsgiDAV 4.3.5). This avoids blindly deleting a substituted collection.
+  Source conditions on replacement moves are resource-tagged too, avoiding
+  servers that incorrectly apply HTTP If-Match to both resources. Missing
+  destinations still use Overwrite: F even with `-f`. HTTP 207 is not treated as
+  complete success. WebDAV locks requiring tokens are not supported.
+- **S3:** server-side CopyObject (up to **5 GiB**) followed by DeleteObject, within
+  a bucket or between buckets at the configured endpoint. It requires source
+  read/copy, destination write, source delete, and verification HEAD permissions.
+  Copy uses the source ETag and pins a version ID when available; protected copies
+  require destination If-None-Match: *. After copying, destination size/ETag and
+  source size/ETag/version/mtime are checked before conditional source deletion.
+  Unsupported conditional requests fail rather than falling back unconditionally.
+  A failed copy never authorizes source deletion, including HTTP 200 responses
+  carrying embedded S3 errors. The client never rolls back by deleting a destination.
+
+**S3 moves are not atomic or transactional.** Cancellation/failure can leave both
+objects; a lost delete acknowledgement can leave only the destination. There is
+no atomic condition covering both objects, and replacements with identical ETags
+cannot always be distinguished, so avoid concurrent writers during a move. In a
+versioned source bucket, deletion creates the usual delete marker rather than
+removing an old version and exposing previous content. Standard CopyObject
+metadata/tag copying applies; source storage class and website-redirect metadata
+are retained, but ACLs/ownership and encryption may differ under
+the destination bucket's rules. Buckets, slash-marker/prefix moves, and multipart
+copies of larger objects are not implemented.
 
 ## WebDAV
 

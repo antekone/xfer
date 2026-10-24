@@ -609,3 +609,83 @@ async fn smb_stored_credentials_and_explicit_anonymous_access_work_without_guest
     let result = app.command("close");
     finish(&mut app, result, true).await;
 }
+
+#[tokio::test]
+async fn smb_native_file_moves_are_exclusive_and_stay_within_the_same_share() {
+    let Some(server) = Server::start() else {
+        return;
+    };
+    for named in [false, true] {
+        fs::write(server.path("share/old file.txt"), b"file\0\xffbytes").unwrap();
+        fs::write(server.path("share/existing"), b"existing").unwrap();
+        let connection = Smb.connect(server.options(named, "share")).await.unwrap();
+        connection
+            .rename_file("old file.txt", "./old file.txt", false)
+            .await
+            .unwrap();
+        assert!(connection
+            .rename_file("old file.txt", "existing", false)
+            .await
+            .unwrap_err()
+            .is::<NonRetryableError>());
+        assert_eq!(
+            fs::read(server.path("share/existing")).unwrap(),
+            b"existing"
+        );
+        connection
+            .rename_file("old file.txt", "photos/new 日本語.txt", false)
+            .await
+            .unwrap();
+        assert!(!server.path("share/old file.txt").exists());
+        assert_eq!(
+            fs::read(server.path("share/photos/new 日本語.txt")).unwrap(),
+            b"file\0\xffbytes"
+        );
+        connection
+            .rename_file("photos/new 日本語.txt", "existing", true)
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read(server.path("share/existing")).unwrap(),
+            b"file\0\xffbytes"
+        );
+        connection
+            .rename_file("existing", "EXISTING", false)
+            .await
+            .unwrap();
+        for (a, b) in [
+            ("EXISTING", "/second/file"),
+            ("EXISTING", "/share"),
+            ("/share", "other"),
+            ("photos", "other"),
+            ("missing", "other"),
+            ("EXISTING", "photos"),
+            ("EXISTING", "missing/other"),
+            ("EXISTING", "file:stream"),
+        ] {
+            assert!(
+                connection
+                    .rename_file(a, b, false)
+                    .await
+                    .unwrap_err()
+                    .is::<NonRetryableError>(),
+                "{a} -> {b}"
+            );
+        }
+        assert_eq!(connection.pwd().unwrap(), "/share/");
+        assert!(!server.path("second/file").exists());
+        connection.disconnect().await.unwrap();
+        fs::remove_file(server.path("share/EXISTING")).unwrap();
+    }
+    let connection = Smb
+        .connect(server.options(false, "readonly"))
+        .await
+        .unwrap();
+    assert!(connection
+        .rename_file("hello world.txt", "other", false)
+        .await
+        .unwrap_err()
+        .is::<NonRetryableError>());
+    assert!(server.path("share/hello world.txt").exists());
+    connection.disconnect().await.unwrap();
+}

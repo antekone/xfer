@@ -46,6 +46,13 @@ enum Mode {
     UnquotedTags,
     Chunked,
     ChangedAfterGet,
+    MoveConflict,
+    MoveMultiStatus,
+    SlowMove,
+    MoveRedirect,
+    MoveSourceChanged,
+    MoveDestinationChanged,
+    IgnoreDavIf,
 }
 #[derive(Clone)]
 struct Call {
@@ -55,6 +62,9 @@ struct Call {
     conditional: Option<String>,
     exclusive: bool,
     depth: Option<String>,
+    destination: Option<String>,
+    overwrite: Option<String>,
+    tagged_if: Option<String>,
 }
 struct State {
     nodes: BTreeMap<String, Node>,
@@ -119,6 +129,9 @@ async fn handle(
         conditional: header("if-match").or_else(|| header("if-unmodified-since")),
         exclusive: header("if-none-match").as_deref() == Some("*"),
         depth: header("depth"),
+        destination: header("destination"),
+        overwrite: header("overwrite"),
+        tagged_if: header("if"),
     };
     let auth = header("authorization");
     let (mode, xml) = {
@@ -297,6 +310,107 @@ async fn handle(
                 },
             );
             Ok(response(201, Body::empty()))
+        }
+        "HEAD" => {
+            let state = state.lock().unwrap();
+            let Some(node) = state.nodes.get(&lookup) else {
+                return Ok(response(404, "missing"));
+            };
+            if mode != Mode::IgnoreDavIf
+                && call.tagged_if.as_ref().is_some_and(|tagged| {
+                    tagged.ends_with(&format!("(Not [\"v{}\"])", node.revision))
+                })
+            {
+                return Ok(response(412, "condition is false"));
+            }
+            Ok(Response::builder()
+                .status(200)
+                .header("content-length", node.data.len())
+                .body(Body::empty())
+                .unwrap())
+        }
+        "MOVE" => {
+            if mode == Mode::MoveRedirect {
+                return Ok(Response::builder()
+                    .status(307)
+                    .header("location", href("/dav/hello.bin/"))
+                    .body(Body::empty())
+                    .unwrap());
+            }
+            if mode == Mode::SlowMove {
+                tokio::time::sleep(Duration::from_secs(600)).await;
+            }
+            if mode == Mode::MoveMultiStatus {
+                return Ok(response(207, "<multistatus/>"));
+            }
+            let Some(destination) = call
+                .destination
+                .as_deref()
+                .and_then(|value| url::Url::parse(value).ok())
+            else {
+                return Ok(response(400, "missing destination"));
+            };
+            let destination = percent_encoding::percent_decode_str(destination.path())
+                .decode_utf8()
+                .unwrap()
+                .into_owned();
+            let mut state = state.lock().unwrap();
+            if mode == Mode::MoveSourceChanged {
+                state.nodes.get_mut(&lookup).unwrap().revision += 1;
+            }
+            if mode == Mode::MoveDestinationChanged {
+                let node = state.nodes.get_mut(&destination).unwrap();
+                node.revision += 1;
+                node.directory = true;
+            }
+            let Some(source) = state.nodes.get(&lookup).cloned() else {
+                return Ok(response(404, "missing source"));
+            };
+            if source.directory {
+                return Ok(response(409, "collection"));
+            }
+            if mode == Mode::MoveConflict {
+                return Ok(response(412, "changed"));
+            }
+            if call
+                .conditional
+                .as_deref()
+                .is_some_and(|tag| tag != format!("\"v{}\"", source.revision) && tag != DATE)
+            {
+                return Ok(response(412, "source changed"));
+            }
+            let exists = state.nodes.contains_key(&destination);
+            if exists && call.overwrite.as_deref() != Some("T") {
+                return Ok(response(412, "exists"));
+            }
+            if let Some(tagged) = &call.tagged_if {
+                if !state.nodes.get(&destination).is_some_and(|node| {
+                    tagged.contains(&format!(
+                        "<{}> ([\"v{}\"])",
+                        call.destination.as_deref().unwrap(),
+                        node.revision
+                    ))
+                }) {
+                    return Ok(response(412, "destination changed"));
+                }
+                if !tagged.ends_with(&format!("([\"v{}\"])", source.revision)) {
+                    return Ok(response(412, "source changed"));
+                }
+            }
+            let parent = format!("{}/", destination.rsplit_once('/').unwrap().0);
+            if !state.nodes.get(&parent).is_some_and(|node| node.directory) {
+                return Ok(response(409, "missing parent"));
+            }
+            if state
+                .nodes
+                .get(&destination)
+                .is_some_and(|node| node.directory)
+            {
+                return Ok(response(409, "directory target"));
+            }
+            state.nodes.remove(&lookup);
+            state.nodes.insert(destination, source);
+            Ok(response(if exists { 204 } else { 201 }, Body::empty()))
         }
         "MKCOL" => {
             let mut state = state.lock().unwrap();
@@ -861,4 +975,258 @@ async fn chunked_downloads_mtime_fallback_and_post_read_changes_are_checked() {
         .unwrap_err()
         .is::<NonRetryableError>());
     assert_eq!(sink.0.len() as u64, expected.size);
+}
+
+#[tokio::test]
+async fn moves_use_same_origin_encoded_destinations_and_explicit_overwrite_conditions() {
+    let fixture = Fixture::start(false);
+    let connection = fixture.connect().await;
+    connection
+        .rename_file("hello.bin", "./hello.bin", false)
+        .await
+        .unwrap();
+    let expected = fixture.state.lock().unwrap().nodes["/dav/hello.bin"]
+        .data
+        .clone();
+    assert!(connection
+        .rename_file("hello.bin", "雪 %?#.txt", false)
+        .await
+        .unwrap_err()
+        .is::<NonRetryableError>());
+    assert_eq!(
+        fixture.state.lock().unwrap().nodes["/dav/雪 %?#.txt"].data,
+        b"unicode file"
+    );
+    connection
+        .rename_file("hello.bin", "dir/new 雪 %?#.bin", false)
+        .await
+        .unwrap();
+    assert!(!fixture
+        .state
+        .lock()
+        .unwrap()
+        .nodes
+        .contains_key("/dav/hello.bin"));
+    assert_eq!(
+        fixture.state.lock().unwrap().nodes["/dav/dir/new 雪 %?#.bin"].data,
+        expected
+    );
+    connection
+        .rename_file("dir/new 雪 %?#.bin", "雪 %?#.txt", true)
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture.state.lock().unwrap().nodes["/dav/雪 %?#.txt"].data,
+        expected
+    );
+    assert_eq!(connection.pwd().unwrap(), "/dav/");
+    for (a, b, overwrite) in [
+        ("dir", "new", false),
+        ("雪 %?#.txt", "dir", true),
+        ("missing", "new", false),
+        ("雪 %?#.txt", "missing/new", false),
+    ] {
+        assert!(connection
+            .rename_file(a, b, overwrite)
+            .await
+            .unwrap_err()
+            .is::<NonRetryableError>());
+    }
+    let state = fixture.state.lock().unwrap();
+    let moves = state
+        .calls
+        .iter()
+        .filter(|call| call.method == "MOVE")
+        .collect::<Vec<_>>();
+    assert_eq!(moves.len(), 4);
+    assert_eq!(moves[1].overwrite.as_deref(), Some("F"));
+    let destination = moves[1].destination.as_deref().unwrap();
+    assert!(
+        destination.contains("/dav/dir/new%20%E9%9B%AA%20%25%3F%23.bin"),
+        "{destination}"
+    );
+    let target = url::Url::parse(destination).unwrap();
+    let base = url::Url::parse(&fixture.url).unwrap();
+    assert_eq!(target.origin(), base.origin());
+    assert!(target.username().is_empty());
+    assert!(target.password().is_none());
+    assert_eq!(moves[2].overwrite.as_deref(), Some("T"));
+    assert!(moves[2]
+        .tagged_if
+        .as_deref()
+        .unwrap()
+        .ends_with("([\"v1\"])"));
+    assert!(moves[2].conditional.is_none());
+    assert!(moves[2]
+        .tagged_if
+        .as_deref()
+        .unwrap()
+        .contains("/dav/dir/new%20%E9%9B%AA%20%25%3F%23.bin> ([\"v1\"])"));
+}
+
+#[tokio::test]
+async fn moves_fail_closed_on_conflicts_multistatus_missing_replacement_validators_and_redirects() {
+    for mode in [
+        Mode::MoveConflict,
+        Mode::MoveMultiStatus,
+        Mode::RedirectForeign,
+        Mode::MoveRedirect,
+        Mode::MoveSourceChanged,
+    ] {
+        let fixture = Fixture::start(false);
+        let connection = fixture.connect().await;
+        fixture.mode(mode);
+        assert!(connection
+            .rename_file("hello.bin", "new", false)
+            .await
+            .unwrap_err()
+            .is::<NonRetryableError>());
+        let state = fixture.state.lock().unwrap();
+        assert!(state.nodes.contains_key("/dav/hello.bin"));
+        assert!(!state.nodes.contains_key("/dav/new"));
+        assert!(
+            state
+                .calls
+                .iter()
+                .filter(|call| call.method == "MOVE")
+                .count()
+                <= 1
+        );
+        assert!(state
+            .calls
+            .iter()
+            .all(|call| !matches!(call.method.as_str(), "PUT" | "DELETE")));
+    }
+    let fixture = Fixture::start(false);
+    let connection = fixture.connect().await;
+    fixture.mode(Mode::MissingValidator);
+    assert!(connection
+        .rename_file("hello.bin", "雪 %?#.txt", true)
+        .await
+        .unwrap_err()
+        .is::<NonRetryableError>());
+    assert!(!fixture
+        .state
+        .lock()
+        .unwrap()
+        .calls
+        .iter()
+        .any(|call| call.method == "MOVE"));
+    connection
+        .rename_file("hello.bin", "new", false)
+        .await
+        .unwrap();
+    assert!(fixture.state.lock().unwrap().nodes.contains_key("/dav/new"));
+}
+
+#[tokio::test]
+async fn cancelled_moves_are_not_replayed_and_cache_refreshes_after_moves() {
+    let fixture = Fixture::start(false);
+    let connection = fixture.connect().await;
+    fixture.mode(Mode::SlowMove);
+    assert!(tokio::time::timeout(
+        Duration::from_millis(60),
+        connection.rename_file("hello.bin", "new", false)
+    )
+    .await
+    .is_err());
+    assert_eq!(
+        fixture
+            .state
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .filter(|call| call.method == "MOVE")
+            .count(),
+        1
+    );
+    assert!(fixture
+        .state
+        .lock()
+        .unwrap()
+        .nodes
+        .contains_key("/dav/hello.bin"));
+    // A fresh connection can operate normally after a cancelled request; no
+    // deferred command-level retry is scheduled by the move implementation.
+    fixture.mode(Mode::Normal);
+    let app = Daemon::bootstrap().unwrap();
+    let connection = xfer::cache::CachedConnection::new(
+        fixture.connect().await,
+        xfer::cache::CacheOptions::from_settings(&app.settings).unwrap(),
+    );
+    assert_eq!(
+        connection.complete_paths("hello").await.unwrap().candidates,
+        vec!["hello.bin"]
+    );
+    connection
+        .rename_file("hello.bin", "dir/renamed file", false)
+        .await
+        .unwrap();
+    assert!(connection
+        .complete_paths("hello")
+        .await
+        .unwrap()
+        .candidates
+        .is_empty());
+    assert_eq!(
+        connection
+            .complete_paths("dir/renamed")
+            .await
+            .unwrap()
+            .candidates,
+        vec!["dir/renamed file"]
+    );
+}
+
+#[tokio::test]
+async fn move_replacement_does_not_delete_a_collection_substituted_after_stat() {
+    let fixture = Fixture::start(false);
+    let connection = fixture.connect().await;
+    fixture.mode(Mode::MoveDestinationChanged);
+    assert!(connection
+        .rename_file("hello.bin", "雪 %?#.txt", true)
+        .await
+        .unwrap_err()
+        .is::<NonRetryableError>());
+    let state = fixture.state.lock().unwrap();
+    assert!(state.nodes.contains_key("/dav/hello.bin"));
+    assert!(state.nodes["/dav/雪 %?#.txt"].directory);
+    assert_eq!(
+        state
+            .calls
+            .iter()
+            .filter(|call| call.method == "MOVE")
+            .count(),
+        1
+    );
+    assert!(!state.calls.iter().any(|call| call.method == "DELETE"));
+}
+
+#[tokio::test]
+async fn unsafe_webdav_replacement_is_refused_when_server_ignores_tagged_conditions() {
+    let fixture = Fixture::start(false);
+    let connection = fixture.connect().await;
+    fixture.mode(Mode::IgnoreDavIf);
+    let error = connection
+        .rename_file("hello.bin", "雪 %?#.txt", true)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("enforced tagged If"));
+    assert!(fixture
+        .state
+        .lock()
+        .unwrap()
+        .calls
+        .iter()
+        .all(|call| call.method != "MOVE"));
+    assert_eq!(
+        fixture.state.lock().unwrap().nodes["/dav/雪 %?#.txt"].data,
+        b"unicode file"
+    );
+    connection
+        .rename_file("hello.bin", "new", true)
+        .await
+        .unwrap();
+    assert!(fixture.state.lock().unwrap().nodes.contains_key("/dav/new"));
 }

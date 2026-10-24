@@ -703,6 +703,44 @@ impl Connection for SmbConnection {
         let result = download_on(lease.get(), &target, offset, expected, sink).await;
         lease.finish(result)
     }
+    async fn rename_file(&self, source: &str, destination: &str, overwrite: bool) -> Result<()> {
+        crate::backend::validate_rename_paths(source, destination)?;
+        if [source, destination]
+            .iter()
+            .any(|path| path.contains(['\\', ':']))
+        {
+            return Err(permanent("invalid SMB rename path"));
+        }
+        let source = self.cwd.resolve(source)?;
+        let destination = self.cwd.resolve(destination)?;
+        if source.key().is_empty()
+            || destination.key().is_empty()
+            || !source
+                .share
+                .as_ref()
+                .zip(destination.share.as_ref())
+                .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
+        {
+            return Err(permanent("SMB mv requires two files within the same share"));
+        }
+        let mut lease = self.acquire().await?;
+        let result = async {
+            remote_file(&lease.get().stat(&source).await?)?;
+            if source == destination {
+                return Ok(());
+            }
+            let session = lease.get();
+            let timeout = session.options.io_timeout;
+            let (client, tree) = session.parts();
+            call(
+                timeout,
+                client.rename_file(tree, source.key(), destination.key(), overwrite),
+            )
+            .await
+        }
+        .await;
+        lease.finish(result)
+    }
     async fn upload(&self, local: &Path, path: &str, overwrite: bool) -> Result<()> {
         let target = self.cwd.resolve(path)?;
         let mut lease = self.acquire().await?;

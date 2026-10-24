@@ -74,6 +74,7 @@ case "$*" in
     *silent.invalid*) exit 42;;
     *stderr.invalid*) echo 'subsystem request failed on channel 0' >&2; exit 255;;
     *noexpand.invalid*) exec {server} -P expand-path -d "$TEST_REMOTE_ROOT";;
+    *norename.invalid*) exec {server} -P posix-rename -d "$TEST_REMOTE_ROOT";;
 esac
 if [ "$SSH_ASKPASS_REQUIRE" = never ]; then
     exec {server} -d "$TEST_REMOTE_ROOT"
@@ -1143,5 +1144,122 @@ fn pipelined_sftp_round_trips_multiple_windows_and_validates_settings_before_job
             .lines()
             .count(),
         1
+    );
+}
+
+#[test]
+fn mv_renames_literal_files_preserves_destinations_and_refreshes_completion() {
+    let Some(mut daemon) = Daemon::start() else {
+        return;
+    };
+    fs::write(daemon.remote().join("literal*.txt"), b"binary\0\xffdata").unwrap();
+    fs::write(daemon.remote().join("existing"), b"existing").unwrap();
+    std::os::unix::fs::symlink("hello world.txt", daemon.remote().join("file link")).unwrap();
+    daemon.connect("test-secret", true);
+    assert_eq!(
+        daemon
+            .complete(pb::CompletionKind::RemotePath, "literal")
+            .unwrap()
+            .candidates,
+        vec!["literal*.txt"]
+    );
+    let cwd = daemon.client.session().unwrap().cwd;
+    let response = daemon.command("mv 'literal*.txt' existing");
+    daemon.finish(response, false);
+    assert_eq!(
+        fs::read(daemon.remote().join("existing")).unwrap(),
+        b"existing"
+    );
+    assert_eq!(
+        fs::read(daemon.remote().join("literal*.txt")).unwrap(),
+        b"binary\0\xffdata"
+    );
+    let response = daemon.command("mv 'literal*.txt' 'photos/new name 日本語?.txt'");
+    daemon.finish(response, true);
+    assert!(!daemon.remote().join("literal*.txt").exists());
+    assert_eq!(
+        fs::read(daemon.remote().join("photos/new name 日本語?.txt")).unwrap(),
+        b"binary\0\xffdata"
+    );
+    assert!(daemon
+        .complete(pb::CompletionKind::RemotePath, "literal")
+        .unwrap()
+        .candidates
+        .is_empty());
+    assert_eq!(
+        daemon
+            .complete(pb::CompletionKind::RemotePath, "photos/new")
+            .unwrap()
+            .candidates,
+        vec!["photos/new name 日本語?.txt"]
+    );
+    let response = daemon.command("mv -f 'photos/new name 日本語?.txt' existing");
+    daemon.finish(response, true);
+    assert_eq!(
+        fs::read(daemon.remote().join("existing")).unwrap(),
+        b"binary\0\xffdata"
+    );
+    for command in [
+        "mv photos other",
+        "mv 'file link' other",
+        "mv existing photos",
+        "mv missing other",
+        "mv existing missing/other",
+    ] {
+        let response = daemon.command(command);
+        daemon.finish(response, false);
+    }
+    let response = daemon.command("mv existing ./existing");
+    daemon.finish(response, true);
+    fs::write(daemon.remote().join("-source"), b"dash").unwrap();
+    let response = daemon.command("mv -- -source -target");
+    daemon.finish(response, true);
+    assert_eq!(fs::read(daemon.remote().join("-target")).unwrap(), b"dash");
+    assert_eq!(daemon.client.session().unwrap().cwd, cwd);
+    assert_eq!(
+        fs::read_to_string(daemon.root.path().join("ssh-pids"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn sftp_moves_use_basic_rename_without_extensions_and_do_not_replay_permission_errors() {
+    let Some(mut daemon) = Daemon::start() else {
+        return;
+    };
+    let response = daemon.command("open sftp://user@norename.invalid");
+    daemon.finish(response, true);
+    let response = daemon.command("mv 'hello world.txt' basic");
+    daemon.finish(response, true);
+    assert_eq!(
+        fs::read(daemon.remote().join("basic")).unwrap(),
+        b"hello remote world"
+    );
+    fs::write(daemon.remote().join("target"), b"protected").unwrap();
+    let response = daemon.command("mv -f basic target");
+    daemon.finish(response, false);
+    assert_eq!(
+        fs::read(daemon.remote().join("target")).unwrap(),
+        b"protected"
+    );
+    let response = daemon.command("mv -f basic free-name");
+    daemon.finish(response, true);
+    let response = daemon.command("mv free-name basic");
+    daemon.finish(response, true);
+    let response = daemon.command("open sftp://user@readonly.invalid");
+    daemon.finish(response, true);
+    let response = daemon.command("mv basic new");
+    daemon.finish(response, false);
+    assert!(daemon.remote().join("basic").exists());
+    assert!(!daemon.remote().join("new").exists());
+    assert_eq!(
+        fs::read_to_string(daemon.root.path().join("ssh-pids"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
     );
 }
