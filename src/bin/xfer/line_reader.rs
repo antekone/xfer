@@ -204,9 +204,9 @@ impl CommandLine {
 
     /// Keep a single-row viewport, leaving a spare terminal column to prevent
     /// autowrap. Count display cells (not bytes), including wide Unicode text.
-    fn frame(&mut self, prompt: &str, columns: u16, clear: bool) -> String {
+    fn frame(&mut self, prompt: &crate::Prompt, columns: u16, clear: bool) -> String {
         let limit = columns.saturating_sub(1) as usize;
-        let prompt_budget = columns.saturating_sub(3).min(columns / 2 + 1);
+        let prompt_budget = columns.saturating_sub(3);
         let prompt = crate::fit_prompt(prompt, prompt_budget);
         let prompt_width = prompt.width();
         let available = limit.saturating_sub(prompt_width);
@@ -556,7 +556,7 @@ impl Typeahead {
     }
 }
 
-fn redraw_command(command: &mut CommandLine, prompt: &str, clear: bool) -> Result<()> {
+fn redraw_command(command: &mut CommandLine, prompt: &crate::Prompt, clear: bool) -> Result<()> {
     let columns = crossterm::terminal::size()
         .map(|(width, _)| width)
         .unwrap_or(80);
@@ -600,7 +600,7 @@ fn selector_context(
 
 pub(super) fn read_attached_command(
     client: &mut Connection,
-    prompt: &str,
+    prompt: &crate::Prompt,
     history: &mut Vec<String>,
     typeahead: &mut Typeahead,
 ) -> Result<Option<String>> {
@@ -1457,14 +1457,14 @@ mod tests {
     fn redraw_positions_the_caret_by_display_cells_and_clear_preserves_the_line() {
         let mut line = CommandLine::new("a界b".into());
         press(&mut line, KeyCode::Left);
-        let plain = line.frame("xfer> ", 80, false);
+        let plain = line.frame(&crate::Prompt::plain("xfer> "), 80, false);
         assert_eq!(plain, "\r\x1b[2Kxfer> a界b\r\x1b[9C");
-        let cleared = line.frame("xfer> ", 80, true);
+        let cleared = line.frame(&crate::Prompt::plain("xfer> "), 80, true);
         assert_eq!(cleared, format!("\x1b[2J\x1b[H{plain}"));
         assert_eq!(line.prefix(), "a界");
         assert_eq!(line.as_str(), "a界b");
         let mut history = CommandLine::new("a\x1b[2J".into());
-        let frame = history.frame("xfer> ", 80, false);
+        let frame = history.frame(&crate::Prompt::plain("xfer> "), 80, false);
         assert!(frame.contains("a\\u{1b}[2J"));
         assert!(!frame.contains("\x1b[2J"));
     }
@@ -1474,7 +1474,14 @@ mod tests {
         let text = "résumé/界/".repeat(50);
         let mut line = CommandLine::new(text.clone());
         for width in 0..100 {
-            let frame = line.frame("xfer[sftp:/a/very/long/directory/]> ", width, false);
+            let frame = line.frame(
+                &crate::Prompt {
+                    text: "xfer[sftp:/a/very/long/directory/]> ".into(),
+                    paths: vec![(10, 33)],
+                },
+                width,
+                false,
+            );
             let visible = frame
                 .strip_prefix("\r\x1b[2K")
                 .unwrap()
@@ -1490,7 +1497,7 @@ mod tests {
             assert_eq!(line.text, text);
         }
         press(&mut line, KeyCode::Home);
-        let frame = line.frame("xfer> ", 30, false);
+        let frame = line.frame(&crate::Prompt::plain("xfer> "), 30, false);
         assert!(frame.contains("xfer> résumé/界/"));
         assert_eq!(line.view_start, 0);
     }

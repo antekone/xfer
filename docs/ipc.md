@@ -226,3 +226,8 @@ frontends. Push subscriptions, capabilities, richer file-browser metadata/action
 and simultaneous GUI/TUI ownership remain future API extensions—not implemented
 GUI features. Do not send unsolicited frames to version-1 clients: their client
 expects the response ID for the outstanding request.
+
+`Session.prompt_paths` contains ordered, non-overlapping UTF-8 byte ranges in
+`Session.prompt` for path substitutions. Terminal clients can shorten only
+those ranges while preserving the surrounding template. Older peers may omit
+these additive fields; clients must validate boundaries before slicing.

@@ -45,6 +45,8 @@ pub struct SessionInfo {
     pub host: String,
     #[serde(default)]
     pub prompt: Option<String>,
+    #[serde(default)]
+    pub prompt_paths: Vec<(u32,u32)>,
 }
 impl From<crate::ipc::pb::Session> for SessionInfo {
     fn from(value: crate::ipc::pb::Session) -> Self {
@@ -55,6 +57,7 @@ impl From<crate::ipc::pb::Session> for SessionInfo {
             user: value.user,
             host: value.host,
             prompt: value.prompt,
+            prompt_paths: value.prompt_paths.into_iter().map(|range| (range.start,range.end)).collect(),
         }
     }
 }
@@ -67,6 +70,7 @@ impl From<SessionInfo> for crate::ipc::pb::Session {
             user: value.user,
             host: value.host,
             prompt: value.prompt,
+            prompt_paths: value.prompt_paths.into_iter().map(|(start,end)| crate::ipc::pb::PromptPath { start,end }).collect(),
         }
     }
 }
@@ -87,6 +91,7 @@ impl SessionInfo {
             user: connection.prompt_user(),
             host: connection.prompt_host(),
             prompt: None,
+            prompt_paths: Vec::new(),
         }
     }
 }
@@ -239,11 +244,13 @@ impl Daemon {
 
     pub fn session_info(&self) -> SessionInfo {
         let mut info = self.session.lock().expect("session state poisoned").clone();
-        info.prompt = Some(crate::prompt::format(
+        let (prompt, paths) = crate::prompt::format(
             self.settings.text("ui:prompt").unwrap_or("xfer$location> "),
             &info,
             &self.local_directory.to_string_lossy(),
-        ));
+        );
+        info.prompt = Some(prompt);
+        info.prompt_paths = paths;
         info
     }
 

@@ -36,18 +36,29 @@ pub struct Bookmark {
 impl Bookmark {
     /// Display only routing information. URL credentials and signed query strings
     /// are secrets too, so never print the original URL verbatim.
-    pub fn summary(&self, alias: &str) -> String {
-        let endpoint = match url::Url::parse(&self.url) {
+    pub fn address(&self) -> String {
+        match url::Url::parse(&self.url) {
             Ok(mut url) => {
                 let _ = url.set_password(None);
                 let _ = url.set_username("");
                 url.set_query(None);
                 url.set_fragment(None);
                 url.to_string()
+                    .chars()
+                    .flat_map(|ch| {
+                        if ch.is_control() {
+                            ch.escape_default().collect::<Vec<_>>()
+                        } else {
+                            vec![ch]
+                        }
+                    })
+                    .collect()
             }
             Err(_) => "[invalid URL]".into(),
-        };
-        let mut summary = format!("{}  {}", alias.escape_default(), endpoint);
+        }
+    }
+    pub fn summary(&self, alias: &str) -> String {
+        let mut summary = format!("{}  {}", alias.escape_default(), self.address());
         if let Some(bucket) = &self.bucket {
             summary.push_str(&format!("  bucket={}", bucket.escape_default()));
         }
@@ -143,14 +154,10 @@ pub fn load(path: &Path) -> Result<BTreeMap<String, Bookmark>> {
 /// Serde's `invalid type`/`invalid value` render the offending value itself,
 /// and raw parser errors embed source lines, so both stay suppressed; the
 /// position still tells the user where to look.
-fn explain_parse_error(
-    path: &Path,
-    source: &str,
-    error: &toml::de::Error,
-) -> anyhow::Error {
+fn explain_parse_error(path: &Path, source: &str, error: &toml::de::Error) -> anyhow::Error {
     let message = error.message();
-    let name_only = message.starts_with("unknown field `")
-        || message.starts_with("missing field `");
+    let name_only =
+        message.starts_with("unknown field `") || message.starts_with("missing field `");
     let reason = if name_only {
         message
     } else if message.starts_with("invalid type:") || message.starts_with("invalid value:") {
@@ -302,7 +309,11 @@ mod tests {
         let file = root.path().join("bookmarks.toml");
 
         // A misspelled field is the common mistake: name it and place it.
-        fs::write(&file, "[store01]\nurl = 'smb://store01'\nuser = 'HQ\\a'\npass = 'secret-value'\n").unwrap();
+        fs::write(
+            &file,
+            "[store01]\nurl = 'smb://store01'\nuser = 'HQ\\a'\npass = 'secret-value'\n",
+        )
+        .unwrap();
         let error = load(&file).unwrap_err().to_string();
         assert!(
             error.contains("unknown field `pass`, expected one of"),

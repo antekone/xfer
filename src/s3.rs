@@ -496,6 +496,8 @@ impl Backend for S3 {
                 region = value;
             }
             if bookmark.url.starts_with("s3://") {
+                // A bucket URL is not an HTTP endpoint: leave endpoint unset
+                // unless explicitly configured, so AWS resolves regional HTTPS.
                 bucket = Some(parse_bucket(&bookmark.url)?);
             } else {
                 validate_endpoint(&bookmark.url)?;
@@ -825,6 +827,19 @@ mod tests {
             root.resolve("//archive///photos//").path(),
             "/archive/photos/"
         );
+    }
+
+    #[tokio::test]
+    async fn bucket_bookmark_defaults_to_https_but_explicit_http_is_respected() {
+        use aws_sdk_s3::config::endpoint::{DefaultResolver, Params, ResolveEndpoint};
+        let resolver = DefaultResolver::new();
+        let bucket = parse_bucket("s3://example").unwrap();
+        let params = Params::builder().region("us-east-1").bucket(bucket.clone()).build().unwrap();
+        let endpoint = ResolveEndpoint::resolve_endpoint(&resolver,&params).await.unwrap();
+        assert!(endpoint.url().starts_with("https://"),"{}",endpoint.url());
+        let params = Params::builder().region("us-east-1").bucket(bucket).endpoint("http://localhost:9000").force_path_style(true).build().unwrap();
+        let endpoint = ResolveEndpoint::resolve_endpoint(&resolver,&params).await.unwrap();
+        assert!(endpoint.url().starts_with("http://"),"{}",endpoint.url());
     }
 
     #[test]

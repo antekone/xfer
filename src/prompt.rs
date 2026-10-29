@@ -10,7 +10,7 @@ fn basename(path: &str) -> &str {
     }
 }
 
-pub(crate) fn format(template: &str, info: &SessionInfo, local: &str) -> String {
+pub(crate) fn format(template: &str, info: &SessionInfo, local: &str) -> (String, Vec<(u32, u32)>) {
     let proto = info.protocol.as_deref().unwrap_or("");
     let path = info.cwd.as_deref().unwrap_or("");
     let cwd = match (&info.protocol, &info.cwd) {
@@ -35,6 +35,7 @@ pub(crate) fn format(template: &str, info: &SessionInfo, local: &str) -> String 
         _ => None,
     };
     let mut output = String::new();
+    let mut ranges = Vec::new();
     let mut rest = template;
     while let Some(index) = rest.find('$') {
         output.push_str(&rest[..index]);
@@ -59,7 +60,21 @@ pub(crate) fn format(template: &str, info: &SessionInfo, local: &str) -> String 
             (&rest[..end], end)
         };
         if let Some(value) = value(name) {
+            let start = output.len();
             output.push_str(value);
+            let (offset, length) = match name {
+                "cwd" if !path.is_empty() && !cwd.is_empty() => {
+                    (value.len() - path.len(), path.len())
+                }
+                "location" if !path.is_empty() && !location.is_empty() => {
+                    (value.len() - path.len() - 1, path.len())
+                }
+                "cwdn" | "lcwd" | "lcwdn" => (0, value.len()),
+                _ => (0, 0),
+            };
+            if length != 0 {
+                ranges.push((start + offset, start + offset + length));
+            }
         } else {
             output.push('$');
             output.push_str(&rest[..consumed]);
@@ -67,17 +82,32 @@ pub(crate) fn format(template: &str, info: &SessionInfo, local: &str) -> String 
         rest = &rest[consumed..];
     }
     output.push_str(rest);
-    // Neither endpoint data nor configuration may inject terminal controls.
-    output
-        .chars()
-        .flat_map(|ch| {
-            if ch.is_control() {
-                ch.escape_default().collect::<Vec<_>>()
-            } else {
-                vec![ch]
-            }
-        })
-        .collect()
+    // Escape controls while translating byte ranges to the escaped output.
+    let mut clean = String::new();
+    let mut clean_ranges = Vec::new();
+    let mut range_index = 0;
+    let mut active = None;
+    for (index, ch) in output.char_indices() {
+        if ranges
+            .get(range_index)
+            .is_some_and(|(start, _)| *start == index)
+        {
+            active = Some(clean.len());
+        }
+        if ch.is_control() {
+            clean.extend(ch.escape_default());
+        } else {
+            clean.push(ch);
+        }
+        if ranges
+            .get(range_index)
+            .is_some_and(|(_, end)| *end == index + ch.len_utf8())
+        {
+            clean_ranges.push((active.take().unwrap() as u32, clean.len() as u32));
+            range_index += 1;
+        }
+    }
+    (clean, clean_ranges)
 }
 
 #[cfg(test)]
@@ -94,7 +124,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            format("xfer[$cwd]> ", &info, "/tmp/work"),
+            format("xfer[$cwd]> ", &info, "/tmp/work").0,
             "xfer[sftp:/home/antek/]> "
         );
         assert_eq!(
@@ -102,11 +132,12 @@ mod tests {
                 "${user}@$host $proto $cwdn $lcwd $lcwdn",
                 &info,
                 "/tmp/work/"
-            ),
+            )
+            .0,
             "antek@example.org sftp antek /tmp/work/ work"
         );
         assert_eq!(
-            format("xfer$location> ", &info, "/"),
+            format("xfer$location> ", &info, "/").0,
             "xfer[sftp:/home/antek/]> "
         );
     }
@@ -114,15 +145,15 @@ mod tests {
     #[test]
     fn disconnected_roots_and_literal_dollars() {
         let mut info = SessionInfo::default();
-        assert_eq!(format("xfer$location> ", &info, "/"), "xfer> ");
-        assert_eq!(format("$user$host$cwd$cwdn$proto", &info, "/"), "");
+        assert_eq!(format("xfer$location> ", &info, "/").0, "xfer> ");
+        assert_eq!(format("$user$host$cwd$cwdn$proto", &info, "/").0, "");
         info.cwd = Some("/".into());
-        assert_eq!(format("$cwdn $lcwdn", &info, "/"), "/ /");
+        assert_eq!(format("$cwdn $lcwdn", &info, "/").0, "/ /");
         assert_eq!(
-            format("$$cwd $unknown ${unknown} $ ${", &info, "/"),
+            format("$$cwd $unknown ${unknown} $ ${", &info, "/").0,
             "$cwd $unknown ${unknown} $ ${"
         );
-        assert_eq!(format("", &info, "/"), "");
+        assert_eq!(format("", &info, "/").0, "");
     }
 
     #[test]
@@ -131,6 +162,23 @@ mod tests {
             user: "$host\n\x1b".into(),
             ..Default::default()
         };
-        assert_eq!(format("$user\r", &info, "/"), "$host\\n\\u{1b}\\r");
+        assert_eq!(format("$user\r", &info, "/").0, "$host\\n\\u{1b}\\r");
+    }
+    #[test]
+    fn spans_mark_only_expanded_paths_including_escaped_controls() {
+        let info = SessionInfo {
+            protocol: Some("sftp".into()),
+            cwd: Some("/very/long/\nname/".into()),
+            ..Default::default()
+        };
+        let (text, ranges) = format("$user [$cwd] fixed $location end $lcwd", &info, "/tmp/界");
+        let parts = ranges
+            .iter()
+            .map(|&(a, b)| &text[a as usize..b as usize])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parts,
+            vec!["/very/long/\\nname/", "/very/long/\\nname/", "/tmp/界"]
+        );
     }
 }

@@ -100,7 +100,10 @@ message Session {
   optional string prompt = 4;
   string user = 5;
   string host = 6;
+  // UTF-8 byte ranges in prompt corresponding to path substitutions.
+  repeated PromptPath prompt_paths = 7;
 }
+message PromptPath { uint32 start = 1; uint32 end = 2; }
 message CompletionResult { repeated string candidates = 1; bool truncated = 2; }
 message CommandResult {
   repeated string lines = 1;

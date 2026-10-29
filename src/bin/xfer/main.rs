@@ -715,54 +715,110 @@ fn fit_status_line(text: &str, terminal_width: u16) -> String {
     clipped
 }
 
-/// Prompts are clipped in the middle rather than from the right: the opening
-/// identifies the session and the trailing marker (typically `> `) signals
-/// that input is ready. Dropping the tail makes a connected client look like a
-/// dead one, which is exactly what happens with long canonicalized macOS
-/// paths under /private/var on an otherwise unchanged session.
-fn fit_prompt(text: &str, budget: u16) -> String {
+/// Prompt path spans are supplied by the daemon; never infer them from text.
+#[derive(Debug, PartialEq, Eq)]
+struct Prompt {
+    text: String,
+    paths: Vec<(usize, usize)>,
+}
+impl Prompt {
+    #[cfg(test)]
+    fn plain(text: &str) -> Self {
+        Self {
+            text: text.into(),
+            paths: Vec::new(),
+        }
+    }
+}
+fn fit_prompt(prompt: &Prompt, budget: u16) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if prompt.text.chars().any(char::is_control) {
+        let clean: String = prompt
+            .text
+            .chars()
+            .map(|ch| if ch.is_control() { ' ' } else { ch })
+            .collect();
+        return suffix_fit(&clean, budget as usize);
+    }
+    let text = &prompt.text;
+    let mut end = 0;
+    let valid = prompt.paths.iter().all(|&(start, stop)| {
+        let ok = start >= end
+            && start < stop
+            && stop <= text.len()
+            && text.is_char_boundary(start)
+            && text.is_char_boundary(stop);
+        end = stop;
+        ok
+    });
+    if text.width() <= budget as usize {
+        return text.clone();
+    }
+    let paths = if valid { prompt.paths.as_slice() } else { &[] };
+    if paths.is_empty() {
+        return suffix_fit(text, budget as usize);
+    }
+    let fixed_width = text.width().saturating_sub(
+        paths
+            .iter()
+            .map(|&(a, b)| text[a..b].width())
+            .sum::<usize>(),
+    );
+    if fixed_width > budget as usize {
+        // No layout can preserve all fixed characters in this terminal width.
+        let mut fixed = String::new();
+        let mut prev = 0;
+        for &(start, stop) in paths {
+            fixed.push_str(&text[prev..start]);
+            prev = stop;
+        }
+        fixed.push_str(&text[prev..]);
+        return suffix_fit(&fixed, budget as usize);
+    }
+    let mut remaining = (budget as usize).saturating_sub(fixed_width);
+    let mut output = String::new();
+    let mut previous = 0;
+    for (i, &(start, stop)) in paths.iter().enumerate() {
+        output.push_str(&text[previous..start]);
+        let path = &text[start..stop];
+        let share = remaining / (paths.len() - i);
+        if path.width() <= share {
+            output.push_str(path);
+            remaining -= path.width();
+        } else if share > 0 {
+            output.push('…');
+            let mut suffix = String::new();
+            let mut used = 1;
+            for ch in path.chars().rev() {
+                let width = ch.width().unwrap_or(0);
+                if used + width > share {
+                    break;
+                }
+                suffix.insert(0, ch);
+                used += width;
+            }
+            output.push_str(&suffix);
+            remaining -= used;
+        }
+        previous = stop;
+    }
+    output.push_str(&text[previous..]);
+    output
+}
+
+fn suffix_fit(text: &str, budget: usize) -> String {
     use unicode_width::UnicodeWidthChar;
-    let budget = budget as usize;
-    let clean = text
-        .chars()
-        .map(|ch| if ch.is_control() { ' ' } else { ch })
-        .collect::<String>();
-    if budget == 0 {
-        return String::new();
-    }
-    let width = clean
-        .chars()
-        .map(|ch| ch.width().unwrap_or(0))
-        .sum::<usize>();
-    if width <= budget {
-        return clean;
-    }
-    // One cell goes to the ellipsis; keep a shorter head so that the more
-    // meaningful tail, including the marker, survives very long values.
-    let keep = budget - 1;
-    let head_budget = keep / 3;
-    let tail_budget = keep - head_budget;
-    let mut head = String::new();
+    let mut result = String::new();
     let mut used = 0;
-    for ch in clean.chars() {
+    for ch in text.chars().rev() {
         let width = ch.width().unwrap_or(0);
-        if used + width > head_budget {
+        if used + width > budget {
             break;
         }
-        head.push(ch);
+        result.insert(0, ch);
         used += width;
     }
-    let mut tail = String::new();
-    let mut used = 0;
-    for ch in clean.chars().rev() {
-        let width = ch.width().unwrap_or(0);
-        if used + width > tail_budget {
-            break;
-        }
-        tail.insert(0, ch);
-        used += width;
-    }
-    format!("{head}…{tail}")
+    result
 }
 
 #[derive(Default)]
@@ -1179,8 +1235,15 @@ fn session_prompt(info: &xfer::daemon::SessionInfo) -> String {
     }
 }
 
-fn fetch_session_prompt(client: &mut Connection) -> Result<String> {
-    Ok(session_prompt(&client.session()?.into()))
+fn fetch_session_prompt(client: &mut Connection) -> Result<Prompt> {
+    let info: xfer::daemon::SessionInfo = client.session()?.into();
+    let text = session_prompt(&info);
+    let paths = info
+        .prompt_paths
+        .into_iter()
+        .map(|(a, b)| (a as usize, b as usize))
+        .collect();
+    Ok(Prompt { text, paths })
 }
 
 #[cfg(test)]
@@ -1523,6 +1586,42 @@ mod startup_tests {
     }
 
     #[test]
+    fn prompt_fits_paths_only_and_preserves_all_fixed_suffixes() {
+        let text = "user@sftp:[/very/long/界/path/] END >>> ";
+        let start = text.find("/very").unwrap();
+        let end = text.find("] END").unwrap();
+        let prompt = Prompt {
+            text: text.into(),
+            paths: vec![(start, end)],
+        };
+        let fit = fit_prompt(&prompt, 30);
+        assert!(fit.starts_with("user@sftp:["), "{fit}");
+        assert!(fit.ends_with("] END >>> "), "{fit}");
+        assert!(fit.contains('…'));
+        assert!(unicode_width::UnicodeWidthStr::width(fit.as_str()) <= 30);
+        assert_eq!(fit_prompt(&prompt, 100), text);
+        let fixed = Prompt::plain("long fixed text END> ");
+        assert_eq!(fit_prompt(&fixed, 8), "xt END> ");
+        let malformed = Prompt {
+            text: "abc\x1b[2J".into(),
+            paths: vec![(1, 100)],
+        };
+        assert!(!fit_prompt(&malformed, 100).contains('\x1b'));
+    }
+    #[test]
+    fn multiple_path_substitutions_keep_intervening_text() {
+        let text = "A/one/very/long/ Z /two/very/long/ TAIL";
+        let prompt = Prompt {
+            text: text.into(),
+            paths: vec![(1, 16), (19, 34)],
+        };
+        let result = fit_prompt(&prompt, 20);
+        assert!(result.starts_with('A'));
+        assert!(result.contains(" Z "));
+        assert!(result.ends_with(" TAIL"));
+        assert!(unicode_width::UnicodeWidthStr::width(result.as_str()) <= 20);
+    }
+    #[test]
     fn prompt_is_loaded_without_creating_a_job() {
         let (mut client, worker) = rpc_pair(1, |op| {
             assert!(matches!(op, Op::Session(_)));
@@ -1536,7 +1635,7 @@ mod startup_tests {
         });
         assert_eq!(
             fetch_session_prompt(&mut client).unwrap(),
-            "custom[archive]> "
+            Prompt::plain("custom[archive]> ")
         );
         worker.join().unwrap();
     }

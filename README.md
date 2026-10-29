@@ -660,8 +660,10 @@ bookmarks, preserving comments and formatting; newly created files are mode
 0600. Protect existing files yourself and prefer the AWS credential chain when
 possible. Credentials are not included in command output or parse diagnostics.
 
-`s3:region` defaults to `us-east-1`; `s3:endpoint` optionally overrides the endpoint
-for direct bucket URLs. Custom endpoints use path-style addressing. TLS
+`s3:region` defaults to `us-east-1`. An `s3://bucket` bookmark uses the AWS SDK's
+regional **HTTPS** endpoint by default; it does not derive an HTTP endpoint from
+the bookmark. `s3:endpoint` optionally overrides the endpoint for bucket URLs;
+an explicit `http://` endpoint still requests plain HTTP. Custom endpoints use path-style addressing. TLS
 certificate validation is enabled by default. `set ssl:skip-validation true` opts
 into disabling certificate trust/hostname validation for subsequent S3 connections
 (unsafe on untrusted networks). Only SigV4 is supported.
