@@ -247,7 +247,13 @@ exec {server} -d "$TEST_REMOTE_ROOT"
         }
     }
     fn remote(&self) -> PathBuf {
-        self.root.path().join("remote")
+        // The SFTP server resolves the real path of the served directory, which
+        // canonicalizes symlinked temp roots on macOS (/var -> /private/var),
+        // so expectations must use the canonical spelling.
+        fs::canonicalize(self.root.path().join("remote")).unwrap()
+    }
+    fn home(&self) -> PathBuf {
+        fs::canonicalize(self.root.path().join("home")).unwrap()
     }
 }
 
@@ -299,7 +305,10 @@ fn interactive_password_sftp_navigation_listing_completion_and_resumed_download(
         .lines()
         .find(|line| line.ends_with("linked photos/"))
         .unwrap();
-    assert!(link_line.starts_with("lrwxrwxrwx"), "{link_line}");
+    // Symlink mode bits differ by platform: Linux creates 0777 symlinks while
+    // macOS applies the umask. Only the link type and the target are part of
+    // the contract here.
+    assert!(link_line.starts_with('l') && link_line.contains("photos"), "{link_line}");
     let large_line = listing
         .lines()
         .find(|line| line.ends_with("large.bin"))
@@ -513,6 +522,11 @@ fn lcd_uses_daemon_home_and_changes_future_download_destinations_only() {
     daemon.connect("test-secret", true);
     let response = daemon.command("cd photos");
     daemon.finish(response, true);
+    // `lcd` without arguments resolves the daemon HOME, which was created as
+    // a plain directory but reported through the canonicalized filesystem
+    // spelling on symlinked temp roots.
+    let home = daemon.home();
+    let downloads = home.join("photo album");
     assert_eq!(
         daemon.command("lcd"),
         vec![format!("Local CWD: {}", home.display())]

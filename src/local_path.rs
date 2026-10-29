@@ -311,7 +311,12 @@ mod tests {
             OsString::from("unsafe\nname"),
             OsString::from_vec(vec![255]),
         ] {
-            fs::create_dir(root.path().join(name)).unwrap();
+            // Some filesystems (e.g. recent macOS) refuse to store names that
+            // are not valid UTF-8 at all, in which case completion can never
+            // observe such candidates and there is nothing to filter.
+            if let Err(error) = fs::create_dir(root.path().join(&name)) {
+                assert_eq!(error.raw_os_error(), Some(92)); // EILSEQ
+            }
         }
         assert_eq!(
             complete_with_home(root.path(), "", None)

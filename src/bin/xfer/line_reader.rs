@@ -207,7 +207,7 @@ impl CommandLine {
     fn frame(&mut self, prompt: &str, columns: u16, clear: bool) -> String {
         let limit = columns.saturating_sub(1) as usize;
         let prompt_budget = columns.saturating_sub(3).min(columns / 2 + 1);
-        let prompt = crate::fit_status_line(prompt, prompt_budget);
+        let prompt = crate::fit_prompt(prompt, prompt_budget);
         let prompt_width = prompt.width();
         let available = limit.saturating_sub(prompt_width);
         self.view_start = self.view_start.min(self.cursor);

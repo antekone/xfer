@@ -319,9 +319,7 @@ fn verify_spawned_by_client() -> Result<()> {
     let parent = if parent <= 1 {
         None
     } else {
-        fs::read_link(format!("/proc/{parent}/exe"))
-            .ok()
-            .and_then(|path| path.canonicalize().ok())
+        parent_executable_path(parent).and_then(|path| path.canonicalize().ok())
     };
 
     if parent.as_deref() != Some(own.as_path()) {
@@ -332,6 +330,31 @@ fn verify_spawned_by_client() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Resolve the executable of the parent process. Linux exposes the target
+/// binary as a procfs symlink; other Unix systems have no such directory and
+/// need their own process information API.
+#[cfg(target_os = "linux")]
+fn parent_executable_path(parent: libc::pid_t) -> Option<PathBuf> {
+    fs::read_link(format!("/proc/{parent}/exe")).ok()
+}
+
+/// Darwin has no procfs; `proc_pidpath` is the supported interface for another
+/// process's executable path. PIDs the kernel will not name yield None, so
+/// the check stays conservative rather than guessing.
+#[cfg(target_os = "macos")]
+fn parent_executable_path(parent: libc::pid_t) -> Option<PathBuf> {
+    // The syscall writes a truncated path if the buffer is too small, so a
+    // wrong result can never look like a valid short match.
+    let mut buffer = [0u8; libc::MAXPATHLEN as usize];
+    let length = unsafe { libc::proc_pidpath(parent, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+    if length <= 0 {
+        return None;
+    }
+    let bytes = buffer.get(..length as usize).unwrap_or(&buffer);
+    let end = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
+    std::str::from_utf8(&bytes[..end]).ok().map(PathBuf::from)
 }
 
 pub async fn main() -> Result<()> {
@@ -360,6 +383,11 @@ pub async fn main() -> Result<()> {
             }
             Err(error) => return Err(error.into()),
         };
+        // The listener is nonblocking for the poll loop, and BSD systems
+        // inherit O_NONBLOCK onto accepted sockets (Linux does not). The
+        // per-connection workers use blocking reads governed by read
+        // timeouts, so restore blocking mode before handing the stream over.
+        stream.set_nonblocking(false)?;
         let runtime = tokio::runtime::Handle::current();
         let shared = Shared {
             attached: shared.attached.clone(),

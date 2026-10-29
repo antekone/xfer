@@ -715,6 +715,56 @@ fn fit_status_line(text: &str, terminal_width: u16) -> String {
     clipped
 }
 
+/// Prompts are clipped in the middle rather than from the right: the opening
+/// identifies the session and the trailing marker (typically `> `) signals
+/// that input is ready. Dropping the tail makes a connected client look like a
+/// dead one, which is exactly what happens with long canonicalized macOS
+/// paths under /private/var on an otherwise unchanged session.
+fn fit_prompt(text: &str, budget: u16) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let budget = budget as usize;
+    let clean = text
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>();
+    if budget == 0 {
+        return String::new();
+    }
+    let width = clean
+        .chars()
+        .map(|ch| ch.width().unwrap_or(0))
+        .sum::<usize>();
+    if width <= budget {
+        return clean;
+    }
+    // One cell goes to the ellipsis; keep a shorter head so that the more
+    // meaningful tail, including the marker, survives very long values.
+    let keep = budget - 1;
+    let head_budget = keep / 3;
+    let tail_budget = keep - head_budget;
+    let mut head = String::new();
+    let mut used = 0;
+    for ch in clean.chars() {
+        let width = ch.width().unwrap_or(0);
+        if used + width > head_budget {
+            break;
+        }
+        head.push(ch);
+        used += width;
+    }
+    let mut tail = String::new();
+    let mut used = 0;
+    for ch in clean.chars().rev() {
+        let width = ch.width().unwrap_or(0);
+        if used + width > tail_budget {
+            break;
+        }
+        tail.insert(0, ch);
+        used += width;
+    }
+    format!("{head}…{tail}")
+}
+
 #[derive(Default)]
 struct ForegroundDisplay {
     previous_status: Option<String>,

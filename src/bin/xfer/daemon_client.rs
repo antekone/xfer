@@ -340,9 +340,11 @@ mod tests {
         let error = start_command(shell(&script), Duration::from_secs(2)).unwrap_err();
         assert!(error.to_string().contains("does not belong"), "{error}");
         let (mut stream, _) = listener.accept().unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
+        // The rejected client has closed its end by now; a peer-closed socket
+        // reads EOF immediately. macOS additionally rejects SO_RCVTIMEO with
+        // EINVAL on such a socket, so a failed timeout is not an error here:
+        // it can only be a hang guard, never a correctness signal.
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
         // In particular, no ATTACH, CWD, rc command, or credential was sent.
         assert_eq!(stream.read(&mut [0u8; 1]).unwrap(), 0);
     }

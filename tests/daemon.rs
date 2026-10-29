@@ -501,13 +501,17 @@ fn directory_snapshots_are_fresh_paged_and_closed_without_completion_limits() {
         pb::JobState::Completed as i32
     );
     fs::write(files.join("created-after-snapshot"), b"").unwrap();
+    // Canonicalize the expected base: daemon-resolved paths traverse macOS
+    // symlinked temp roots (/var/folders -> /private/var/folders), while
+    // `tempfile` hands out the unresolved spelling.
+    let canonical_files = fs::canonicalize(&files).unwrap();
     let mut offset = 0;
     let mut names = Vec::new();
     loop {
         let page = client.directory_page(id, offset, 97).unwrap();
         assert_eq!(page.total, 2502);
         assert!(page.entries.len() <= 97);
-        assert_eq!(page.path, files.to_str().unwrap());
+        assert_eq!(page.path, canonical_files.to_str().unwrap());
         names.extend(page.entries.into_iter().map(|entry| entry.name));
         offset = page.next_offset;
         if page.eof {
