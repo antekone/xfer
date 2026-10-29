@@ -103,14 +103,9 @@ pub fn load(path: &Path) -> Result<BTreeMap<String, Bookmark>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
         Err(e) => return Err(e).context("read bookmarks"),
     };
-    // Do not print TOML parser errors: they can include credential-bearing source lines.
     let source = zeroize::Zeroizing::new(source);
-    let entries: BTreeMap<String, Bookmark> = toml::from_str(&source).map_err(|_| {
-        anyhow::anyhow!(
-            "invalid bookmarks TOML at {} (expected named bookmark tables)",
-            path.display()
-        )
-    })?;
+    let entries: BTreeMap<String, Bookmark> =
+        toml::from_str(&source).map_err(|error| explain_parse_error(path, &source, &error))?;
     let mut entries = entries;
     for (name, entry) in entries.iter_mut() {
         if entry.protocol.trim().is_empty() {
@@ -140,6 +135,50 @@ pub fn load(path: &Path) -> Result<BTreeMap<String, Bookmark>> {
         }
     }
     Ok(entries)
+}
+
+/// Turn a TOML parse/decode failure into a diagnostic that stays safe when the
+/// file carries credentials: forward only messages proven to contain field
+/// names or structure words, and report positions instead of source content.
+/// Serde's `invalid type`/`invalid value` render the offending value itself,
+/// and raw parser errors embed source lines, so both stay suppressed; the
+/// position still tells the user where to look.
+fn explain_parse_error(
+    path: &Path,
+    source: &str,
+    error: &toml::de::Error,
+) -> anyhow::Error {
+    let message = error.message();
+    let name_only = message.starts_with("unknown field `")
+        || message.starts_with("missing field `");
+    let reason = if name_only {
+        message
+    } else if message.starts_with("invalid type:") || message.starts_with("invalid value:") {
+        "a value has the wrong type"
+    } else {
+        "invalid or unexpected syntax"
+    };
+    anyhow::anyhow!("invalid bookmarks TOML at {}", path.display()).context(
+        error
+            .span()
+            .map(|span| {
+                let (line, column) = line_column(source, span.start);
+                format!("{reason} at line {line}, column {column}")
+            })
+            .unwrap_or_else(|| reason.to_owned()),
+    )
+}
+
+/// Translate a byte offset into 1-based line and column numbers. The offset is
+/// bounded by the document length; parser spans always point inside it.
+fn line_column(source: &str, offset: usize) -> (usize, usize) {
+    let offset = offset.min(source.len());
+    let line = source[..offset].matches('\n').count() + 1;
+    let column = source[..offset]
+        .rsplit_once('\n')
+        .map_or(offset, |(_, last)| last.len())
+        + 1;
+    (line, column)
 }
 
 pub fn prepare_for_editor(path: &Path) -> Result<()> {
@@ -255,5 +294,45 @@ mod tests {
         let text = "# preserved by editor\nminio = { type = 's3', url = 'https://localhost:9000', accessKey = 'a', secretKey = 'b', api = 's3v4' }";
         let values: BTreeMap<String, Bookmark> = toml::from_str(text).unwrap();
         assert_eq!(values["minio"].protocol, "s3");
+    }
+
+    #[test]
+    fn parse_errors_report_positions_without_leaking_values() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("bookmarks.toml");
+
+        // A misspelled field is the common mistake: name it and place it.
+        fs::write(&file, "[store01]\nurl = 'smb://store01'\nuser = 'HQ\\a'\npass = 'secret-value'\n").unwrap();
+        let error = load(&file).unwrap_err().to_string();
+        assert!(
+            error.contains("unknown field `pass`, expected one of"),
+            "{error}"
+        );
+        assert!(error.contains("line 4, column 1"), "{error}");
+        assert!(!error.contains("secret-value"), "{error}");
+
+        // A missing required field is named without quoting values.
+        fs::write(&file, "[broken]\ntype = 'sftp'\n").unwrap();
+        let error = load(&file).unwrap_err().to_string();
+        assert!(error.contains("missing field `url`"), "{error}");
+
+        // Type errors embed the offending value, so only the position is
+        // forwarded.
+        fs::write(&file, "[broken]\nurl = 123456789\n").unwrap();
+        let error = load(&file).unwrap_err().to_string();
+        assert!(error.contains("wrong type at line 2, column 7"), "{error}");
+        assert!(!error.contains("123456789"), "{error}");
+
+        // Raw syntax errors embed source lines; keep them summarized too.
+        fs::write(&file, "[broken\nurl = 'value'\n").unwrap();
+        let error = load(&file).unwrap_err().to_string();
+        assert!(error.contains("line 1, column 8"), "{error}");
+        assert!(!error.contains("value"), "{error}");
+
+        // Inline-table values stay secret as well.
+        fs::write(&file, "broken = { url = 'x', pass = 'secret-value' }\n").unwrap();
+        let error = load(&file).unwrap_err().to_string();
+        assert!(error.contains("unknown field `pass`"), "{error}");
+        assert!(!error.contains("secret-value"), "{error}");
     }
 }
