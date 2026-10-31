@@ -1136,6 +1136,24 @@ mod tests {
     }
 
     #[test]
+    fn rm_completion_preserves_multiple_quoted_paths_and_double_dash() {
+        assert_eq!(
+            path_completion_context("rm 'first file' pho").unwrap(),
+            (
+                "rm 'first file'".into(),
+                "pho".into(),
+                pb::CompletionKind::RemotePath
+            )
+        );
+        let command = complete_with_candidates("rm 'first file' -- -fi", &["-file name"], false);
+        assert_eq!(
+            shlex::split(&command).unwrap(),
+            vec!["rm", "first file", "--", "-file name"]
+        );
+        assert!(path_completion_context("rm -r ").is_none());
+    }
+
+    #[test]
     fn cat_completion_handles_multiple_quoted_paths_and_literal_dash_names() {
         assert_eq!(
             path_completion_context("cat first.txt pho").unwrap(),

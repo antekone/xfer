@@ -142,6 +142,12 @@ impl Client {
             }
         }
     }
+    pub(super) async fn remove_file(&mut self, tree: &Tree, path: &str) -> smb2::Result<()> {
+        match self {
+            Self::Named(client) => client.delete_file(tree, path).await,
+            Self::Anonymous(client) => tree.delete_file(&mut client.0, path).await,
+        }
+    }
     pub(super) async fn rename_file(
         &mut self,
         tree: &Tree,

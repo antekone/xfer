@@ -689,3 +689,21 @@ async fn smb_native_file_moves_are_exclusive_and_stay_within_the_same_share() {
     assert!(server.path("share/hello world.txt").exists());
     connection.disconnect().await.unwrap();
 }
+
+#[tokio::test]
+async fn rm_files_on_named_and_anonymous_sessions_without_removing_directories() {
+    let Some(server) = Server::start() else {
+        return;
+    };
+    for named in [false, true] {
+        fs::write(server.path("share/to remove.txt"), b"data").unwrap();
+        let connection = Smb.connect(server.options(named, "share")).await.unwrap();
+        connection.remove_file("to remove.txt").await.unwrap();
+        assert!(!server.path("share/to remove.txt").exists());
+        assert!(connection.remove_file("photos").await.is_err());
+        assert!(server.path("share/photos/image.txt").exists());
+        assert!(connection.remove_file("missing").await.is_err());
+        assert!(connection.remove_file("/share").await.is_err());
+        connection.disconnect().await.unwrap();
+    }
+}

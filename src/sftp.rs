@@ -798,6 +798,16 @@ impl Connection for SftpConnection {
         lease.finish(result)
     }
 
+    async fn remove_file(&self, path: &str) -> Result<()> {
+        crate::backend::validate_file_path(path)?;
+        let path = self.resolve_listing_path(path)?;
+        let lease = self.acquire().await?;
+        // SFTP REMOVE removes files/symlinks, never directories, atomically
+        // at the server (no unsafe stat-then-recursive-delete).
+        let result = operation(lease.session.sftp.fs().remove_file(path)).await;
+        lease.finish(result)
+    }
+
     async fn rename_file(&self, source: &str, destination: &str, overwrite: bool) -> Result<()> {
         crate::backend::validate_rename_paths(source, destination)?;
         let source = self.resolve_listing_path(source)?;

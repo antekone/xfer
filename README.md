@@ -64,6 +64,25 @@ S3, SFTP, SMB, and WebDAV support connect, navigation, listing and downloads.
 SFTP, SMB, and WebDAV also support uploads with `put`; all four backends support
 file renaming with `mv`. S3 uploads and mirroring are not implemented yet.
 
+## Removing remote files
+
+`rm [--] <files...>` deletes exact remote filenames on SFTP, SMB, WebDAV and
+S3. Multiple files are processed in order; processing stops at the first error,
+so earlier deletions may already have succeeded. Use `--` before names starting
+with `-`. TAB completes remote paths, including later operands. No glob
+expansion, recursive deletion, directory removal, or `-f` is provided.
+
+A delete is never automatically retried: if the connection fails or a job is
+cancelled, inspect the path before repeating it. Completion caches are cleared
+even after failure or cancellation. SFTP REMOVE removes a final symlink itself;
+SMB uses a non-directory file operation. For WebDAV, a strong ETag and a server
+that enforces If-Match are required: deleting a collection could otherwise be
+recursive. S3 requires a source ETag and conditional DeleteObject; versioned
+buckets create their usual delete marker. These checks are not atomic snapshots:
+a replacement with the same ETag may not be distinguishable. Some S3-compatible
+or WebDAV servers may not support the required conditional operations and will
+fail rather than use an unconditional delete.
+
 ## Renaming remote files
 
 ```text

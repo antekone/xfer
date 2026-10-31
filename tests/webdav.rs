@@ -316,6 +316,13 @@ async fn handle(
             let Some(node) = state.nodes.get(&lookup) else {
                 return Ok(response(404, "missing"));
             };
+            if call
+                .conditional
+                .as_deref()
+                .is_some_and(|tag| tag != format!("\"v{}\"", node.revision))
+            {
+                return Ok(response(412, "condition false"));
+            }
             if mode != Mode::IgnoreDavIf
                 && call.tagged_if.as_ref().is_some_and(|tagged| {
                     tagged.ends_with(&format!("(Not [\"v{}\"])", node.revision))
@@ -328,6 +335,17 @@ async fn handle(
                 .header("content-length", node.data.len())
                 .body(Body::empty())
                 .unwrap())
+        }
+        "DELETE" => {
+            let mut state = state.lock().unwrap();
+            let Some(node) = state.nodes.get(&lookup) else {
+                return Ok(response(404, "missing"));
+            };
+            if call.conditional.as_deref() != Some(format!("\"v{}\"", node.revision).as_str()) {
+                return Ok(response(412, "changed"));
+            }
+            state.nodes.remove(&lookup);
+            Ok(response(204, Body::empty()))
         }
         "MOVE" => {
             if mode == Mode::MoveRedirect {
@@ -1229,4 +1247,51 @@ async fn unsafe_webdav_replacement_is_refused_when_server_ignores_tagged_conditi
         .await
         .unwrap();
     assert!(fixture.state.lock().unwrap().nodes.contains_key("/dav/new"));
+}
+
+#[tokio::test]
+async fn rm_uses_guarded_delete_refuses_collections_and_invalidates_cache() {
+    let fixture = Fixture::start(false);
+    let app = Daemon::bootstrap().unwrap();
+    let connection = xfer::cache::CachedConnection::new(
+        fixture.connect().await,
+        xfer::cache::CacheOptions::from_settings(&app.settings).unwrap(),
+    );
+    assert_eq!(
+        connection.complete_paths("hello").await.unwrap().candidates,
+        vec!["hello.bin"]
+    );
+    connection.remove_file("hello.bin").await.unwrap();
+    assert!(connection
+        .complete_paths("hello")
+        .await
+        .unwrap()
+        .candidates
+        .is_empty());
+    assert!(connection
+        .remove_file("dir")
+        .await
+        .unwrap_err()
+        .is::<NonRetryableError>());
+    assert!(connection
+        .remove_file("missing")
+        .await
+        .unwrap_err()
+        .is::<NonRetryableError>());
+    fixture.mode(Mode::MissingValidator);
+    assert!(connection
+        .remove_file("雪 %?#.txt")
+        .await
+        .unwrap_err()
+        .is::<NonRetryableError>());
+    let state = fixture.state.lock().unwrap();
+    assert!(state.nodes.contains_key("/dav/dir/"));
+    assert!(state.nodes.contains_key("/dav/雪 %?#.txt"));
+    let deletes = state
+        .calls
+        .iter()
+        .filter(|call| call.method == "DELETE")
+        .collect::<Vec<_>>();
+    assert_eq!(deletes.len(), 1);
+    assert_eq!(deletes[0].conditional.as_deref(), Some("\"v1\""));
 }

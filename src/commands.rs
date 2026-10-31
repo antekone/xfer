@@ -17,6 +17,7 @@ pub(crate) mod mkdir;
 pub(crate) mod mv;
 pub(crate) mod output;
 pub(crate) mod put;
+pub(crate) mod rm;
 pub(crate) mod shell;
 pub(crate) mod status;
 
@@ -205,6 +206,7 @@ pub static COMMANDS: &[&dyn Command] = &[
     &ls::Ls,
     &mkdir::Mkdir,
     &mv::Mv,
+    &rm::Rm,
     &du::Du,
     &get::Get,
     &put::Put,

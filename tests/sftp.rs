@@ -308,7 +308,10 @@ fn interactive_password_sftp_navigation_listing_completion_and_resumed_download(
     // Symlink mode bits differ by platform: Linux creates 0777 symlinks while
     // macOS applies the umask. Only the link type and the target are part of
     // the contract here.
-    assert!(link_line.starts_with('l') && link_line.contains("photos"), "{link_line}");
+    assert!(
+        link_line.starts_with('l') && link_line.contains("photos"),
+        "{link_line}"
+    );
     let large_line = listing
         .lines()
         .find(|line| line.ends_with("large.bin"))
@@ -1276,4 +1279,37 @@ fn sftp_moves_use_basic_rename_without_extensions_and_do_not_replay_permission_e
             .count(),
         2
     );
+}
+
+#[test]
+fn rm_deletes_exact_files_and_symlinks_but_not_directories_and_refreshes_completion() {
+    let Some(mut daemon) = Daemon::start() else {
+        return;
+    };
+    fs::write(daemon.remote().join("literal*.txt"), b"literal").unwrap();
+    fs::write(daemon.remote().join("-dash"), b"dash").unwrap();
+    daemon.connect("test-secret", true);
+    assert_eq!(
+        daemon
+            .complete(pb::CompletionKind::RemotePath, "literal")
+            .unwrap()
+            .candidates,
+        vec!["literal*.txt"]
+    );
+    let response = daemon.command("rm -- 'literal*.txt' -dash 'linked photos'");
+    daemon.finish(response, true);
+    assert!(!daemon.remote().join("literal*.txt").exists());
+    assert!(!daemon.remote().join("-dash").exists());
+    assert!(fs::symlink_metadata(daemon.remote().join("linked photos")).is_err());
+    assert!(daemon.remote().join("photos/image.txt").exists());
+    assert!(daemon
+        .complete(pb::CompletionKind::RemotePath, "literal")
+        .unwrap()
+        .candidates
+        .is_empty());
+    let response = daemon.command("rm photos");
+    daemon.finish(response, false);
+    assert!(daemon.remote().join("photos/image.txt").exists());
+    let response = daemon.command("rm missing");
+    daemon.finish(response, false);
 }

@@ -914,6 +914,50 @@ impl Connection for WebdavConnection {
         }
         unchanged(&self.stat(&location, false).await?, expected)
     }
+    async fn remove_file(&self, path: &str) -> Result<()> {
+        crate::backend::validate_file_path(path)?;
+        let location = self.cwd.resolve(path)?;
+        let entry = self.stat(&location, false).await?;
+        if entry.directory {
+            return Err(permanent("rm refuses WebDAV collections"));
+        }
+        let tag = entry
+            .etag
+            .filter(|tag| !tag.starts_with("W/"))
+            .ok_or_else(|| permanent("safe WebDAV rm requires a strong ETag"))?;
+        // A DELETE against a collection is recursive. Check non-destructively
+        // that the server enforces If-Match before relying on its condition.
+        let url = location.url(&self.base, false);
+        let mut probe = HeaderMap::new();
+        probe.insert(
+            header::IF_MATCH,
+            HeaderValue::from_static("\"xfer-impossible-validator\""),
+        );
+        if tag == "\"xfer-impossible-validator\"" {
+            return Err(permanent("cannot safely validate WebDAV delete conditions"));
+        }
+        let response = self
+            .request(Method::HEAD, url.clone(), probe, empty_body())
+            .await?;
+        if response.status() != StatusCode::PRECONDITION_FAILED {
+            return Err(permanent(
+                "safe WebDAV rm requires enforced If-Match conditions",
+            ));
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::IF_MATCH,
+            HeaderValue::from_str(&tag).map_err(|_| invalid_xml())?,
+        );
+        let response = self
+            .request(Method::DELETE, url, headers, empty_body())
+            .await?;
+        if matches!(response.status().as_u16(), 200 | 204) {
+            Ok(())
+        } else {
+            Err(http_error(response.status().as_u16()))
+        }
+    }
     async fn rename_file(&self, source: &str, destination: &str, overwrite: bool) -> Result<()> {
         crate::backend::validate_rename_paths(source, destination)?;
         let source = self.cwd.resolve(source)?;

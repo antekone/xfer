@@ -223,6 +223,20 @@ impl Connection for S3Connection {
     fn pwd(&self) -> Result<String> {
         Ok(self.location.path())
     }
+    async fn remove_file(&self, path: &str) -> Result<()> {
+        crate::backend::validate_file_path(path)?;
+        let target = self.location.resolve(path);
+        let bucket = target.bucket.as_deref().ok_or_else(|| NonRetryableError("select an S3 bucket before deleting objects".into()))?;
+        let key = target.prefix.trim_end_matches('/');
+        if key.is_empty() { return Err(NonRetryableError("cannot remove an S3 bucket".into()).into()); }
+        let before = self.client.head_object().bucket(bucket).key(key).send().await
+            .map_err(|error| operation_error("HeadObject",&error,&self.redactions))?;
+        let tag = before.e_tag().filter(|tag| rename::strong_tag(tag))
+            .ok_or_else(|| NonRetryableError("S3 rm requires a strong quoted ETag".into()))?;
+        self.client.delete_object().bucket(bucket).key(key).if_match(tag).send().await
+            .map_err(|error| operation_error("DeleteObject",&error,&self.redactions))?;
+        Ok(())
+    }
     async fn rename_file(&self, source: &str, destination: &str, overwrite: bool) -> Result<()> {
         self.move_object(source, destination, overwrite).await
     }

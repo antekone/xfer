@@ -703,6 +703,31 @@ impl Connection for SmbConnection {
         let result = download_on(lease.get(), &target, offset, expected, sink).await;
         lease.finish(result)
     }
+    async fn remove_file(&self, path: &str) -> Result<()> {
+        crate::backend::validate_file_path(path)?;
+        if path.contains(['\\', ':']) {
+            return Err(permanent("invalid SMB removal path"));
+        }
+        let target = self.cwd.resolve(path)?;
+        let share = target
+            .share
+            .as_deref()
+            .ok_or_else(|| permanent("select an SMB share before removing files"))?;
+        if target.key().is_empty() {
+            return Err(permanent("cannot remove an SMB share"));
+        }
+        let mut lease = self.acquire().await?;
+        let result = async {
+            let session = lease.get();
+            session.select(share).await?;
+            let timeout = session.options.io_timeout;
+            let (client, tree) = session.parts();
+            // smb2 uses FILE_NON_DIRECTORY_FILE in the delete CREATE.
+            call(timeout, client.remove_file(tree, target.key())).await
+        }
+        .await;
+        lease.finish(result)
+    }
     async fn rename_file(&self, source: &str, destination: &str, overwrite: bool) -> Result<()> {
         crate::backend::validate_rename_paths(source, destination)?;
         if [source, destination]

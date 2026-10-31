@@ -77,6 +77,10 @@ pub trait Connection: Send + Sync {
     async fn rename_file(&self, _source: &str, _destination: &str, _overwrite: bool) -> Result<()> {
         Err(NonRetryableError(format!("mv is not implemented for {}", self.protocol())).into())
     }
+    /// Remove a single exact non-directory path, with no implicit retry.
+    async fn remove_file(&self, _path: &str) -> Result<()> {
+        Err(NonRetryableError(format!("rm is not implemented for {}", self.protocol())).into())
+    }
     async fn complete_directories(&self, _input: &str) -> Result<crate::cache::PathCompletion> {
         bail!(
             "directory completion is not available for {}",
@@ -116,6 +120,20 @@ pub(crate) fn validate_rename_paths(source: &str, destination: &str) -> Result<(
             )
             .into());
         }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_file_path(path: &str) -> Result<()> {
+    if path.is_empty()
+        || path.len() > 64 * 1024
+        || path.chars().any(char::is_control)
+        || matches!(path.rsplit('/').next(), Some("" | "." | ".."))
+    {
+        return Err(NonRetryableError(
+            "rm requires an exact file path (at most 64 KiB), not a directory".into(),
+        )
+        .into());
     }
     Ok(())
 }

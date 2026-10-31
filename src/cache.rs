@@ -301,6 +301,12 @@ impl Connection for CachedConnection {
         self.cache.lock().unwrap().clear();
         result
     }
+    async fn remove_file(&self, path: &str) -> Result<()> {
+        self.cache.lock().unwrap().clear();
+        let result = self.inner.remove_file(path).await;
+        self.cache.lock().unwrap().clear();
+        result
+    }
     async fn rename_file(&self, source: &str, destination: &str, overwrite: bool) -> Result<()> {
         // Clear both source/destination parents and aliases, even on cancellation.
         self.cache.lock().unwrap().clear();
