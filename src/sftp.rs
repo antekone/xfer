@@ -155,22 +155,41 @@ impl Target {
         format!("{user}{host}{port}")
     }
 
-    fn command(&self, program: &Path, timeout: u64, password: bool) -> Command {
+    fn command(
+        &self,
+        program: &Path,
+        timeout: u64,
+        password: bool,
+        disable_strict_checking: bool,
+    ) -> Command {
         let mut command = Command::new(program);
 
         command
             .args([
                 "-T",
-                "-o", "StrictHostKeyChecking=yes",
-                "-o", "NumberOfPasswordPrompts=1",
-                "-o", "KbdInteractiveAuthentication=no",
-                "-o", "PermitLocalCommand=no",
-                "-o", "ClearAllForwardings=yes",
-                "-o", "ServerAliveInterval=15",
-                "-o", "ServerAliveCountMax=2",
+                "-o",
+                if disable_strict_checking {
+                    "StrictHostKeyChecking=no"
+                } else {
+                    "StrictHostKeyChecking=yes"
+                },
+                "-o",
+                "NumberOfPasswordPrompts=1",
+                "-o",
+                "KbdInteractiveAuthentication=no",
+                "-o",
+                "PermitLocalCommand=no",
+                "-o",
+                "ClearAllForwardings=yes",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=2",
             ])
-            .arg("-o").arg(format!("ConnectTimeout={timeout}"))
-            .arg("-o").arg(if password {
+            .arg("-o")
+            .arg(format!("ConnectTimeout={timeout}"))
+            .arg("-o")
+            .arg(if password {
                 "BatchMode=no"
             } else {
                 "BatchMode=yes"
@@ -287,6 +306,11 @@ impl Backend for Sftp {
             "SSH connection/authentication timeout (seconds)",
         );
         settings.register(
+            "sftp:disable-strict-checking",
+            SettingValue::Bool(false),
+            "Disable strict SSH host-key checking (insecure; reconnect to apply)",
+        );
+        settings.register(
             "sftp:max-requests",
             SettingValue::Int(64),
             "Concurrent SFTP read/write requests (1..256; reconnect to apply)",
@@ -317,6 +341,7 @@ impl Backend for Sftp {
             target,
             timeout,
             max_requests,
+            disable_strict_checking: options.settings.bool("sftp:disable-strict-checking"),
             password: options.password.or_else(|| {
                 options
                     .bookmark
@@ -345,6 +370,7 @@ struct ConnectRecipe {
     target: Target,
     timeout: u64,
     max_requests: usize,
+    disable_strict_checking: bool,
     password: Option<crate::credentials::Password>,
     program: PathBuf,
 }
@@ -365,7 +391,12 @@ impl ConnectRecipe {
                 ))
             })?;
 
-        let mut command = target.command(&self.program, timeout, askpass.is_some());
+        let mut command = target.command(
+            &self.program,
+            timeout,
+            askpass.is_some(),
+            self.disable_strict_checking,
+        );
         if let Some(askpass) = &askpass {
             askpass.configure(&mut command)?;
         }
@@ -379,9 +410,13 @@ impl ConnectRecipe {
         let mut stage = "start SFTP subsystem";
 
         let result = tokio::time::timeout(Duration::from_secs(timeout), async {
-            let sftp = Client::new(stdin, stdout, SftpOptions::new().flush_interval(Duration::ZERO))
-                .await
-                .context(stage)?;
+            let sftp = Client::new(
+                stdin,
+                stdout,
+                SftpOptions::new().flush_interval(Duration::ZERO),
+            )
+            .await
+            .context(stage)?;
 
             // Logical cwd/home are absolute paths kept by SftpConnection. A
             // recovery session must not reset them or re-resolve a changed ~.
@@ -415,7 +450,8 @@ impl ConnectRecipe {
             };
 
             Ok::<_, anyhow::Error>((sftp, home))
-        }).await;
+        })
+        .await;
 
         match result {
             Ok(Ok((sftp, home))) => {
@@ -1071,6 +1107,7 @@ mod tests {
             },
             timeout: 5,
             max_requests: 2,
+            disable_strict_checking: false,
             password: Some(crate::credentials::Password::new("fixture secret".into())),
             program,
         };
@@ -1415,20 +1452,28 @@ mod tests {
     #[test]
     fn ssh_command_is_subsystem_only_and_verifies_host_keys() {
         let target = Target::parse("sftp://user@example.org:2222").unwrap();
-        let command = target.command(Path::new("ssh"), 5, false);
+        let command = target.command(Path::new("ssh"), 5, false, false);
         let command = command.as_std();
         let args = command
             .get_args()
             .map(|arg| arg.to_str().unwrap())
             .collect::<Vec<_>>();
         assert!(args.contains(&"StrictHostKeyChecking=yes"));
+        let relaxed = target.command(Path::new("ssh"), 5, false, true);
+        let relaxed_args = relaxed.as_std().get_args().collect::<Vec<_>>();
+        assert!(relaxed_args
+            .iter()
+            .any(|arg| *arg == "StrictHostKeyChecking=no"));
+        assert!(!relaxed_args
+            .iter()
+            .any(|arg| *arg == "StrictHostKeyChecking=yes"));
         assert!(args.contains(&"BatchMode=yes"));
         assert!(args.contains(&"ConnectTimeout=5"));
         assert!(args.ends_with(&["-s", "--", "example.org", "sftp"]));
         assert!(args.windows(2).any(|args| args == ["-l", "user"]));
         assert!(args.windows(2).any(|args| args == ["-p", "2222"]));
         assert!(target
-            .command(Path::new("ssh"), 5, true)
+            .command(Path::new("ssh"), 5, true, false)
             .as_std()
             .get_args()
             .any(|arg| arg == "BatchMode=no"));
@@ -1579,6 +1624,11 @@ mod tests {
     fn pipeline_window_settings_are_bounded_and_registered() {
         let mut settings = Settings::new();
         Sftp.register_settings(&mut settings);
+        assert!(!settings.bool("sftp:disable-strict-checking"));
+        settings
+            .set("sftp:disable-strict-checking", "true")
+            .unwrap();
+        assert!(settings.bool("sftp:disable-strict-checking"));
         assert_eq!(request_window(&settings).unwrap(), 64);
         for value in [1, 256] {
             settings
@@ -1629,5 +1679,4 @@ mod tests {
         assert_eq!(connection.recipe.max_requests, 2);
         Box::new(connection).disconnect().await.unwrap();
     }
-
 }

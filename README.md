@@ -72,6 +72,7 @@ the default directory is `~/.config/xfer`; the default bookmark file is
 ui:auto-pager: true
 s3:region: us-east-1
 sftp:connect-timeout: 30
+sftp:disable-strict-checking: false
 sftp:max-requests: 64
 smb:connect-timeout: 10
 smb:operation-timeout: 30
@@ -148,8 +149,11 @@ plain text.
   listing alone is insufficient. Authentication supports Basic auth and
   anonymous access, not Digest, NTLM, OAuth/Bearer, or client certificates.
 - SFTP password login is a single password flow; keyboard-interactive MFA and
-  challenge-response authentication are not supported. Host-key checking is
-  always strict.
+  challenge-response authentication are not supported. SSH host-key checking is
+  strict by default. Setting `sftp:disable-strict-checking: true` disables strict
+  checking for new connections, allowing unknown host keys without verification;
+  this is insecure and exposes connections to man-in-the-middle attacks. OpenSSH
+  may still restrict authentication when a known host key changes.
 - Remote operations may leave partial files after a failed or cancelled upload.
   Inspect ambiguous results before retrying mutating commands such as `mv` or
   `rm`.
