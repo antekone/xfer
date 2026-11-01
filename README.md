@@ -16,8 +16,8 @@ pull requests that increase the code quality, which currently is... not the best
 However, I don't have that much time to have this as a full time project, I just
 needed a tool that supports sftp, smb and s3.
 
-xfer is intended for Linux and macOS. Windows support is planned and being
-experimented with, but it probably does not work yet.
+xfer is intended for Linux and macOS, no idea if it works on Windows (probably
+not, never tried it).
 
 ## Demo
 
