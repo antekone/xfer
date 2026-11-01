@@ -14,6 +14,10 @@ pull requests that increase the code quality, which currently is... not the best
 However, I don't have that much time to have this as a full time project, I just
 needed a tool that supports sftp, smb and s3.
 
+## Demo
+
+![xfer terminal demo](docs/xfer-demo.gif)
+
 ## Protocols
 
 xfer supports these backends:
