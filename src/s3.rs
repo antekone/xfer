@@ -1,6 +1,7 @@
 //! S3 backend, including AWS client configuration, routing, and diagnostics.
 mod mkdir;
 mod rename;
+mod upload;
 
 use crate::{
     backend::{Backend, ConnectOptions, Connection},
@@ -88,6 +89,9 @@ impl Connection for S3Connection {
 
     fn protocol(&self) -> &'static str {
         "s3"
+    }
+    async fn upload(&self, local: &std::path::Path, path: &str, overwrite: bool) -> Result<()> {
+        self.upload_object(local, path, overwrite).await
     }
     async fn stat_file(&self, path: &str) -> Result<crate::transfer::RemoteFile> {
         let location = self.location.resolve(path);
@@ -1125,6 +1129,16 @@ mod connection_tests {
                     }
                     request.push_str(&line);
                 }
+                // Consume upload bodies before replying, including any SDK
+                // checksum framing (whose encoded length is advertised).
+                let length = request.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                }).unwrap_or(0);
+                let mut body_bytes = vec![0; length];
+                std::io::Read::read_exact(&mut reader, &mut body_bytes).unwrap();
+                request.push_str(&String::from_utf8_lossy(&body_bytes));
                 requests.push(request);
                 socket.write_all(headers.as_bytes()).unwrap();
                 socket.write_all(&body).unwrap();

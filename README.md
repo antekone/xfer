@@ -14,6 +14,9 @@ pull requests that increase the code quality, which currently is... not the best
 However, I don't have that much time to have this as a full time project, I just
 needed a tool that supports sftp, smb and s3.
 
+xfer is intended for Linux and macOS. Windows support is planned and being
+experimented with, but it probably does not work yet.
+
 ## Demo
 
 ![xfer terminal demo](docs/xfer-demo.gif)
@@ -24,7 +27,7 @@ xfer supports these backends:
 
 | Protocol | URLs | Read operations | Writes |
 | --- | --- | --- | --- |
-| S3 and S3-compatible storage | `s3://`, `http://`, `https://` | browse, `ls`, `get`, `cat`, `mkdir`, `rm`, `mv` | directory markers; object upload is not yet supported |
+| S3 and S3-compatible storage | `s3://`, `http://`, `https://` | browse, `ls`, `get`, `cat`, `mirror` | `put`, `mirror-upload`, `mkdir`, `rm`, `mv` |
 | SFTP | `sftp://` | browse, `ls`, `get`, `cat` | `put`, `mkdir`, `rm`, `mv` |
 | SMB | `smb://` | browse, `ls`, `get`, `cat` | `put`, `mkdir`, `rm`, `mv` |
 | WebDAV | `http://`, `https://`, `dav://`, `davs://`, `webdav://`, `webdavs://` | browse, `ls`, `get`, `cat` | `put`, `mkdir`, `rm`, `mv` |
@@ -130,7 +133,10 @@ plain text.
   followed by delete; a failure or cancellation can leave both source and
   destination objects. It supports objects up to 5 GiB and does not implement
   prefix/directory moves or multipart copies of larger objects.
-- S3 file uploads (`put`) are not implemented. `mirror` can download S3 prefixes, while `mirror-upload` (also `mirror-up`) uploads directory trees on SFTP, SMB, and WebDAV only.
+- S3 uploads (`put`, `mirror-upload`, also `mirror-up`) support files up to 5 GiB
+  each; multipart uploads of larger files are not implemented. Uploads stream
+  from disk and require `xfer:clobber` to replace existing objects. `mirror`
+  downloads S3 prefixes recursively.
 - WebDAV requires a server with WebDAV `PROPFIND` support; an HTML directory
   listing alone is insufficient. Authentication supports Basic auth and
   anonymous access, not Digest, NTLM, OAuth/Bearer, or client certificates.
