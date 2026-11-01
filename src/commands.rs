@@ -14,6 +14,8 @@ pub(crate) mod du;
 pub(crate) mod get;
 pub(crate) mod ls;
 pub(crate) mod mkdir;
+pub(crate) mod mirror;
+pub(crate) mod mirror_upload;
 pub(crate) mod mv;
 pub(crate) mod output;
 pub(crate) mod put;
@@ -217,7 +219,8 @@ pub static COMMANDS: &[&dyn Command] = &[
     &CANCEL,
     &SHOW,
     &SET,
-    &MIRROR,
+    &mirror::Mirror,
+    &mirror_upload::MirrorUpload,
     &FOREGROUND,
     &BACKGROUND,
     &shell::Shell,
@@ -454,7 +457,6 @@ static SET: SmallCommand = SmallCommand {
         set,
     )
 };
-static MIRROR: SmallCommand = small(&["mirror"], Some(("mirror", "not implemented yet")), mirror);
 static FOREGROUND: SmallCommand = SmallCommand {
     site: ExecutionSite::Client,
     history: false,
@@ -617,14 +619,6 @@ fn set_lines(app: &mut Daemon, parser: &ParserContext<'_>) -> Vec<String> {
 
 fn set(context: &mut CommandContext<'_>, parser: &ParserContext<'_>) -> Result<CommandResult> {
     Ok(set_lines(context.daemon()?, parser).into())
-}
-
-fn mirror_lines(_app: &mut Daemon, _parser: &ParserContext<'_>) -> Vec<String> {
-    vec!["mirror is not implemented yet".into()]
-}
-
-fn mirror(context: &mut CommandContext<'_>, parser: &ParserContext<'_>) -> Result<CommandResult> {
-    Ok(mirror_lines(context.daemon()?, parser).into())
 }
 
 #[cfg(test)]
