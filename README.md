@@ -133,10 +133,14 @@ plain text.
   followed by delete; a failure or cancellation can leave both source and
   destination objects. It supports objects up to 5 GiB and does not implement
   prefix/directory moves or multipart copies of larger objects.
-- S3 uploads (`put`, `mirror-upload`, also `mirror-up`) support files up to 5 GiB
-  each; multipart uploads of larger files are not implemented. Uploads stream
-  from disk and require `xfer:clobber` to replace existing objects. `mirror`
-  downloads S3 prefixes recursively.
+- S3 uploads (`put`, `mirror-upload`, also `mirror-up`) stream from disk and
+  support files up to 5 TiB. Files larger than 5 GiB use multipart uploads;
+  replacing existing objects requires `xfer:clobber`. Failed or cancelled
+  multipart uploads are aborted on a best-effort basis. Configure an S3
+  lifecycle rule to clean up incomplete uploads, which can incur storage charges
+  if cleanup fails or the application stops unexpectedly. If completion fails,
+  inspect the destination before retrying because its outcome may be unknown.
+  `mirror` downloads S3 prefixes recursively.
 - WebDAV requires a server with WebDAV `PROPFIND` support; an HTML directory
   listing alone is insufficient. Authentication supports Basic auth and
   anonymous access, not Digest, NTLM, OAuth/Bearer, or client certificates.
