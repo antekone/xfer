@@ -5,9 +5,11 @@ Rust. It keeps a persistent connection in a small per-session daemon while the
 terminal client provides an lftp-style command prompt, remote navigation,
 listings, transfers, job control, completion, and a pager.
 
-It is loosely modeled after [lftp](https://lftp.yar.ru/): connect to a remote
-site, work with a remote current directory, and run commands such as `ls`,
-`cd`, `get`, `put`, and `mkdir`. It is not a drop-in replacement for lftp.
+Its user experience is loosely modeled after [lftp](https://lftp.yar.ru/):
+connect to a remote site, work with a remote current directory, and run commands
+such as `ls`, `cd`, `get`, `put`, and `mkdir`. The implementation is different:
+xfer uses async Rust, while lftp has a very nice cooperative task framework.
+xfer is not a drop-in replacement for lftp.
 
 Please have in mind that it was vibe-coded; it's working, but I would appreciate
 pull requests that increase the code quality, which currently is... not the best.
@@ -131,13 +133,14 @@ plain text.
   objects, and buckets must already exist.
 - Moving an S3 object is **not atomic**. xfer implements `mv` as server-side copy
   followed by delete; a failure or cancellation can leave both source and
-  destination objects. It supports objects up to 5 GiB and does not implement
-  prefix/directory moves or multipart copies of larger objects.
+  destination objects. Objects up to 5 TiB are supported; objects larger than
+  5 GiB use multipart copy. Prefix/directory moves are not implemented.
+  Multipart copy requires permission to read object tags and abort multipart uploads.
 - S3 uploads (`put`, `mirror-upload`, also `mirror-up`) stream from disk and
   support files up to 5 TiB. Files larger than 5 GiB use multipart uploads;
   replacing existing objects requires `xfer:clobber`. Failed or cancelled
   multipart uploads are aborted on a best-effort basis. Configure an S3
-  lifecycle rule to clean up incomplete uploads, which can incur storage charges
+  lifecycle rule to clean up incomplete uploads and copies, which can incur storage charges
   if cleanup fails or the application stops unexpectedly. If completion fails,
   inspect the destination before retrying because its outcome may be unknown.
   `mirror` downloads S3 prefixes recursively.

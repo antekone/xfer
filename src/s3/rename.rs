@@ -55,10 +55,8 @@ impl S3Connection {
             .content_length()
             .filter(|size| *size >= 0)
             .ok_or_else(|| permanent("S3 source has no valid length"))?;
-        if size > 5 * 1024 * 1024 * 1024 {
-            return Err(permanent(
-                "S3 mv supports objects up to 5 GiB; larger objects require multipart copy",
-            ));
+        if size as u64 > super::upload::MAX_OBJECT_SIZE {
+            return Err(permanent("S3 mv supports objects up to 5 TiB"));
         }
         let tag = before
             .e_tag()
@@ -73,34 +71,53 @@ impl S3Connection {
             copy_source.push_str("?versionId=");
             copy_source.push_str(&utf8_percent_encode(version, NON_ALPHANUMERIC).to_string());
         }
-        let mut copy = self
-            .client
-            .copy_object()
-            .bucket(target_bucket)
-            .key(target_key)
-            .copy_source(copy_source)
-            .copy_source_if_match(tag)
-            .set_storage_class(before.storage_class().cloned())
-            .set_website_redirect_location(before.website_redirect_location().map(str::to_owned));
-        if !overwrite {
-            copy = copy.if_none_match("*");
-        }
-        let copied = copy.send().await.map_err(|error| {
-            let cause = operation_error("CopyObject", &error, &self.redactions);
-            let message = format!(
-                "S3 copy failed or its outcome is unknown; source was not deleted: {cause}"
-            );
-            cause.context(message)
-        })?;
-        // A 200 HTTP status is not enough: CopyObject may carry an embedded
-        // failure, and a malformed success must never authorize deletion.
-        let copied_tag = copied
-            .copy_object_result()
-            .and_then(|result| result.e_tag())
-            .filter(|tag| strong_tag(tag))
-            .ok_or_else(|| {
-                permanent("S3 copy has no ETag; source was not deleted; inspect destination")
+        let copied_tag = if size as u64 > super::upload::SINGLE_LIMIT {
+            self.multipart_copy(
+                bucket,
+                key,
+                target_bucket,
+                target_key,
+                &copy_source,
+                tag,
+                &before,
+                size as u64,
+                overwrite,
+            )
+            .await?
+        } else {
+            let mut copy = self
+                .client
+                .copy_object()
+                .bucket(target_bucket)
+                .key(target_key)
+                .copy_source(copy_source)
+                .copy_source_if_match(tag)
+                .set_storage_class(before.storage_class().cloned())
+                .set_website_redirect_location(
+                    before.website_redirect_location().map(str::to_owned),
+                );
+            if !overwrite {
+                copy = copy.if_none_match("*");
+            }
+            let copied = copy.send().await.map_err(|error| {
+                let cause = operation_error("CopyObject", &error, &self.redactions);
+                let message = format!(
+                    "S3 copy failed or its outcome is unknown; source was not deleted: {cause}"
+                );
+                cause.context(message)
             })?;
+            // A 200 HTTP status is not enough: CopyObject may carry an embedded
+            // failure, and a malformed success must never authorize deletion.
+            let copied_tag = copied
+                .copy_object_result()
+                .and_then(|result| result.e_tag())
+                .filter(|tag| strong_tag(tag))
+                .ok_or_else(|| {
+                    permanent("S3 copy has no ETag; source was not deleted; inspect destination")
+                })?
+                .to_owned();
+            copied_tag
+        };
         let result: Result<()> = async {
             let destination = self
                 .client
@@ -110,7 +127,8 @@ impl S3Connection {
                 .send()
                 .await
                 .map_err(|error| operation_error("HeadObject", &error, &self.redactions))?;
-            if destination.content_length() != Some(size) || destination.e_tag() != Some(copied_tag)
+            if destination.content_length() != Some(size)
+                || destination.e_tag() != Some(copied_tag.as_str())
             {
                 return Err(permanent(
                     "S3 copied destination changed or failed verification",
@@ -339,7 +357,7 @@ mod tests {
             head(3, Some("*"), None),
             head(3, Some("unquoted"), None),
             head(3, Some("W/\"weak\""), None),
-            head(5 * 1024 * 1024 * 1024 + 1, Some("\"src\""), None),
+            head(5_i64 * 1024 * 1024 * 1024 * 1024 + 1, Some("\"src\""), None),
         ] {
             let (connection, requests) = http_client(vec![meta]).await;
             assert!(connection

@@ -9,11 +9,11 @@ use std::{
     path::Path,
 };
 
-const SINGLE_LIMIT: u64 = 5 * 1024 * 1024 * 1024;
-const MAX_OBJECT_SIZE: u64 = 5 * 1024 * 1024 * 1024 * 1024;
+pub(super) const SINGLE_LIMIT: u64 = 5 * 1024 * 1024 * 1024;
+pub(super) const MAX_OBJECT_SIZE: u64 = 5 * 1024 * 1024 * 1024 * 1024;
 const MIN_PART: u64 = 16 * 1024 * 1024;
 
-fn part_size(size: u64) -> u64 {
+pub(super) fn part_size(size: u64) -> u64 {
     MIN_PART.max(size.div_ceil(10_000).div_ceil(1024 * 1024) * 1024 * 1024)
 }
 
@@ -27,11 +27,11 @@ fn unchanged(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
 
 // Cancellation drops the future, so schedule a best-effort abort independently.
 // An interrupted CreateMultipartUpload with no received ID cannot be cleaned up.
-struct MultipartGuard {
-    client: aws_sdk_s3::Client,
-    bucket: String,
-    key: String,
-    id: Option<String>,
+pub(super) struct MultipartGuard {
+    pub(super) client: aws_sdk_s3::Client,
+    pub(super) bucket: String,
+    pub(super) key: String,
+    pub(super) id: Option<String>,
 }
 impl Drop for MultipartGuard {
     fn drop(&mut self) {

@@ -1,5 +1,6 @@
 //! S3 backend, including AWS client configuration, routing, and diagnostics.
 mod mkdir;
+mod multipart_copy;
 mod rename;
 mod upload;
 
