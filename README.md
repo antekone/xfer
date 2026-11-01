@@ -138,3 +138,7 @@ plain text.
   `rm`.
 
 For implementation and IPC details, see [docs/ipc.md](docs/ipc.md).
+
+## License
+
+xfer is licensed under the [GNU General Public License v3.0](LICENSE).
