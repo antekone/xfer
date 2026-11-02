@@ -63,6 +63,22 @@ xfer[sftp:/home/alice/]> put local-notes.txt
 Use `help` in the client for the command reference. `Ctrl-C` cancels a
 foreground job; `Ctrl-Z` backgrounds it, and `jobs` / `fg` manage jobs.
 
+To execute a command file without an interactive terminal, run
+`xfer -f commands.rc` (or `xfer --file commands.rc`). For example:
+
+```text
+# commands.rc
+open archive
+lcd ~/Downloads
+get report.pdf
+```
+
+Commands run in order, waiting for each job. Script mode skips `~/.xferrc`,
+does not record history, and cannot prompt for passwords. A failed job stops
+the script with a nonzero exit status. Some commands report usage or setting
+errors as text rather than failure status, so check their output as well. See
+the manual's **Command scripts** section for details.
+
 ## Manual
 
 The [xfer(1) manual page](docs/xfer.1) documents commands, settings, bookmarks,

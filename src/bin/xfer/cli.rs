@@ -6,8 +6,11 @@ use clap::{Parser, Subcommand};
 
 /// lftp-style transfer client with S3, SFTP, SMB and WebDAV backends.
 #[derive(Debug, Parser)]
-#[command(name = "xfer", version)]
+#[command(name = "xfer", version, args_conflicts_with_subcommands = true)]
 pub struct Cli {
+    /// Execute commands from a file non-interactively, then exit
+    #[arg(short = 'f', long = "file", value_name = "FILE")]
+    file: Option<std::path::PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -33,12 +36,17 @@ pub enum Invocation {
     Daemon,
     /// Attach to an existing daemon, optionally selecting it by ID prefix.
     Attach(Option<String>),
+    /// Start a fresh daemon and execute a command file.
+    Script(std::path::PathBuf),
 }
 
 /// Parse the process arguments, exiting with usage/help errors like other clap
 /// programs (stderr message plus status 2) before any daemon work starts.
 pub fn parse() -> Invocation {
-    let Cli { command } = Cli::parse();
+    let Cli { command, file } = Cli::parse();
+    if let Some(file) = file {
+        return Invocation::Script(file);
+    }
     match command {
         Some(Command::Daemon) => Invocation::Daemon,
         Some(Command::Attach { id }) => Invocation::Attach(id),

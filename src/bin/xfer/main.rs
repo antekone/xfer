@@ -60,10 +60,98 @@ async fn main() -> Result<()> {
         cli::Invocation::StartAndAttach => start_daemon_and_attach(),
         cli::Invocation::Daemon => xfer::daemon::main().await,
         cli::Invocation::Attach(id) => attach(id.as_deref()),
+        cli::Invocation::Script(path) => run_script(&path),
     }
 }
 
 // ------------------------------------------------------------------------------------------------
+
+/// Execute an explicit script without terminal input, startup commands, or history.
+fn run_script(path: &std::path::Path) -> Result<()> {
+    use anyhow::Context;
+    let text =
+        fs::read_to_string(path).with_context(|| format!("read script {}", path.display()))?;
+    let mut client = daemon_client::start()?;
+    let cwd = std::env::current_dir()?;
+    client.ok(Op::SetLocalCwd(pb::Path {
+        path: cwd
+            .to_str()
+            .context("local directory must be valid UTF-8")?
+            .into(),
+    }))?;
+    for (index, line) in text.lines().enumerate() {
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        if !script_command(&mut client, line)
+            .with_context(|| format!("{}:{}", path.display(), index + 1))?
+        {
+            break;
+        }
+    }
+    client.ok(Op::Detach(pb::Empty {}))?;
+    Ok(())
+}
+
+fn script_command(client: &mut Connection, line: &str) -> Result<bool> {
+    let parser = ParserContext::parse(line)?;
+    let definition = commands::find(&parser)
+        .ok_or_else(|| anyhow::anyhow!("unknown command: {}", parser.name()))?;
+    if definition.site() == ExecutionSite::Client {
+        match parser.name() {
+            "detach" | "exit" if parser.arguments().is_empty() => return Ok(false),
+            "!" => {
+                let source = parser
+                    .shell_source
+                    .ok_or_else(|| anyhow::anyhow!("missing Bash command"))?;
+                if source.trim().is_empty() {
+                    anyhow::bail!("missing Bash command");
+                }
+                let status = Command::new("bash")
+                    .arg("-c")
+                    .arg(source)
+                    .current_dir(read_local_directory(client)?)
+                    .status()?;
+                if !status.success() {
+                    anyhow::bail!("Bash command exited with {status}");
+                }
+                return Ok(true);
+            }
+            _ => anyhow::bail!("{} is not supported in scripts", parser.name()),
+        }
+    }
+    let result = client.command(line)?;
+    for line in result.lines {
+        println!("{line}");
+    }
+    match result.action {
+        Some(pb::command_result::Action::JobStarted(job)) => loop {
+            let job = client.job(job.id)?;
+            match pb::JobState::try_from(job.state)? {
+                pb::JobState::Running => std::thread::sleep(Duration::from_millis(100)),
+                pb::JobState::Completed => {
+                    copy_job_output(client, job.id, &mut io::stdout())?;
+                    client.ok(Op::AcknowledgeOutput(pb::JobId { id: job.id }))?;
+                    break;
+                }
+                pb::JobState::Failed | pb::JobState::Cancelled => {
+                    copy_job_output(client, job.id, &mut io::stderr())?;
+                    client.ok(Op::AcknowledgeOutput(pb::JobId { id: job.id }))?;
+                    anyhow::bail!("job {} failed or was cancelled", job.id);
+                }
+                _ => anyhow::bail!("invalid job state"),
+            }
+        },
+        Some(pb::command_result::Action::PasswordRequired(_)) => {
+            anyhow::bail!("interactive password prompts are not available in scripts");
+        }
+        Some(pb::command_result::Action::EditBookmarks(_)) => {
+            anyhow::bail!("bookmark edit is not available in scripts");
+        }
+        None => {}
+    }
+    Ok(true)
+}
 
 fn start_daemon_and_attach() -> Result<()> {
     attached_session(daemon_client::start()?)

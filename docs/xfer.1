@@ -8,6 +8,10 @@ xfer \- interactive remote file transfer client
 .RI [ id ]
 .br
 .B xfer
+.BR \-f " | " \-\-file
+.I file
+.br
+.B xfer
 .BR \-h " | " \-\-help
 .br
 .B xfer
@@ -29,7 +33,7 @@ it has no running jobs.
 The interface is modeled after
 .BR lftp (1),
 but xfer is not a drop-in replacement. In particular, it does not implement
-FTP, FTPS, lftp's batch options, or lftp's shell command language.
+FTP, FTPS, most of lftp's batch options, or lftp's shell command language.
 .SS Normal startup
 For normal use, simply run:
 .PP
@@ -43,6 +47,32 @@ This automatically creates a daemon and a terminal client connected to it.
 You do not need to start the daemon separately or attach manually.
 Detaching and reattaching are optional features for leaving jobs running
 and returning to them later.
+.SS Command scripts
+.BI "xfer -f " file
+starts a fresh daemon, runs commands from the named file, and exits.
+Each nonblank, non-comment line is one command, using the same quoting as
+the interactive prompt. Commands execute in order and each job finishes
+before the next command starts. Script output goes to standard output;
+the pager and command history are not used. The usual
+.I ~/.xferrc
+is not read in script mode, so scripts do not depend on interactive startup
+commands. The daemon still reads its normal configuration files.
+.PP
+A failed or cancelled job, malformed or unknown command, failed Bash
+escape, or unavailable interactive operation stops the script with a
+nonzero exit status and a file and line diagnostic. Some commands report
+usage or setting errors as ordinary output rather than a failure status;
+such messages do not stop the script. Do not rely on the exit status alone
+to detect those errors.
+.PP
+Interactive password prompts, bookmark editing, and interactive job-control
+commands are not available. Use noninteractive credentials instead.
+.B exit
+or
+.B detach
+ends the script early. Lines starting with
+.B !
+run Bash and a nonzero Bash exit status stops the script.
 .SS Attaching to a session
 .B xfer attach
 attaches to the only ready detached daemon. If several are available, it

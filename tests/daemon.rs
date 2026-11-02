@@ -610,3 +610,67 @@ fn directory_snapshots_are_fresh_paged_and_closed_without_completion_limits() {
     assert!(client.job(ordinary.id).is_ok());
     assert!(client.session().is_ok());
 }
+
+#[test]
+fn script_runs_without_a_terminal_and_stops_on_failed_job() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path();
+    fs::create_dir_all(path.join("home")).unwrap();
+    let script = path.join("commands.rc");
+    fs::write(
+        &script,
+        "# comment\nset s3:region eu-west-1\nshow s3:region\n!printf script-ok\\n\n",
+    )
+    .unwrap();
+    let output = command(path)
+        .arg("-f")
+        .arg(&script)
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("s3:region: eu-west-1"), "{stdout}");
+    assert!(stdout.contains("script-ok"), "{stdout}");
+
+    fs::write(&script, "pwd\n!touch must-not-run\n").unwrap();
+    let output = command(path)
+        .current_dir(path)
+        .arg("-f")
+        .arg(&script)
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!path.join("must-not-run").exists());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("commands.rc:1"));
+}
+
+#[test]
+fn script_reports_missing_file_and_rejects_interactive_commands() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path();
+    fs::create_dir_all(path.join("home")).unwrap();
+    let script = path.join("missing.rc");
+    let output = command(path)
+        .arg("-f")
+        .arg(&script)
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("missing.rc"));
+    fs::write(&script, "bookmark edit\n").unwrap();
+    let output = command(path)
+        .arg("--file")
+        .arg(&script)
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not available in scripts"));
+}
