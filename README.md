@@ -39,7 +39,7 @@ S3-compatible HTTP(S) bookmarks must specify `type = 's3'` (or a `bucket` or
 
 ## Getting started
 
-Install the binary directly from GitHub (requires Rust 1.94 or newer):
+Install the binary directly from GitHub (requires Rust 1.94.1 or newer):
 
 ```sh
 cargo install --git https://github.com/antekone/xfer.git --locked

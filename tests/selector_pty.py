@@ -48,7 +48,11 @@ try:
                TERM='xterm-256color')
     master, slave = pty.openpty()
     original = termios.tcgetattr(slave)
-    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 140, 0, 0))
+    # Assertions below read the rendered command line, not the editor's hidden
+    # horizontal-scroll buffer. macOS temporary paths can make the remote
+    # prompt much longer than on Linux; keep the full command visible here.
+    # The resize case below still exercises a narrow terminal explicitly.
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 512, 0, 0))
     process = subprocess.Popen([binary], cwd=root, env=env, stdin=slave, stdout=slave,
                                stderr=slave, start_new_session=True)
     os.close(slave)
@@ -275,6 +279,12 @@ try:
     applied_filter(r'^file2504\.txt$')
     mark = len(transcript)
     fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 9, 85, 0, 0))
+    os.kill(process.pid, signal.SIGWINCH)
+    until(rb'\x1b\[2J', mark)
+    # Restore the wide viewport before comparing the full rendered command;
+    # a long macOS prompt can scroll even "put " at the narrow size.
+    mark = len(transcript)
+    fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 512, 0, 0))
     os.kill(process.pid, signal.SIGWINCH)
     until(rb'\x1b\[2J', mark)
     assert close_selector(b'\x03') == 'put '
