@@ -126,6 +126,7 @@ impl ConfigFile {
 pub struct Daemon {
     pub settings: Settings,
     pub jobs: JobManager,
+    pub(crate) debug_log: Option<Arc<crate::debug_log::DebugLog>>,
     pub(crate) backends: HashMap<String, std::sync::Arc<dyn Backend>>,
     pub(crate) connection:
         std::sync::Arc<tokio::sync::Mutex<Option<Box<dyn crate::backend::Connection>>>>,
@@ -148,6 +149,11 @@ impl Daemon {
             "ui:history-file",
             SettingValue::Text(default_history_path()),
             "Client history path; session or /dev/null disables persistence",
+        );
+        settings.register(
+            "xfer:debug-file",
+            SettingValue::Text(crate::debug_log::DEFAULT_PATH.into()),
+            "Daemon log filename template ($pid and $cwd)",
         );
         settings.register(
             "xfer:clobber",
@@ -190,6 +196,7 @@ impl Daemon {
         Ok(Self {
             settings,
             jobs: JobManager::new(),
+            debug_log: None,
             backends: backends
                 .into_iter()
                 .map(|backend| {
@@ -367,7 +374,12 @@ fn parent_executable_path(parent: libc::pid_t) -> Option<PathBuf> {
 pub async fn main() -> Result<()> {
     verify_spawned_by_client()?;
 
-    let daemon = Daemon::bootstrap()?;
+    let mut daemon = Daemon::bootstrap()?;
+    let template = daemon.settings.text("xfer:debug-file").expect("registered debug file setting");
+    let log = Arc::new(crate::debug_log::DebugLog::create(template, &daemon.local_directory)
+        .context("open daemon debug log")?);
+    daemon.jobs.debug_log = Some(log.clone());
+    daemon.debug_log = Some(log);
     let mut socket = DaemonSocket::bind_in(&crate::runtime_dir()?)?;
     let shared = Shared {
         attached: Arc::new(AtomicBool::new(false)),

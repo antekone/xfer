@@ -63,6 +63,18 @@ xfer[sftp:/home/alice/]> put local-notes.txt
 Use `help` in the client for the command reference. `Ctrl-C` cancels a
 foreground job; `Ctrl-Z` backgrounds it, and `jobs` / `fg` manage jobs.
 
+`debug` shows the daemon's log level and private log file path. Use `debug 0`
+(the default) for errors and warnings, `debug 1` for debug events, or `debug 2`
+for trace events. By default the log is `xfer-debug-<pid>.log` in the
+initial local directory. Set `xfer:debug-file` in the configuration or at the
+prompt to change it, for example `set xfer:debug-file '${cwd}/shared.log'`.
+The template supports `${pid}` and `${cwd}` (also `$pid` and `$cwd`); `cwd` is
+the local directory when the setting is applied. Relative paths use that same
+directory. Existing private files are appended to, so daemons can share a log;
+each line includes the daemon PID. Logs are not deleted automatically.
+Diagnostics omit command arguments, job output, and error details because
+these can contain sensitive data.
+
 To execute a command file without an interactive terminal, run
 `xfer -f commands.rc` (or `xfer --file commands.rc`). For example:
 

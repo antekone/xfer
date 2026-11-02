@@ -12,6 +12,7 @@ use xfer::ipc::{self, pb, Op, Reply};
 fn command(root: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_xfer"));
     command
+        .current_dir(root)
         .env("HOME", root.join("home"))
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("XDG_CACHE_HOME", root.join("cache"))
@@ -648,6 +649,64 @@ fn script_runs_without_a_terminal_and_stops_on_failed_job() {
     assert!(!output.status.success());
     assert!(!path.join("must-not-run").exists());
     assert!(String::from_utf8_lossy(&output.stderr).contains("commands.rc:1"));
+}
+
+#[test]
+fn debug_controls_private_daemon_log_without_recording_arguments() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path();
+    fs::create_dir_all(path.join("home")).unwrap();
+    let script = path.join("commands.rc");
+    fs::write(&script, "debug\ndebug 2\nshow secret-argument\ndebug 0\nshow another-secret\n").unwrap();
+    let output = command(path).arg("-f").arg(&script).stderr(Stdio::piped()).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("debug level: 0; log:"), "{stdout}");
+    assert!(stdout.contains("debug level: 2; log:"), "{stdout}");
+    let logs = fs::read_dir(path).unwrap().filter_map(Result::ok).filter(|entry| entry.file_name().to_string_lossy().starts_with("xfer-debug-")).collect::<Vec<_>>();
+    assert_eq!(logs.len(), 1);
+    let log_path = logs[0].path();
+    assert_eq!(fs::metadata(&log_path).unwrap().permissions().mode() & 0o777, 0o600);
+    let log = fs::read_to_string(log_path).unwrap();
+    assert!(log.contains("TRACE dispatching command show"), "{log}");
+    assert!(!log.contains("secret-argument"));
+    assert!(!log.contains("another-secret"));
+    assert_eq!(log.matches("TRACE dispatching command show").count(), 1);
+
+    fs::write(&script, "debug 3\n").unwrap();
+    let output = command(path).arg("-f").arg(&script).stderr(Stdio::piped()).output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("usage: debug [0|1|2]"));
+}
+
+#[test]
+fn debug_file_configuration_and_runtime_switch() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path();
+    fs::create_dir_all(path.join("home")).unwrap();
+    fs::create_dir_all(path.join("config/xfer")).unwrap();
+    fs::write(path.join("config/xfer/xfer.conf"), "xfer:debug-file: ${cwd}/global.log\n").unwrap();
+    let script = path.join("commands.rc");
+    fs::write(&script, "debug 2\nshow secret-one\nset xfer:debug-file '${cwd}/other-${pid}.log'\ndebug\nshow secret-two\nset xfer:debug-file missing/dir/log\ndebug\n").unwrap();
+    let output = command(path).arg("-f").arg(&script).stderr(Stdio::piped()).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("cannot open debug log"), "{stdout}");
+    assert!(stdout.contains("other-"), "{stdout}");
+    let initial = fs::read_to_string(path.join("global.log")).unwrap();
+    assert!(initial.contains("TRACE dispatching command show"));
+    let other = fs::read_dir(path).unwrap().filter_map(Result::ok).find(|e| e.file_name().to_string_lossy().starts_with("other-")).unwrap().path();
+    let switched = fs::read_to_string(other).unwrap();
+    assert!(switched.contains("TRACE dispatching command show"));
+    assert!(!initial.contains("secret-one"));
+    assert!(!switched.contains("secret-two"));
+    // A second daemon can append to the configured shared file.
+    fs::write(&script, "debug 2\nshow\n").unwrap();
+    let output = command(path).arg("-f").arg(&script).output().unwrap();
+    assert!(output.status.success());
+    let appended = fs::read_to_string(path.join("global.log")).unwrap();
+    assert!(appended.len() > initial.len());
 }
 
 #[test]

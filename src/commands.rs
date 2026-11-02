@@ -201,6 +201,7 @@ pub fn should_record_history(line: &str) -> bool {
 /// Adding a command requires a handler/Command implementation and ONE entry here.
 pub static COMMANDS: &[&dyn Command] = &[
     &HELP,
+    &DEBUG,
     &connect::Connect,
     &DISCONNECT,
     &cd::Cd,
@@ -294,7 +295,19 @@ fn run_daemon(
     password: Option<Password>,
 ) -> Result<CommandResult> {
     let command = find(parser).ok_or_else(|| anyhow::anyhow!("unknown daemon command"))?;
-    command.execute(&mut CommandContext::Daemon { app, password }, parser)
+    let log = app.debug_log.clone();
+    if let Some(log) = &log {
+        log.log(2, "TRACE", &format!("dispatching command {}", command.names()[0]));
+    }
+    let result = command.execute(&mut CommandContext::Daemon { app, password }, parser);
+    if let Some(log) = &log {
+        if result.is_err() {
+            log.log(0, "ERROR", &format!("command {} failed (details omitted)", command.names()[0]));
+        } else {
+            log.log(2, "TRACE", &format!("command {} dispatched", command.names()[0]));
+        }
+    }
+    result
 }
 fn display_result(result: Result<CommandResult>) -> Vec<String> {
     match result {
@@ -411,6 +424,22 @@ const fn small(
         history: true,
     }
 }
+fn debug(context: &mut CommandContext<'_>, parser: &ParserContext<'_>) -> Result<CommandResult> {
+    let level = match parser.arguments() {
+        [] => None,
+        [level] if matches!(level.as_str(), "0" | "1" | "2") => Some(level.parse::<u8>()?),
+        _ => bail!("usage: debug [0|1|2]"),
+    };
+    let log = context.daemon()?.debug_log.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("daemon logging is not available"))?;
+    if let Some(level) = level {
+        log.set_level(level);
+        log.log(1, "DEBUG", &format!("debug level set to {level}"));
+    }
+    Ok(vec![format!("debug level: {}; log: {}", log.level(), log.path().display())].into())
+}
+
+static DEBUG: SmallCommand = small(&["debug"], Some(("debug [0|1|2]", "show or set daemon log level")), debug);
 static HELP: SmallCommand = SmallCommand {
     completion: Completion::CommandNames,
     ..small(&["help"], Some(("help", "show available commands")), help)
@@ -610,6 +639,15 @@ fn show(context: &mut CommandContext<'_>, parser: &ParserContext<'_>) -> Result<
 fn set_lines(app: &mut Daemon, parser: &ParserContext<'_>) -> Vec<String> {
     let mut words = parser.words();
     match (words.next(), words.next()) {
+        (Some("xfer:debug-file"), Some(value)) => {
+            if let Some(log) = &app.debug_log {
+                if let Err(error) = log.set_path(value, &app.local_directory) {
+                    return vec![format!("cannot open debug log: {error}")];
+                }
+            }
+            app.settings.set("xfer:debug-file", value).expect("registered debug file setting");
+            vec![format!("xfer:debug-file set to {value}")]
+        }
         (Some(name), Some(value)) => match app.settings.set(name, value) {
             Ok(()) => vec![format!(
                 "{name} set to {}",

@@ -188,6 +188,7 @@ enum JobEventKind {
 pub struct JobManager {
     pub jobs: HashMap<JobId, Job>,
     next_id: JobId,
+    pub(crate) debug_log: Option<std::sync::Arc<crate::debug_log::DebugLog>>,
     tx: mpsc::UnboundedSender<JobEvent>,
     rx: mpsc::UnboundedReceiver<JobEvent>,
 }
@@ -198,6 +199,7 @@ impl JobManager {
         Self {
             jobs: HashMap::new(),
             next_id: 1,
+            debug_log: None,
             tx,
             rx,
         }
@@ -297,6 +299,10 @@ impl JobManager {
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
         let events = self.tx.clone();
+        let log = self.debug_log.clone();
+        if let Some(log) = &log {
+            log.log(1, "DEBUG", &format!("job {id} started"));
+        }
         let handle = tokio::spawn(async move {
             let operation = operation(task_output, progress_tx.clone());
             let (state, message) = tokio::select! {
@@ -304,6 +310,12 @@ impl JobManager {
                 _ = task_cancel.cancelled() => (JobState::Cancelled, "operation cancelled".to_owned()),
                 result = operation => match result { Ok(message) => (JobState::Completed, message), Err(error) => (JobState::Failed, error.to_string()) },
             };
+            if let Some(log) = &log {
+                match state {
+                    JobState::Failed => log.log(0, "ERROR", &format!("job {id} failed (details omitted)")),
+                    _ => log.log(1, "DEBUG", &format!("job {id} finished: {state:?}")),
+                }
+            }
             let _ = progress_tx.send(Progress::Indeterminate {
                 message: message.clone(),
             });

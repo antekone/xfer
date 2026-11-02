@@ -20,6 +20,7 @@ pub mod webdav;
 pub mod walker;
 pub mod core;
 
+mod debug_log;
 mod local_path;
 mod prompt;
 mod directory;

@@ -164,6 +164,16 @@ A missing file is created with private permissions.
 validates the file. Bookmarks are read afresh on each connection, so edits
 do not require a daemon restart and do not change an existing connection.
 .TP
+.B debug \fR[\fIlevel\fR]
+Show or set the daemon log level and display the log file path. Level 0
+(the default) records errors and warnings; 1 also records debug events; 2
+also records trace events. By default the private log is named
+.B xfer-debug-<pid>.log
+in the initial local directory. Configure its filename with
+.BR xfer:debug-file .
+Logs are not automatically deleted. Diagnostics omit command arguments,
+job output, and error details, which may contain sensitive data.
+.TP
 .BI cancel " job-id"
 Request cancellation of a daemon job.
 .TP
@@ -505,6 +515,24 @@ TCP connection timeout, from 1 to 300 seconds. Default: 10.
 .TP
 .B webdav:operation-timeout \fR(integer)
 Request/read timeout, from 1 to 300 seconds. Default: 30.
+.TP
+.B xfer:debug-file \fR(string)
+Daemon log filename template. Default:
+.BR ${cwd}/xfer-debug-${pid}.log .
+.B ${pid}
+and
+.B ${cwd}
+(or the unbraced forms
+.B $pid
+and
+.BR $cwd )
+expand to the daemon PID and local directory when the setting is applied.
+Relative filenames are resolved against that directory. Use quotes around the
+value in a command if it contains spaces. An existing private regular file
+owned by the user is appended to, allowing multiple daemons to share a log;
+each line includes the daemon PID. Parent directories must already exist.
+A runtime change switches the destination immediately; an invalid filename
+leaves the previous destination unchanged.
 .TP
 .B xfer:clobber \fR(boolean)
 Allow downloads to overwrite local files and uploads or renames to replace
