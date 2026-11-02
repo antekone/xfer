@@ -97,7 +97,7 @@ exec {server} -d "$TEST_REMOTE_ROOT"
         fs::create_dir_all(&config).unwrap();
         fs::write(
             config.join("xfer.conf"),
-            "ui:history-file: session\nsftp:connect-timeout: 5\n",
+            format!("ui:history-file: session\nsftp:connect-timeout: 5\nxfer:debug-file: {}/test-debug-${{pid}}.log\n", root.path().display()),
         )
         .unwrap();
         fs::write(config.join("bookmarks.toml"), "[test]\ntype = 'sftp'\nurl = 'sftp://user@example.invalid'\npassword_interactive = true\n[stall]\ntype = 'sftp'\nurl = 'sftp://user@stall.invalid'\npassword_interactive = true\n").unwrap();
@@ -1279,6 +1279,26 @@ fn sftp_moves_use_basic_rename_without_extensions_and_do_not_replay_permission_e
             .count(),
         2
     );
+}
+
+#[test]
+fn recursive_rm_removes_tree_without_following_symlinks_and_force_continues() {
+    let Some(mut daemon) = Daemon::start() else { return; };
+    let remote = daemon.remote();
+    fs::create_dir_all(remote.join("tree/nested")).unwrap();
+    fs::write(remote.join("tree/nested/file"), b"data").unwrap();
+    std::os::unix::fs::symlink("../../photos", remote.join("tree/nested/link")).unwrap();
+    fs::write(remote.join("after"), b"data").unwrap();
+    daemon.connect("test-secret", true);
+    let response = daemon.command("rm -rf missing tree/ after");
+    let output = daemon.finish(response, false);
+    assert!(!remote.join("tree").exists(), "{output:?}");
+    assert!(!remote.join("after").exists());
+    assert!(remote.join("photos/image.txt").exists());
+    let response = daemon.command("rm -r 'linked photos'");
+    daemon.finish(response, true);
+    assert!(fs::symlink_metadata(remote.join("linked photos")).is_err());
+    assert!(remote.join("photos/image.txt").exists());
 }
 
 #[test]

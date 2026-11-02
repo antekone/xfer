@@ -834,6 +834,30 @@ impl Connection for SftpConnection {
         lease.finish(result)
     }
 
+    async fn select_for_removal(&self, path: &str, _directory_hint: bool) -> Result<crate::walker::Selection> {
+        use crate::walker::WalkSource;
+        crate::backend::validate_file_path(path)?;
+        let path = self.resolve_listing_path(path)?;
+        crate::backend::validate_file_path(&path)?;
+        let lease = self.acquire().await?;
+        let metadata = operation(lease.session.sftp.fs().symlink_metadata(&path)).await;
+        let metadata = lease.finish(metadata)?;
+        let kind = metadata.file_type().ok_or_else(|| permanent("SFTP server did not report file type"))?;
+        if !kind.is_dir() {
+            return Ok(crate::walker::Selection::File(record(path.rsplit('/').next().unwrap_or(&path).to_owned(), &metadata, false, None, None)));
+        }
+        crate::walker::RemoteSource(self).select(&path).await
+    }
+
+    async fn remove_empty_directory(&self, path: &str) -> Result<()> {
+        crate::backend::validate_file_path(path)?;
+        let path = self.resolve_listing_path(path)?;
+        crate::backend::validate_file_path(&path)?;
+        let lease = self.acquire().await?;
+        let result = operation(lease.session.sftp.fs().remove_dir(path)).await;
+        lease.finish(result)
+    }
+
     async fn remove_file(&self, path: &str) -> Result<()> {
         crate::backend::validate_file_path(path)?;
         let path = self.resolve_listing_path(path)?;

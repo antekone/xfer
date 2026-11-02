@@ -256,6 +256,24 @@ async fn finish(app: &mut Daemon, result: Vec<String>, success: bool) -> u64 {
 }
 
 #[tokio::test]
+async fn smb_recursive_rm_and_force_continue() {
+    let Some(server) = Server::start() else { return; };
+    fs::create_dir_all(server.path("share/tree/nested")).unwrap();
+    fs::write(server.path("share/tree/nested/file"), b"data").unwrap();
+    fs::write(server.path("share/after"), b"data").unwrap();
+    let mut app = Daemon::bootstrap().unwrap();
+    let connected = app.command(&format!("open {}", server.url(false, "share")));
+    finish(&mut app, connected, true).await;
+    let response = app.command("rm -rf missing tree after");
+    finish(&mut app, response, false).await;
+    assert!(!server.path("share/tree").exists());
+    assert!(!server.path("share/after").exists());
+    let response = app.command("rm -r /share");
+    finish(&mut app, response, false).await;
+    assert!(server.path("share/photos").is_dir());
+}
+
+#[tokio::test]
 async fn smb_guest_navigation_listing_download_upload_and_mkdir() {
     let Some(server) = Server::start() else {
         return;

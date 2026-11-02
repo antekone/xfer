@@ -148,6 +148,12 @@ impl Client {
             Self::Anonymous(client) => tree.delete_file(&mut client.0, path).await,
         }
     }
+    pub(super) async fn remove_directory(&mut self, tree: &Tree, path: &str) -> smb2::Result<()> {
+        match self {
+            Self::Named(client) => client.delete_directory(tree, path).await,
+            Self::Anonymous(client) => tree.delete_directory(&mut client.0, path).await,
+        }
+    }
     pub(super) async fn rename_file(
         &mut self,
         tree: &Tree,

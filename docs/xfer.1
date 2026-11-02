@@ -336,9 +336,23 @@ for directories.
 .B pwd
 Print the remote working directory.
 .TP
-.B rm \fR[\fB\-\-\fR] \fIfile\fR...
-Delete remote files. This command is non-recursive and does not accept
-.BR \-r .
+.B rm \fR[\fB\-rf\fR] [\fB\-\-\fR] \fIpath\fR...
+Delete exact remote paths. Without
+.BR \-r ,
+only files are removed.
+.B WARNING: \-r recursively deletes directories and their contents. This is
+dangerous and cannot be undone.
+Recursive deletion is supported for SFTP, SMB and S3; WebDAV recursive deletion
+is not supported because a collection DELETE can recursively remove newly
+created children. Symlinks are not followed by SFTP; SMB reparse points are
+refused. Do not modify a remote tree concurrently with recursive deletion.
+By default, stop on the first error.
+.B \-f
+continues after errors, reports them, and leaves the job failed if any occurred;
+it does not suppress missing-file errors. Mutations are never retried.
+Use
+.B \-\-
+before paths beginning with a dash.
 .TP
 .BI set " name value"
 Change a daemon setting. Quote values containing spaces; use an empty

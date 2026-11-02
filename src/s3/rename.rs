@@ -490,6 +490,26 @@ mod remove_tests {
         (format!("HTTP/1.1 {status} Response\r\n{headers}content-length: 0\r\nconnection: close\r\n\r\n"),Vec::new())
     }
     #[tokio::test]
+    async fn remove_empty_s3_directory_only_deletes_its_marker_conditionally() {
+        fn listing(body: &str) -> (String, Vec<u8>) {
+            (format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len()), body.as_bytes().to_vec())
+        }
+        let marker = "<ListBucketResult><Contents><Key>dir/</Key><ETag>&quot;v1&quot;</ETag></Contents></ListBucketResult>";
+        let (connection, requests) = http_client(vec![listing(marker), response(204, "")]).await;
+        connection.remove_empty_directory("/example/dir").await.unwrap();
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].starts_with("DELETE /example/dir/"));
+        assert!(requests[1].to_ascii_lowercase().contains("if-match: \"v1\"\r\n"));
+        let nonempty = "<ListBucketResult><Contents><Key>dir/file</Key></Contents></ListBucketResult>";
+        let (connection, requests) = http_client(vec![listing(nonempty)]).await;
+        assert!(connection.remove_empty_directory("/example/dir").await.is_err());
+        assert_eq!(requests.await.unwrap().len(), 1);
+        let (connection, requests) = http_client(vec![]).await;
+        assert!(connection.remove_empty_directory("/example").await.is_err());
+        assert!(requests.await.unwrap().is_empty());
+    }
+    #[tokio::test]
     async fn remove_requires_etag_and_deletes_only_exact_object_conditionally() {
         let (connection, requests) =
             http_client(vec![response(200, "etag: \"v1\"\r\n"), response(204, "")]).await;

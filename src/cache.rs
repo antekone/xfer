@@ -301,6 +301,15 @@ impl Connection for CachedConnection {
         self.cache.lock().unwrap().clear();
         result
     }
+    async fn select_for_removal(&self, path: &str, directory_hint: bool) -> Result<crate::walker::Selection> {
+        self.inner.select_for_removal(path, directory_hint).await
+    }
+    async fn remove_empty_directory(&self, path: &str) -> Result<()> {
+        self.cache.lock().unwrap().clear();
+        let result = self.inner.remove_empty_directory(path).await;
+        self.cache.lock().unwrap().clear();
+        result
+    }
     async fn remove_file(&self, path: &str) -> Result<()> {
         self.cache.lock().unwrap().clear();
         let result = self.inner.remove_file(path).await;

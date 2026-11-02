@@ -1158,7 +1158,8 @@ mod tests {
             shlex::split(&command).unwrap(),
             vec!["rm", "first file", "--", "-file name"]
         );
-        assert!(path_completion_context("rm -r ").is_none());
+        assert_eq!(path_completion_context("rm -rf pho").unwrap().1, "pho");
+        assert!(path_completion_context("rm -x ").is_none());
     }
 
     #[test]

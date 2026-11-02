@@ -228,6 +228,39 @@ impl Connection for S3Connection {
     fn pwd(&self) -> Result<String> {
         Ok(self.location.path())
     }
+    async fn select_for_removal(&self, path: &str, directory_hint: bool) -> Result<crate::walker::Selection> {
+        use crate::walker::WalkSource;
+        crate::backend::validate_file_path(path)?;
+        let target = self.location.resolve(path);
+        let bucket = target.bucket.as_deref().ok_or_else(|| NonRetryableError("cannot remove S3 buckets".into()))?;
+        if target.prefix.is_empty() { return Err(NonRetryableError("cannot remove an S3 bucket".into()).into()); }
+        let selection_path = if directory_hint { format!("{}/", path.trim_end_matches('/')) } else { path.to_owned() };
+        let selection = crate::walker::RemoteSource(self).select(&selection_path).await?;
+        if matches!(selection, crate::walker::Selection::Directory(_)) {
+            let probe = self.client.list_objects_v2().bucket(bucket).prefix(&target.prefix).max_keys(1).send().await
+                .map_err(|error| operation_error("ListObjectsV2", &error, &self.redactions))?;
+            if probe.contents().is_empty() { return Err(NonRetryableError("no such S3 directory".into()).into()); }
+        }
+        Ok(selection)
+    }
+    async fn remove_empty_directory(&self, path: &str) -> Result<()> {
+        crate::backend::validate_file_path(path)?;
+        let target = self.location.resolve(path);
+        let bucket = target.bucket.as_deref().ok_or_else(|| NonRetryableError("cannot remove S3 buckets".into()))?;
+        if target.prefix.is_empty() { return Err(NonRetryableError("cannot remove an S3 bucket".into()).into()); }
+        let result = self.client.list_objects_v2().bucket(bucket).prefix(&target.prefix).max_keys(2).send().await
+            .map_err(|error| operation_error("ListObjectsV2", &error, &self.redactions))?;
+        if result.is_truncated().unwrap_or(false) || result.contents().iter().any(|object| object.key() != Some(target.prefix.as_str())) {
+            return Err(NonRetryableError("S3 directory is not empty".into()).into());
+        }
+        if let Some(marker) = result.contents().first() {
+            let tag = marker.e_tag().filter(|tag| rename::strong_tag(tag))
+                .ok_or_else(|| NonRetryableError("S3 rm requires a strong directory marker ETag".into()))?;
+            self.client.delete_object().bucket(bucket).key(&target.prefix).if_match(tag).send().await
+                .map_err(|error| operation_error("DeleteObject", &error, &self.redactions))?;
+        }
+        Ok(())
+    }
     async fn remove_file(&self, path: &str) -> Result<()> {
         crate::backend::validate_file_path(path)?;
         let target = self.location.resolve(path);
