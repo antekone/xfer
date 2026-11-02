@@ -16,7 +16,7 @@ pub(crate) const DEFAULT_PATH: &str = "${cwd}/xfer-debug-${pid}.log";
 
 struct Destination {
     path: PathBuf,
-    file: fs::File,
+    file: Option<fs::File>,
 }
 
 pub(crate) struct DebugLog {
@@ -61,17 +61,15 @@ fn expand_path(template: &str, cwd: &Path) -> io::Result<PathBuf> {
     })
 }
 
-fn open_destination(template: &str, cwd: &Path) -> io::Result<Destination> {
-    let path = expand_path(template, cwd)?;
-    // Append allows multiple daemon processes to share an explicitly configured
-    // file. Refuse symlinks, non-regular files, other owners and public files.
+// Append allows multiple daemons to share a file. Refuse symlinks,
+// non-regular files, other owners and public files, including on lazy open.
+fn open_file(path: &Path, create: bool) -> io::Result<fs::File> {
     let file = OpenOptions::new()
-        .write(true)
         .append(true)
-        .create(true)
+        .create(create)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(&path)?;
+        .open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file()
         || metadata.uid() != unsafe { libc::geteuid() }
@@ -82,19 +80,38 @@ fn open_destination(template: &str, cwd: &Path) -> io::Result<Destination> {
             "debug log must be a private regular file owned by the current user",
         ));
     }
-    Ok(Destination { path, file })
+    Ok(file)
+}
+
+fn prepare_destination(template: &str, cwd: &Path) -> io::Result<Destination> {
+    let path = expand_path(template, cwd)?;
+    match open_file(&path, false) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // Do not create the file yet, but reject nonexistent/non-directory
+            // parents when applying the setting. Opening is checked again at use.
+            if !fs::metadata(path.parent().unwrap_or(cwd))?.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotADirectory,
+                    "debug log parent is not a directory",
+                ));
+            }
+        }
+        Err(error) => return Err(error),
+    }
+    Ok(Destination { path, file: None })
 }
 
 impl DebugLog {
     pub(crate) fn create(template: &str, cwd: &Path) -> io::Result<Self> {
         Ok(Self {
-            destination: Mutex::new(open_destination(template, cwd)?),
+            destination: Mutex::new(prepare_destination(template, cwd)?),
             level: AtomicU8::new(0),
         })
     }
 
     pub(crate) fn set_path(&self, template: &str, cwd: &Path) -> io::Result<()> {
-        let destination = open_destination(template, cwd)?;
+        let destination = prepare_destination(template, cwd)?;
         *self
             .destination
             .lock()
@@ -132,7 +149,12 @@ impl DebugLog {
                 label,
                 message
             );
-            let _ = destination.file.write_all(line.as_bytes());
+            if destination.file.is_none() {
+                destination.file = open_file(&destination.path, true).ok();
+            }
+            if let Some(file) = &mut destination.file {
+                let _ = file.write_all(line.as_bytes());
+            }
         }
     }
 }
@@ -151,12 +173,14 @@ mod tests {
             dir.path()
                 .join(format!("xfer-debug-{}.log", std::process::id()))
         );
+        assert!(!log.path().exists());
+        log.log(1, "DEBUG", "hidden");
+        assert!(!log.path().exists());
+        log.log(0, "WARN", "warning");
         assert_eq!(
             fs::metadata(log.path()).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        log.log(0, "WARN", "warning");
-        log.log(1, "DEBUG", "hidden");
         log.set_level(2);
         log.log(2, "TRACE", "visible");
         let contents = fs::read_to_string(log.path()).unwrap();
@@ -166,11 +190,24 @@ mod tests {
     }
 
     #[test]
+    fn lazy_open_rechecks_safety_after_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::write(&target, "untouched").unwrap();
+        let log = DebugLog::create("log", dir.path()).unwrap();
+        symlink(&target, log.path()).unwrap();
+        log.log(0, "WARN", "unsafe");
+        assert_eq!(fs::read_to_string(target).unwrap(), "untouched");
+    }
+
+    #[test]
     fn expansion_switch_and_file_safety() {
         let dir = tempfile::tempdir().unwrap();
         let log = DebugLog::create("$cwd/log-$pid", dir.path()).unwrap();
         let first = log.path();
+        log.log(0, "WARN", "first");
         log.set_path("shared.log", dir.path()).unwrap();
+        assert!(!dir.path().join("shared.log").exists());
         log.log(0, "WARN", "shared");
         assert!(fs::read_to_string(dir.path().join("shared.log"))
             .unwrap()

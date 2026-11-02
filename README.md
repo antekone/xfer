@@ -71,7 +71,8 @@ prompt to change it, for example `set xfer:debug-file '${cwd}/shared.log'`.
 The template supports `${pid}` and `${cwd}` (also `$pid` and `$cwd`); `cwd` is
 the local directory when the setting is applied. Relative paths use that same
 directory. Existing private files are appended to, so daemons can share a log;
-each line includes the daemon PID. Logs are not deleted automatically.
+each line includes the daemon PID. The file is created only when a message is
+actually logged, and is not deleted automatically.
 Diagnostics omit command arguments, job output, and error details because
 these can contain sensitive data.
 

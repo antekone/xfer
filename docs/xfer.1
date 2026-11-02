@@ -171,8 +171,9 @@ also records trace events. By default the private log is named
 .B xfer-debug-<pid>.log
 in the initial local directory. Configure its filename with
 .BR xfer:debug-file .
-Logs are not automatically deleted. Diagnostics omit command arguments,
-job output, and error details, which may contain sensitive data.
+The log file is created only when a message is emitted, and is not
+automatically deleted. Diagnostics omit command arguments, job output, and
+error details, which may contain sensitive data.
 .TP
 .BI cancel " job-id"
 Request cancellation of a daemon job.
@@ -545,8 +546,9 @@ Relative filenames are resolved against that directory. Use quotes around the
 value in a command if it contains spaces. An existing private regular file
 owned by the user is appended to, allowing multiple daemons to share a log;
 each line includes the daemon PID. Parent directories must already exist.
-A runtime change switches the destination immediately; an invalid filename
-leaves the previous destination unchanged.
+A runtime change switches the destination immediately. Invalid paths detected
+when applying the setting leave the previous destination unchanged; file
+creation and its permission checks occur when a message is first emitted.
 .TP
 .B xfer:clobber \fR(boolean)
 Allow downloads to overwrite local files and uploads or renames to replace

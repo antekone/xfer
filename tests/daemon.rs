@@ -652,6 +652,29 @@ fn script_runs_without_a_terminal_and_stops_on_failed_job() {
 }
 
 #[test]
+fn debug_log_is_created_only_for_an_emitted_message() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path();
+    fs::create_dir_all(path.join("home")).unwrap();
+    let script = path.join("commands.rc");
+    fs::write(&script, "debug\nset xfer:debug-file '${cwd}/custom.log'\ndebug\nshow\n").unwrap();
+    let output = command(path).arg("-f").arg(&script).stderr(Stdio::piped()).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("debug level: 0; log:"));
+    assert!(!fs::read_dir(path).unwrap().filter_map(Result::ok)
+        .any(|entry| entry.file_name().to_string_lossy().starts_with("xfer-debug-")));
+    assert!(!path.join("custom.log").exists());
+
+    fs::write(&script, "debug 1\n").unwrap();
+    let output = command(path).arg("-f").arg(&script).stderr(Stdio::piped()).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let log = fs::read_dir(path).unwrap().filter_map(Result::ok)
+        .find(|entry| entry.file_name().to_string_lossy().starts_with("xfer-debug-"))
+        .expect("debug event should create the log");
+    assert!(fs::read_to_string(log.path()).unwrap().contains("DEBUG debug level set to 1"));
+}
+
+#[test]
 fn debug_controls_private_daemon_log_without_recording_arguments() {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
