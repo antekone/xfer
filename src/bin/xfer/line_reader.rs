@@ -480,6 +480,14 @@ fn complete_command(client: &mut Connection, command: &mut String) -> Result<Vec
             .into_iter()
             .filter(|name| name.starts_with(prefix))
             .collect::<Vec<_>>()
+    } else if completion == Completion::CommandNames {
+        // Command names are compiled into the client; no IPC round trip is
+        // needed. Offer the same visible names `help` itself lists.
+        let prefix = command.trim_start().strip_prefix(verb).unwrap_or("").trim();
+        commands::visible_names()
+            .filter(|name| name.starts_with(prefix))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
     } else {
         Vec::new()
     };
@@ -1275,6 +1283,34 @@ mod tests {
             complete_command(&mut client, &mut prefix).unwrap();
             assert_eq!(prefix, expected);
         }
+    }
+
+    #[test]
+    fn help_completion_offers_visible_command_names_without_ipc() {
+        let (stream, _server) = UnixStream::pair().unwrap();
+        let mut client = Connection::new(stream);
+        for (before, expected) in [
+            ("help ", "help "),
+            ("help ge", "help get"),
+            ("help cl", "help close"),
+            // A fully typed unique match is not rewritten, matching settings
+            // completion behavior for arguments.
+            ("help exit", "help exit"),
+        ] {
+            let mut prefix = before.to_owned();
+            complete_command(&mut client, &mut prefix).unwrap();
+            assert_eq!(prefix, expected, "for {before:?}");
+        }
+        // Multiple matches share a prefix but are not auto-inserted.
+        let mut prefix = "help c".to_owned();
+        let notices = complete_command(&mut client, &mut prefix).unwrap();
+        assert_eq!(prefix, "help c");
+        assert_eq!(notices.len(), 1);
+        let listed = notices[0].split("  ").collect::<Vec<_>>();
+        assert!(listed.contains(&"cancel"));
+        assert!(listed.contains(&"cat"));
+        assert!(listed.contains(&"cd"));
+        assert!(listed.contains(&"connect"));
     }
 
     #[test]

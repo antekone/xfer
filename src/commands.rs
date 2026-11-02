@@ -33,6 +33,7 @@ pub enum ExecutionSite {
 pub enum Completion {
     None,
     Settings,
+    CommandNames,
     RemotePath {
         kind: crate::ipc::pb::CompletionKind,
         multiple_arguments: bool,
@@ -410,7 +411,10 @@ const fn small(
         history: true,
     }
 }
-static HELP: SmallCommand = small(&["help"], Some(("help", "show available commands")), help);
+static HELP: SmallCommand = SmallCommand {
+    completion: Completion::CommandNames,
+    ..small(&["help"], Some(("help", "show available commands")), help)
+};
 static DISCONNECT: SmallCommand = small(
     &["disconnect", "close"],
     Some(("disconnect", "release the active backend connection")),
@@ -688,6 +692,7 @@ mod tests {
         assert!(!help.contains("read-output"));
         assert_eq!(completion_for("show"), Completion::Settings);
         assert_eq!(completion_for("set"), Completion::Settings);
+        assert_eq!(completion_for("help"), Completion::CommandNames);
         assert_eq!(
             completion_for("lcd"),
             Completion::LocalPath {
