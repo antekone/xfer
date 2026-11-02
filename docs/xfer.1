@@ -1,0 +1,753 @@
+.TH XFER 1 "" "xfer 0.1.0" "General Commands Manual"
+.SH NAME
+xfer \- interactive remote file transfer client
+.SH SYNOPSIS
+.B xfer
+.br
+.B xfer attach
+.RI [ id ]
+.br
+.B xfer
+.BR \-h " | " \-\-help
+.br
+.B xfer
+.BR \-V " | " \-\-version
+.SH DESCRIPTION
+.B xfer
+is an interactive, terminal-based file transfer program for S3 and
+S3-compatible storage, SFTP, SMB, and WebDAV. It provides a command prompt,
+remote and local working directories, listings, recursive transfers,
+completion, a file selector, a pager, and job control.
+.PP
+Without arguments, xfer starts a new per-session daemon and attaches the
+terminal to it. Establish a connection with the
+.B open
+command. The daemon owns the connection, settings, and jobs; detaching the
+terminal does not cancel running transfers. A detached daemon exits when
+it has no running jobs.
+.PP
+The interface is modeled after
+.BR lftp (1),
+but xfer is not a drop-in replacement. In particular, it does not implement
+FTP, FTPS, lftp's batch options, or lftp's shell command language.
+.SS Normal startup
+For normal use, simply run:
+.PP
+.nf
+.RS
+xfer
+.RE
+.fi
+.PP
+This automatically creates a daemon and a terminal client connected to it.
+You do not need to start the daemon separately or attach manually.
+Detaching and reattaching are optional features for leaving jobs running
+and returning to them later.
+.SS Attaching to a session
+.B xfer attach
+attaches to the only ready detached daemon. If several are available, it
+lists their instance IDs and asks you to select one. With
+.IR id ,
+it selects an exact instance ID or an unambiguous ID prefix.
+Only one terminal may be attached to a daemon at a time.
+.SS Command syntax
+Enter one command per line. Arguments use shell-like quoting and backslash
+escaping; for example:
+.PP
+.nf
+.RS
+cd 'photo album'
+get 'annual report.pdf'
+.RE
+.fi
+.PP
+Ordinary xfer commands do not perform shell variable or command expansion,
+pipelines, redirection, command grouping, or chaining with semicolons,
+.BR && ,
+or
+.BR || .
+A trailing
+.B &
+is not a background operator. Use Ctrl-Z to leave a job running in the
+background. Commands beginning with
+.B !
+are an exception: their remaining text is passed unchanged to Bash.
+.PP
+Where supported,
+.B \-\-
+ends option parsing so that subsequent names beginning with a hyphen are
+operands. Quoting a wildcard does not disable a command's own pattern
+matching. The
+.B get
+and
+.B put
+commands match patterns against files in the current remote or local
+directory, respectively, using * for any sequence and ? for one character;
+other characters are literal. Prefix a name with
+.B ./
+to bypass their pattern expansion.
+.SS Jobs and retries
+Remote operations run as daemon jobs. The client normally waits for a
+started job in the foreground. Ctrl-C requests cancellation of the
+foreground job; Ctrl-Z returns to the prompt without stopping it.
+Use
+.B jobs
+and
+.B status
+for information,
+.B fg
+to wait for a job again, and
+.B cancel
+to cancel a background job.
+.PP
+Retryable operations use backoff for transient failures. This is not a
+transaction guarantee: mutating operations such as
+.B mv
+and
+.B rm
+are not automatically replayed. A failed or cancelled operation can leave
+partial files or an ambiguous remote result. Inspect the destination
+before retrying.
+.SH COMMANDS
+.TP
+.BI ! command
+Run a local Bash command with the terminal's standard input, output, and
+error streams. The working directory is the daemon's current local
+directory. Bash handles quoting, expansion, pipelines, and redirection.
+This is a client-side command, not a daemon job.
+.TP
+.B bg
+Leave jobs in the background. All daemon jobs are already background tasks;
+this command does not resume a stopped operating-system process.
+.TP
+.B bookmark \fR[\fBedit\fR | \fBreload\fR]
+Without arguments, list bookmark names and addresses, omitting credentials.
+.B edit
+opens the TOML bookmark file using
+.BR VISUAL ,
+then
+.BR EDITOR ,
+or
+.BR vi .
+A missing file is created with private permissions.
+.B reload
+validates the file. Bookmarks are read afresh on each connection, so edits
+do not require a daemon restart and do not change an existing connection.
+.TP
+.BI cancel " job-id"
+Request cancellation of a daemon job.
+.TP
+.B cat \fR[\fB\-\-\fR] \fIfile\fR...
+Fetch remote file contents for display, using the pager for long output
+when enabled. Multiple operands are read in order.
+.TP
+.B cd \fR[\fIdirectory\fR]
+Change the remote working directory. Without an argument, return to the
+connection's initial directory.
+.TP
+.B close
+Alias for
+.BR disconnect .
+.TP
+.B connect \fIurl\fR|\fIname
+Connect to a URL or a bookmark. The URL scheme selects the backend;
+bookmarks may specify a backend explicitly. See
+.B PROTOCOLS
+and
+.BR BOOKMARKS .
+.TP
+.B detach
+Detach the terminal. Running daemon jobs continue; the daemon remains
+only while jobs are running. Reattach using
+.BR "xfer attach" .
+.TP
+.B disconnect
+Release the active backend connection.
+.TP
+.B du \fR[\fB\-sh\fR] [\fB\-\-\fR] [\fIpath\fR...]
+Recursively report remote apparent byte usage, not allocated disk blocks.
+The default path is the current remote directory.
+.B \-s
+reports only totals for the requested roots;
+.B \-h
+uses human-readable sizes.
+.TP
+.B exit
+Alias for
+.BR detach .
+.TP
+.BI fg " job-id"
+Bring a daemon job into the client's foreground and wait for it.
+.TP
+.B get \fR[\fB\-c\fR] [\fB\-\-\fR] \fIfile\fR...
+Download remote files into the daemon's local working directory using
+their basenames. Patterns select files in the current remote directory.
+Existing local files are protected unless
+.B xfer:clobber
+is true.
+.B \-c
+continues an existing local file from its current length. A local file
+larger than its remote counterpart cannot be resumed. Directories must
+be downloaded with
+.BR mirror .
+.TP
+.B help
+List available commands and aliases.
+.TP
+.B jobs
+List daemon jobs with their IDs, states, and titles.
+.TP
+.B lcd \fR[\fIdirectory\fR]
+Change the local working directory used by transfers and Bash escapes.
+Without an argument, use the user's home directory. Local paths may use
+.B ~
+or
+.BR ~/ .
+The initial local directory is the directory from which the daemon started.
+.TP
+.B ls \fR[\fB\-FlarSh\fR] [\fB\-\-\fR] [\fIpath\fR]
+List remote entries. Without a path, list the current directory. A path
+may name a directory, a file, or a supported filename pattern.
+Default options come from
+.BR ui:ls-default-options .
+.RS
+.TP
+.B \-F
+Append file-type indicators.
+.TP
+.B \-l
+Use the long listing format.
+.TP
+.B \-a
+Include hidden entries.
+.TP
+.B \-r
+Reverse the sort order.
+.TP
+.B \-S
+Sort by size, largest first.
+.TP
+.B \-h
+Display human-readable sizes.
+.RE
+.IP
+Normally directories sort before files, with names sorted within each
+group. Command options are applied after the defaults. Use
+.BR \-\-no-classify ,
+.BR \-\-no-long ,
+.BR \-\-no-all ,
+.BR \-\-no-reverse ,
+.BR \-\-no-size ,
+or
+.B \-\-no-human-readable
+to disable the corresponding option.
+.TP
+.B mirror \fR[\fB\-c\fR] [\fB\-\-\fR] \fIdirectory\fR...
+Recursively download named remote directories below the local working
+directory, preserving each directory's basename. Existing regular files
+are skipped by default, or overwritten when
+.B xfer:clobber
+is true.
+.B \-c
+resumes existing files. This is a recursive copy, not a synchronization
+engine: it does not delete extra destination files or compare timestamps
+like lftp's mirror command. Remote root, dot, and dot-dot are not accepted
+as root directory names.
+.TP
+.B mirror-upload \fR[\fB\-\-\fR] \fIdirectory\fR...
+Recursively upload local directories below the current remote directory,
+preserving their basenames. Replacement of existing remote files is
+controlled by
+.BR xfer:clobber .
+This command has no resume option and does not delete extra remote files.
+.TP
+.B mirror-up
+Alias for
+.BR mirror-upload .
+.TP
+.B mkdir \fR[\fB\-p\fR] [\fB\-\-\fR] \fIdirectory\fR...
+Create remote directories.
+.BR \-p " (" \-\-parents )
+creates missing parents and accepts existing directories. S3 directories
+are trailing-slash marker objects; this command does not create buckets.
+.TP
+.B mv \fR[\fB\-f\fR] [\fB\-\-\fR] \fIsource destination
+Rename a remote file to an exact destination path, not a destination
+directory. Directory moves are not supported.
+.BR \-f " (" \-\-force )
+permits replacement of an existing file for this operation; otherwise
+.B xfer:clobber
+controls replacement. S3 implements this as copy followed by delete,
+which is not atomic.
+.TP
+.B open \fIurl\fR|\fIname
+Alias for
+.BR connect .
+.TP
+.B put \fR[\fB\-\-\fR] \fIfile\fR...
+Upload local files into the current remote directory using their basenames.
+Patterns select regular files in the current local directory. Existing
+remote files are protected unless
+.B xfer:clobber
+is true. Use
+.B mirror-upload
+for directories.
+.TP
+.B pwd
+Print the remote working directory.
+.TP
+.B rm \fR[\fB\-\-\fR] \fIfile\fR...
+Delete remote files. This command is non-recursive and does not accept
+.BR \-r .
+.TP
+.BI set " name value"
+Change a daemon setting. Quote values containing spaces; use an empty
+quoted string for an empty text value. Changes are session-local and are
+not written to a configuration file. Connection settings generally take
+effect on a new connection.
+.TP
+.B show \fR[\fIname\fR]
+Show all settings or a single setting, with descriptions. Password values
+are redacted.
+.TP
+.B status \fR[\fIjob-id\fR]
+Without an argument, show daemon, connection, local and remote directory,
+and configuration-file information. With a job ID, show job details.
+.SH PROTOCOLS
+.TP
+.B s3://\fIbucket
+Use S3 with the default AWS credential chain unless bookmark credentials
+are supplied. Use
+.B s3:endpoint
+or an HTTP(S) S3 bookmark for an S3-compatible service. Buckets must
+already exist. Only Signature Version 4 is supported.
+.TP
+.B sftp://\fR[\fIuser\fB@\fR]\fIhost\fR[\fB:\fIport\fR][\fB/\fIpath\fR]
+Use SFTP through OpenSSH. SSH configuration, keys, and ssh-agent are
+normally used for authentication. Host-key checking is strict by default.
+Password bookmarks support a single password exchange, not
+keyboard-interactive MFA or challenge-response authentication.
+.TP
+.B smb://\fR[\fIdomain\fB;\fR][\fIuser\fB@\fR]\fIhost\fR[\fB:\fIport\fR][\fB/\fIshare\fR[\fB/\fIpath\fR]]
+Use SMB. A server URL without a share can be used to browse shares.
+An empty username means anonymous access, not the operating-system user.
+.TP
+.B http://\fIhost/path/\fR, \fBhttps://\fIhost/path/
+Use WebDAV. The schemes
+.BR dav ,
+.BR davs ,
+.BR webdav ,
+and
+.B webdavs
+are also supported; the variants ending in "s" use TLS.
+The server must support WebDAV PROPFIND; an HTML directory index is
+insufficient. Authentication is anonymous or Basic, not Digest, NTLM,
+OAuth/Bearer, or client certificates. Plaintext HTTP credentials are
+refused unless explicitly enabled.
+.PP
+HTTP(S) bookmarks select S3 instead of WebDAV when they specify
+.BR "type = 's3'" ,
+a
+.B bucket
+field, or an
+.B accessKey
+field. An explicit bookmark type takes precedence over inference.
+.SH SETTINGS
+Settings are named with colon-separated namespaces. Boolean values are
+.B true
+or
+.BR false ;
+timeouts are in seconds. The defaults are shown below. Use
+.B show
+for current values.
+.TP
+.B bookmarks:file \fR(path)
+Bookmark file. Default: bookmarks.toml in the application configuration
+directory.
+.TP
+.B cache:max-bytes \fR(integer)
+Per-connection directory cache budget in bytes. Default: 4194304.
+Reconnect to apply.
+.TP
+.B cache:ttl \fR(integer)
+Directory cache lifetime in seconds; zero disables caching. Default: 30.
+Reconnect to apply.
+.TP
+.B s3:endpoint \fR(string)
+Optional S3-compatible HTTP(S) endpoint. Default: empty.
+.TP
+.B s3:region \fR(string)
+Default S3 signing region. Default: us-east-1.
+.TP
+.B sftp:connect-timeout \fR(integer)
+Positive SSH connection and authentication timeout. Default: 30.
+.TP
+.B sftp:disable-strict-checking \fR(boolean)
+Disable strict SSH host-key checking for new connections. Default: false.
+This permits unverified unknown host keys and is insecure; OpenSSH may
+still restrict authentication when a known host key changes.
+.TP
+.B sftp:max-requests \fR(integer)
+Concurrent SFTP read/write requests, from 1 to 256. Default: 64.
+Reconnect to apply.
+.TP
+.B smb:connect-timeout \fR(integer)
+SMB connection and login timeout. Default: 10.
+.TP
+.B smb:operation-timeout \fR(integer)
+SMB operation timeout. Default: 30.
+.TP
+.B smb:max-credits \fR(integer)
+Maximum in-flight 64 KiB transfer chunks, from 1 to 128. Default: 32.
+Reconnect to apply.
+.TP
+.B smb:user \fR(string)
+Default SMB username; empty selects anonymous access. Default: empty.
+.TP
+.B smb:password \fR(secret)
+Default SMB password, displayed redacted. Default: unset. Prefer
+per-bookmark credentials or interactive entry.
+.TP
+.B smb:domain \fR(string)
+Default NTLM domain. Default: empty.
+.TP
+.B smb:dfs \fR(boolean)
+Allow DFS referrals to other servers, forwarding credentials to them.
+Default: false. Reconnect to apply.
+.TP
+.B smb:require-encryption \fR(boolean)
+Refuse shares without active SMB3 encryption. Default: false.
+Reconnect to apply.
+.TP
+.B ssl:skip-validation \fR(boolean)
+Disable TLS certificate validation. Default: false. Enabling this is
+insecure and permits man-in-the-middle attacks.
+.TP
+.B ui:auto-pager \fR(boolean)
+Use the built-in pager for long output. Default: true.
+.TP
+.B ui:history-file \fR(path)
+Persistent command history file. Default: history in the application state
+directory. The values
+.B session
+and
+.B /dev/null
+disable persistence. The client reads this setting when attaching.
+.TP
+.B ui:ls-default-options \fR(string)
+Base options for
+.BR ls .
+Default: \-lF. Only options, not a path, are allowed.
+.TP
+.B ui:prompt \fR(string)
+Prompt template. Default: "xfer$location> ". Substitutions are
+.B $cwd
+(protocol and remote path),
+.B $cwdn
+(remote basename),
+.BR $user ,
+.BR $host ,
+.BR $proto ,
+.B $lcwd
+(local path),
+.B $lcwdn
+(local basename), and
+.B $location
+(bracketed protocol and remote path, empty when disconnected).
+Braced forms such as
+.B ${host}
+are accepted;
+.B $$
+produces a literal dollar sign. No shell code is evaluated.
+.TP
+.B webdav:user \fR(string)
+Default WebDAV Basic-auth username; empty means anonymous. Default: empty.
+.TP
+.B webdav:password \fR(secret)
+Default WebDAV password, displayed redacted. Default: unset.
+.TP
+.B webdav:allow-insecure-auth \fR(boolean)
+Allow Basic credentials over plaintext HTTP. Default: false. This exposes
+credentials to the network. Reconnect to apply.
+.TP
+.B webdav:connect-timeout \fR(integer)
+TCP connection timeout, from 1 to 300 seconds. Default: 10.
+.TP
+.B webdav:operation-timeout \fR(integer)
+Request/read timeout, from 1 to 300 seconds. Default: 30.
+.TP
+.B xfer:clobber \fR(boolean)
+Allow downloads to overwrite local files and uploads or renames to replace
+remote files. Default: false. Recursive downloads have their own
+skip/resume behavior; see
+.BR mirror .
+.SH CONFIGURATION
+At daemon startup, xfer reads
+.I xfer.conf
+from its application configuration directory, then reads the file named by
+.B XFER_CONFIG
+if set. Later values override earlier values. Missing optional files are
+ignored. Configuration lines have the form
+.IR "name: value" ;
+blank lines and lines whose first non-space character is # are ignored.
+Values are literal text, not shell-quoted command arguments.
+.PP
+.nf
+.RS
+# xfer.conf
+ui:auto-pager: true
+ui:ls-default-options: -lhF
+s3:region: us-east-1
+sftp:max-requests: 64
+ssl:skip-validation: false
+.RE
+.fi
+.PP
+On the first attachment to a daemon, the client also reads
+.I ~/.xferrc
+and executes its commands in order, one command per line. Blank lines and
+comment lines are ignored. This file uses command syntax, not the
+configuration-file setting syntax. It is not rerun on later attachments.
+For example:
+.PP
+.nf
+.RS
+# ~/.xferrc
+set ui:prompt 'xfer$location> '
+lcd ~/Downloads
+.RE
+.fi
+.SH BOOKMARKS
+Bookmarks are TOML tables in the file selected by
+.BR bookmarks:file .
+Each table name is an alias accepted by
+.BR open .
+The
+.B url
+field is required;
+.B type
+may be
+.BR s3 ,
+.BR sftp ,
+.BR smb ,
+or
+.BR webdav .
+When omitted, the type is inferred from the URL and S3-specific fields.
+Unknown fields are rejected.
+.PP
+.nf
+.RS
+[archive]
+type = 's3'
+url = 's3://example-archive'
+region = 'us-east-1'
+
+[minio]
+type = 's3'
+url = 'https://minio.example.net'
+bucket = 'backups'
+accessKey = 'replace-me'
+secretKey = 'replace-me'
+api = 's3v4'
+
+[home]
+url = 'sftp://alice@sftp.example.net/home/alice'
+
+[nas]
+url = 'smb://nas.example.net/Documents'
+user = 'alice'
+domain = 'WORKGROUP'
+password_interactive = true
+
+[web-files]
+url = 'https://dav.example.net/files/'
+user = 'alice'
+password_interactive = true
+.RE
+.fi
+.PP
+S3 fields are
+.BR bucket ,
+.BR region ,
+.BR accessKey ,
+.BR secretKey ,
+.BR sessionToken ,
+.BR api ,
+.BR override_host ,
+and
+.BR override_port .
+Access and secret keys must be supplied together. Without explicit
+credentials, the AWS credential chain is used.
+.PP
+SFTP, SMB, and WebDAV bookmarks may store a
+.B password
+or set
+.B password_interactive = true
+to request a password in the terminal. SMB and WebDAV also support
+.BR user ;
+SMB supports
+.BR domain .
+Explicit empty user fields select anonymous access. For SFTP, specify the
+username in the URL.
+.PP
+Protect files containing credentials, for example with mode 0600.
+Prefer interactive passwords to plaintext storage. Credential-bearing
+connection commands and password-setting commands are excluded from
+history, but shell escapes and other command text may still contain
+secrets: do not rely on history filtering as a general secret scrubber.
+.SH TERMINAL INTERFACE
+At the prompt, Tab completes commands, bookmarks, settings, and applicable
+local or remote paths. Up and Down navigate command history. Ctrl-A and
+Ctrl-E move to the beginning and end of the line. Ctrl-L redraws the screen.
+Ctrl-C clears the current input; Ctrl-D on an empty line detaches.
+.PP
+Ctrl-S opens the context-sensitive file selector. Use arrows or j/k to
+move, Page Up/Down or Ctrl-B/Ctrl-F to scroll, Home/End for boundaries,
+Space to mark entries where multiple selection is available, and Enter
+to accept. Slash starts filtering. Escape or Ctrl-C cancels.
+.PP
+In the built-in pager, use arrows or j/k for lines, Space, Page Down, or
+Ctrl-F for the next page, Page Up or Ctrl-B for the previous page, and
+Home/End for the beginning/end. Press q or Escape to quit. The vertical
+bar key opens a private copy of the output in
+.BR VISUAL ,
+then
+.BR EDITOR ,
+or
+.BR vi ;
+editing the copy does not change the pager's data.
+.SH ENVIRONMENT
+.TP
+.B XFER_CONFIG
+Additional settings file, read after the default xfer.conf at daemon startup.
+.TP
+.B XDG_CONFIG_HOME
+If absolute, places configuration in $XDG_CONFIG_HOME/xfer.
+.TP
+.B XDG_CACHE_HOME
+If absolute, places disposable data in $XDG_CACHE_HOME/xfer.
+.TP
+.B XDG_STATE_HOME
+If absolute, places persistent local state in $XDG_STATE_HOME/xfer.
+.TP
+.B XDG_RUNTIME_DIR
+If absolute, places daemon discovery files and sockets in
+$XDG_RUNTIME_DIR/xfer/instances. Otherwise the native runtime directory
+is used if available, falling back to the state directory's instances
+subdirectory. Empty or relative XDG overrides are ignored.
+.TP
+.B VISUAL, EDITOR
+Editor commands for bookmark editing and pager output copies.
+.TP
+.B AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, AWS_PROFILE
+Used by the standard AWS credential provider chain when bookmark
+credentials are not supplied.
+.TP
+.B SSH_AUTH_SOCK
+Used by OpenSSH for ssh-agent authentication.
+.SH FILES
+The following are Linux defaults. Absolute XDG overrides take precedence.
+On macOS, configuration and persistent state normally use
+.IR "~/Library/Application Support/xfer" ,
+and cache data uses
+.IR ~/Library/Caches/xfer .
+.TP
+.I ~/.config/xfer/xfer.conf
+Daemon settings.
+.TP
+.I ~/.config/xfer/bookmarks.toml
+Connection bookmarks; overridable with
+.BR bookmarks:file .
+.TP
+.I ~/.xferrc
+Commands run on the first attachment to a daemon.
+.TP
+.I ~/.local/state/xfer/history
+Persistent command history; overridable with
+.BR ui:history-file .
+.TP
+.I ~/.cache/xfer/jobs/
+Daemon job output spools.
+.TP
+.I $XDG_RUNTIME_DIR/xfer/instances/
+Private daemon sockets and discovery files when XDG_RUNTIME_DIR is set.
+.TP
+.I ~/.ssh/config, ~/.ssh/known_hosts
+OpenSSH client configuration and known host keys used by SFTP.
+.SH EXAMPLES
+Connect to a bookmark, download a file, and upload a local file:
+.PP
+.nf
+.RS
+$ xfer
+xfer> open home
+xfer[sftp:/home/alice/]> ls
+xfer[sftp:/home/alice/]> get report.pdf
+xfer[sftp:/home/alice/]> put local-notes.txt
+.RE
+.fi
+.PP
+Resume a download and recursively copy a directory:
+.PP
+.nf
+.RS
+lcd ~/Downloads
+get -c large-image.iso
+mirror -c photos
+.RE
+.fi
+.PP
+Upload a local directory, explicitly allowing replacement:
+.PP
+.nf
+.RS
+set xfer:clobber true
+mirror-upload documents
+set xfer:clobber false
+.RE
+.fi
+.PP
+After Ctrl-Z backgrounds a transfer, inspect it and detach:
+.PP
+.nf
+.RS
+jobs
+status 1
+detach
+.RE
+.fi
+.PP
+From another terminal, while the detached daemon still has running jobs:
+.PP
+.nf
+.RS
+$ xfer attach
+.RE
+.fi
+.SH LIMITATIONS
+S3 has no real directories. File moves use server-side copy followed by
+delete and can leave both objects after failure or cancellation. Objects
+up to 5 TiB are supported; uploads and copies larger than 5 GiB use
+multipart operations. Multipart copy also requires permission to read
+object tags and abort multipart uploads. Directory/prefix moves are not
+implemented.
+.PP
+Failed or cancelled multipart uploads and copies are aborted on a
+best-effort basis. Configure S3 lifecycle cleanup for incomplete multipart
+operations to avoid ongoing storage charges. If completion fails, check
+the destination before retrying because completion may have succeeded.
+Other backends may also leave partial files after failed uploads.
+.PP
+Disabling TLS validation or strict SSH host-key checking compromises peer
+authentication. Sending Basic credentials over HTTP exposes them in
+plaintext. Keep the secure defaults unless the risks are understood.
+.SH AUTHOR
+Grzegorz Antoniak <xfer@anadoxin.org>
+.SH WEBSITE
+.UR https://anadoxin.org/xfer
+.UE
+.SH SEE ALSO
+.BR lftp (1),
+.BR ssh (1),
+.BR ssh_config (5),
+.BR bash (1)

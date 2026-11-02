@@ -39,11 +39,16 @@ S3-compatible HTTP(S) bookmarks must specify `type = 's3'` (or a `bucket` or
 
 ## Getting started
 
-Build and run from a checkout:
+Build the release binary and manual (requires Cargo, groff, and gzip):
 
 ```sh
-cargo run
+make
+./target/release/xfer
 ```
+
+Use `make release` or `make man` to build only the binary or manual.
+The manual artifacts are `target/man/xfer.1.gz` and `target/man/xfer.txt`.
+For a development build, run `cargo run`.
 
 At the prompt, connect to a configured bookmark and work as you would in a
 remote shell:
@@ -57,6 +62,25 @@ xfer[sftp:/home/alice/]> put local-notes.txt
 
 Use `help` in the client for the command reference. `Ctrl-C` cancels a
 foreground job; `Ctrl-Z` backgrounds it, and `jobs` / `fg` manage jobs.
+
+## Manual
+
+The [xfer(1) manual page](docs/xfer.1) documents commands, settings, bookmarks,
+and session management. View it from a checkout with:
+
+```sh
+man -l docs/xfer.1
+# Or, after make man:
+man -l target/man/xfer.1.gz
+```
+
+On systems without `man -l`, use `man ./docs/xfer.1` instead.
+
+To install it for your user (on systems using `~/.local/share/man`):
+
+```sh
+install -Dm644 docs/xfer.1 ~/.local/share/man/man1/xfer.1
+```
 
 ## Configuration
 
