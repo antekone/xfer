@@ -39,7 +39,17 @@ S3-compatible HTTP(S) bookmarks must specify `type = 's3'` (or a `bucket` or
 
 ## Getting started
 
-Build the release binary and manual (requires Cargo, groff, and gzip):
+Install the binary directly from GitHub (requires Rust 1.94 or newer):
+
+```sh
+cargo install --git https://github.com/antekone/xfer.git --locked
+```
+
+This installs `xfer` to `~/.cargo/bin` by default; it does not install the manual.
+Prebuilt Linux and macOS archives, including the manual, and a PDF manual are
+also available from [GitHub Releases](https://github.com/antekone/xfer/releases).
+
+Alternatively, build the release binary and manual from a checkout (requires Cargo, groff, and gzip):
 
 ```sh
 make
@@ -212,6 +222,17 @@ plain text.
   `rm`.
 
 For implementation and IPC details, see [docs/ipc.md](docs/ipc.md).
+
+## Publishing a release
+
+Push a tag such as `v0.1.0` to trigger the release workflow. It builds Linux and
+macOS archives containing the binary and manual, then publishes them along
+with a PDF manual, SHA-256 checksums and automatically generated release notes:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
 
 ## License
 
