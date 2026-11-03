@@ -61,6 +61,7 @@ async fn main() -> Result<()> {
         cli::Invocation::Daemon => xfer::daemon::main().await,
         cli::Invocation::Attach(id) => attach(id.as_deref()),
         cli::Invocation::Script(path) => run_script(&path),
+        cli::Invocation::Inline(text) => run_inline_script(&text),
     }
 }
 
@@ -71,6 +72,52 @@ fn run_script(path: &std::path::Path) -> Result<()> {
     use anyhow::Context;
     let text =
         fs::read_to_string(path).with_context(|| format!("read script {}", path.display()))?;
+    let name = path.display().to_string();
+    let lines = text.lines().enumerate().map(|(i, l)| (i + 1, l.to_string()));
+    run_lines(lines, &name)
+}
+
+/// Execute `;`-separated commands given on the command line.
+fn run_inline_script(text: &str) -> Result<()> {
+    let commands = split_inline_script(text);
+    run_lines(
+        commands.into_iter().enumerate().map(|(i, c)| (i + 1, c)),
+        "-s",
+    )
+}
+
+/// Split on `;` outside single quotes, double quotes, and backslash escapes.
+fn split_inline_script(text: &str) -> Vec<String> {
+    let mut commands = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (None, ';') => commands.push(std::mem::take(&mut current)),
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                current.push(c);
+            }
+            (Some(q), _) if c == q => {
+                quote = None;
+                current.push(c);
+            }
+            (q, '\\') if q != Some('\'') => {
+                current.push(c);
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
+            _ => current.push(c),
+        }
+    }
+    commands.push(current);
+    commands
+}
+
+fn run_lines(lines: impl Iterator<Item = (usize, String)>, name: &str) -> Result<()> {
+    use anyhow::Context;
     let mut client = daemon_client::start()?;
     let cwd = std::env::current_dir()?;
     client.ok(Op::SetLocalCwd(pb::Path {
@@ -79,13 +126,11 @@ fn run_script(path: &std::path::Path) -> Result<()> {
             .context("local directory must be valid UTF-8")?
             .into(),
     }))?;
-    for (index, line) in text.lines().enumerate() {
+    for (index, line) in lines {
         if line.trim().is_empty() || line.trim_start().starts_with('#') {
             continue;
         }
-        if !script_command(&mut client, line)
-            .with_context(|| format!("{}:{}", path.display(), index + 1))?
-        {
+        if !script_command(&mut client, &line).with_context(|| format!("{name}:{index}"))? {
             break;
         }
     }
@@ -1621,6 +1666,14 @@ mod startup_tests {
             );
             assert!(!line.contains('\n'));
         }
+    }
+
+    #[test]
+    fn inline_script_splits_on_unquoted_semicolons() {
+        assert_eq!(
+            split_inline_script("open a; get 'x;y' \"p;q\"; lcd c\\;d"),
+            ["open a", " get 'x;y' \"p;q\"", " lcd c\\;d"]
+        );
     }
 
     #[test]

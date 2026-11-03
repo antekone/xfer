@@ -12,6 +12,10 @@ xfer \- interactive remote file transfer client
 .I file
 .br
 .B xfer
+.BR \-s " | " \-\-script
+.I commands
+.br
+.B xfer
 .BR \-h " | " \-\-help
 .br
 .B xfer
@@ -48,6 +52,10 @@ You do not need to start the daemon separately or attach manually.
 Detaching and reattaching are optional features for leaving jobs running
 and returning to them later.
 .SS Command scripts
+.BI "xfer -s " commands
+behaves like \fB\-f\fR but takes the script inline, with commands
+separated by semicolons (not inside quotes or after a backslash).
+.PP
 .BI "xfer -f " file
 starts a fresh daemon, runs commands from the named file, and exits.
 Each nonblank, non-comment line is one command, using the same quoting as

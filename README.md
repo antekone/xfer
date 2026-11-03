@@ -96,6 +96,9 @@ lcd ~/Downloads
 get report.pdf
 ```
 
+For a short inline script, use `xfer -s 'open archive; get report.pdf'`
+(or `--script`); commands are separated by `;` outside quotes.
+
 Commands run in order, waiting for each job. Script mode skips `~/.xferrc`,
 does not record history, and cannot prompt for passwords. A failed job stops
 the script with a nonzero exit status. Some commands report usage or setting

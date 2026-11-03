@@ -11,6 +11,9 @@ pub struct Cli {
     /// Execute commands from a file non-interactively, then exit
     #[arg(short = 'f', long = "file", value_name = "FILE")]
     file: Option<std::path::PathBuf>,
+    /// Execute an inline script (commands separated by ';') non-interactively, then exit
+    #[arg(short = 's', long = "script", value_name = "SCRIPT", conflicts_with = "file")]
+    script: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -38,12 +41,21 @@ pub enum Invocation {
     Attach(Option<String>),
     /// Start a fresh daemon and execute a command file.
     Script(std::path::PathBuf),
+    /// Start a fresh daemon and execute inline commands separated by `;`.
+    Inline(String),
 }
 
 /// Parse the process arguments, exiting with usage/help errors like other clap
 /// programs (stderr message plus status 2) before any daemon work starts.
 pub fn parse() -> Invocation {
-    let Cli { command, file } = Cli::parse();
+    let Cli {
+        command,
+        file,
+        script,
+    } = Cli::parse();
+    if let Some(script) = script {
+        return Invocation::Inline(script);
+    }
     if let Some(file) = file {
         return Invocation::Script(file);
     }
