@@ -293,20 +293,26 @@ to disable the corresponding option.
 .TP
 .B mirror \fR[\fB\-c\fR] [\fB\-\-\fR] \fIdirectory\fR...
 Recursively download named remote directories below the local working
-directory, preserving each directory's basename. Existing regular files
-are skipped by default, or overwritten when
+directory, preserving each directory's basename. A literal
+.B .
+downloads the contents of the current remote directory directly into the
+current local directory instead, including when the remote directory is root.
+Existing regular files are skipped by default, or overwritten when
 .B xfer:clobber
 is true.
 .B \-c
 resumes existing files. This is a recursive copy, not a synchronization
 engine: it does not delete extra destination files or compare timestamps
-like lftp's mirror command. Remote root, dot, and dot-dot are not accepted
+like lftp's mirror command. Explicit remote root and dot-dot are not accepted
 as root directory names.
 .TP
 .B mirror-upload \fR[\fB\-\-\fR] \fIdirectory\fR...
 Recursively upload local directories below the current remote directory,
-preserving their basenames. Replacement of existing remote files is
-controlled by
+preserving their basenames. A literal
+.B .
+uploads the contents of the current local directory directly into the
+current remote directory instead. Local files are not removed.
+Replacement of existing remote files is controlled by
 .BR xfer:clobber .
 This command has no resume option and does not delete extra remote files.
 .TP

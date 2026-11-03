@@ -74,6 +74,7 @@ struct Uploader<'a> {
     connection: &'a dyn Connection,
     remote_root: String,
     clobber: bool,
+    skip_root: bool,
     output: &'a mut OutputStore,
     progress: tokio::sync::watch::Sender<Progress>,
 }
@@ -101,6 +102,7 @@ impl WalkVisitor for Uploader<'_> {
     async fn visit(&mut self, event: WalkEvent, entry: &WalkEntry) -> Result<WalkControl> {
         let remote = remote_join(&self.remote_root, &entry.relative);
         match event {
+            WalkEvent::EnterDirectory if self.skip_root && entry.relative.is_empty() => {}
             WalkEvent::EnterDirectory => self.create(&remote).await?,
             WalkEvent::File => {
                 let local = Path::new(&entry.path);
@@ -141,6 +143,19 @@ impl WalkVisitor for Uploader<'_> {
     }
 }
 
+// A literal dot means the contents of the current directory, not its basename.
+fn upload_directory_name(input: &str, path: &Path) -> Result<Option<String>> {
+    if input == "." {
+        return Ok(None);
+    }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| NonRetryableError("mirror-upload requires a named directory".into()))?;
+    Ok(Some(name.to_owned()))
+}
+
 fn execute(context: &mut CommandContext<'_>, parser: &ParserContext<'_>) -> Result<CommandResult> {
     let directories = args(parser.words())?;
     let app = context.daemon()?;
@@ -163,23 +178,16 @@ fn execute(context: &mut CommandContext<'_>, parser: &ParserContext<'_>) -> Resu
                             path.display()
                         );
                     }
-                    let name = path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .filter(|name| !name.is_empty())
-                        .ok_or_else(|| {
-                            NonRetryableError("mirror-upload requires a named directory".into())
-                        })?
-                        .to_owned();
+                    let name = upload_directory_name(&input, &path)?;
                     Ok::<_, anyhow::Error>((path, name))
                 })
-                .collect::<Result<Vec<(PathBuf, String)>>>()?;
+                .collect::<Result<Vec<(PathBuf, Option<String>)>>>()?;
             let active = connection.lock().await;
             let active = active
                 .as_ref()
                 .ok_or_else(|| NonRetryableError("not connected; use connect first".into()))?;
             for (local, name) in local_roots {
-                let remote_root = active.resolve_directory(Some(&name))?;
+                let remote_root = active.resolve_directory(Some(name.as_deref().unwrap_or(".")))?;
                 let local = local.to_str().ok_or_else(|| {
                     NonRetryableError("non-UTF-8 local paths are not supported".into())
                 })?;
@@ -190,6 +198,7 @@ fn execute(context: &mut CommandContext<'_>, parser: &ParserContext<'_>) -> Resu
                         connection: active.as_ref(),
                         remote_root,
                         clobber,
+                        skip_root: name.is_none(),
                         output: &mut output,
                         progress: progress.clone(),
                     },
@@ -204,6 +213,86 @@ fn execute(context: &mut CommandContext<'_>, parser: &ParserContext<'_>) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn dot_uploads_contents_but_named_directories_keep_their_name() {
+        assert_eq!(
+            upload_directory_name(".", Path::new("/tmp/public/.")).unwrap(),
+            None
+        );
+        assert_eq!(
+            upload_directory_name("public", Path::new("/tmp/public")).unwrap(),
+            Some("public".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn dot_uploads_into_current_remote_directory_without_creating_it() {
+        use crate::{core::JobState, daemon::Daemon};
+        use std::sync::{Arc, Mutex};
+
+        struct RecordingConnection(Arc<Mutex<Vec<String>>>);
+        #[async_trait]
+        impl Connection for RecordingConnection {
+            fn protocol(&self) -> &'static str {
+                "test"
+            }
+            fn resolve_directory(&self, path: Option<&str>) -> Result<String> {
+                Ok(match path {
+                    Some(".") => "/current".into(),
+                    Some(name) => format!("/current/{name}"),
+                    None => "/initial".into(),
+                })
+            }
+            async fn create_directory(&self, path: &str, _: bool) -> Result<()> {
+                self.0.lock().unwrap().push(format!("mkdir {path}"));
+                Ok(())
+            }
+            async fn upload(&self, _: &Path, path: &str, _: bool) -> Result<()> {
+                self.0.lock().unwrap().push(format!("upload {path}"));
+                Ok(())
+            }
+        }
+
+        let local = tempfile::tempdir().unwrap();
+        fs::write(local.path().join("root.txt"), "root").unwrap();
+        fs::create_dir(local.path().join("nested")).unwrap();
+        fs::write(local.path().join("nested/file.txt"), "nested").unwrap();
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let mut app = Daemon::bootstrap().unwrap();
+        app.local_directory = local.path().to_owned();
+        *app.connection.lock().await = Some(Box::new(RecordingConnection(operations.clone())));
+        let reply = app.command("mirror-upload .");
+        let id = reply[0]
+            .strip_prefix("JOB ")
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while app.has_running_jobs() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            app.jobs.jobs[&id].state,
+            JobState::Completed,
+            "{:?}",
+            app.jobs.jobs[&id].output.read_all()
+        );
+        let mut actual = operations.lock().unwrap().clone();
+        actual.sort();
+        assert_eq!(
+            actual,
+            [
+                "mkdir /current/nested",
+                "upload /current/nested/file.txt",
+                "upload /current/root.txt"
+            ]
+        );
+        assert!(local.path().join("root.txt").exists());
+    }
+
     #[test]
     fn aliases_and_completion_accept_multiple_directories() {
         assert_eq!(MirrorUpload.names(), ["mirror-upload", "mirror-up"]);

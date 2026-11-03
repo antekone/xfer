@@ -72,6 +72,10 @@ xfer[sftp:/home/alice/]> put local-notes.txt
 
 Use `help` in the client for the command reference. `Ctrl-C` cancels a
 foreground job; `Ctrl-Z` backgrounds it, and `jobs` / `fg` manage jobs.
+Use `mirror .` to copy the current remote directory's contents into the current
+local directory, or `mirror-upload .` to copy in the other direction. Named
+directories are copied under their basenames. Neither command removes source
+files or extra destination files.
 
 `debug` shows the daemon's log level and private log file path. Use `debug 0`
 (the default) for errors and warnings, `debug 1` for debug events, or `debug 2`

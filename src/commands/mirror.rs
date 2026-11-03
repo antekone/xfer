@@ -164,7 +164,11 @@ fn execute(context: &mut CommandContext<'_>, parser: &ParserContext<'_>) -> Resu
             for input in &args.directories {
                 let remote = active.resolve_directory(Some(input))?;
                 let mut planner = Planner {
-                    local_root: local_directory.join(root_name(&remote)?),
+                    local_root: if input == "." {
+                        local_directory.clone()
+                    } else {
+                        local_directory.join(root_name(&remote)?)
+                    },
                     plan: Plan::default(),
                 };
                 walker::walk(&RemoteSource(active.as_ref()), &remote, &mut planner).await?;
@@ -224,6 +228,105 @@ fn execute(context: &mut CommandContext<'_>, parser: &ParserContext<'_>) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn dot_downloads_current_remote_contents_into_current_local_directory() {
+        use crate::{
+            backend::Connection,
+            core::JobState,
+            daemon::Daemon,
+            listing::{Content, DirectoryInfo, FileInfo, ListingSink},
+            transfer::{DownloadSink, RemoteFile},
+        };
+        use std::time::Duration;
+
+        struct TestConnection;
+        #[async_trait]
+        impl Connection for TestConnection {
+            fn protocol(&self) -> &'static str {
+                "test"
+            }
+            fn resolve_directory(&self, path: Option<&str>) -> Result<String> {
+                Ok(match path {
+                    Some(".") => "/current".into(),
+                    Some(name) => format!("/current/{name}"),
+                    None => "/initial".into(),
+                })
+            }
+            async fn list(&self, path: &str, sink: &mut dyn ListingSink) -> Result<u64> {
+                let path = path.trim_end_matches('/');
+                if path == "/current" {
+                    sink.emit(Content::Directory(DirectoryInfo {
+                        name: "nested".into(),
+                        modified: None,
+                        size: None,
+                        unix: None,
+                    }))?;
+                    sink.emit(Content::File(FileInfo {
+                        name: "root.txt".into(),
+                        modified: None,
+                        size: Some(4),
+                        unix: None,
+                    }))?;
+                } else if path == "/current/nested" {
+                    sink.emit(Content::File(FileInfo {
+                        name: "file.txt".into(),
+                        modified: None,
+                        size: Some(4),
+                        unix: None,
+                    }))?;
+                } else {
+                    bail!("unexpected path: {path}");
+                }
+                Ok(0)
+            }
+            async fn stat_file(&self, _: &str) -> Result<RemoteFile> {
+                Ok(RemoteFile {
+                    size: 4,
+                    revision: None,
+                })
+            }
+            async fn download(
+                &self,
+                _: &str,
+                _: u64,
+                _: &RemoteFile,
+                sink: &mut dyn DownloadSink,
+            ) -> Result<()> {
+                sink.write(b"data")
+            }
+        }
+
+        let local = tempfile::tempdir().unwrap();
+        let mut app = Daemon::bootstrap().unwrap();
+        app.local_directory = local.path().to_owned();
+        *app.connection.lock().await = Some(Box::new(TestConnection));
+        let reply = app.command("mirror .");
+        let id = reply[0]
+            .strip_prefix("JOB ")
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while app.has_running_jobs() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            app.jobs.jobs[&id].state,
+            JobState::Completed,
+            "{:?}",
+            app.jobs.jobs[&id].output.read_all()
+        );
+        assert_eq!(fs::read(local.path().join("root.txt")).unwrap(), b"data");
+        assert_eq!(
+            fs::read(local.path().join("nested/file.txt")).unwrap(),
+            b"data"
+        );
+        assert!(!local.path().join("current").exists());
+    }
+
     #[test]
     fn arguments_and_completion_support_multiple_directories() {
         let parsed = Args::parse(["-c", "one", "--", "-two"]).unwrap();
