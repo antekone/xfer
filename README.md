@@ -1,5 +1,7 @@
 # xfer
 
+[Homepage](https://anadoxin.org/xfer)
+
 `xfer` is an interactive, terminal-based remote file-transfer client written in
 Rust. It keeps a persistent connection in a small per-session daemon while the
 terminal client provides an lftp-style command prompt, remote navigation,
