@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 //! Backend-independent listing records and text rendering.
 //!
 //! Backends emit records incrementally, keeping large/paginated listings bounded.

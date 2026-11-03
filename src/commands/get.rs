@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 //! Download to the daemon local directory (-c resumes).
 use super::{Command, CommandContext, CommandResult, Completion, Handler, ParserContext};
 use crate::{

@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 //! Server-side multipart copy. Source is retained unless the caller verifies it.
 use super::{
     operation_error,

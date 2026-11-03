@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 mod cli;
 mod daemon_client;
 mod file_selector;

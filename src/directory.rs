@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 //! Private disk-backed directory snapshots: constant-memory collection, indexed
 //! random-access pages, and automatic cleanup on cancellation/close/acknowledge.
 use crate::{

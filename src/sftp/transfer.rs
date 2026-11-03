@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 //! Bounded, offset-based SFTP pipelines. Clone a remote handle (not a session)
 //! per chunk, keep requests concurrent, and deliver downloads in file order.
 use super::{local_error, operation, permanent, unchanged, Client, DiscardSession};

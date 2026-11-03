@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 pub use paths::{cache_dir, config_dir, home_dir, runtime_dir, state_dir};
 
 pub mod paths;

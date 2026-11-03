@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 //! Bounded-record-memory external merge sort. Small listings stay in memory;
 //! larger ones use private temporary runs, removed on success/error/cancellation.
 use super::{attributes, LsArgs};

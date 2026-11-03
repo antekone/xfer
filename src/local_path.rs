@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 //! Local path resolution and filesystem-only directory/file completion.
 use crate::cache::PathCompletion;
 use anyhow::{bail, Result};

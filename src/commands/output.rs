@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 //! Human-readable spool inspection retained for embedded/console callers.
 //! Socket IPC uses typed output-read/acknowledgement messages, not these lines.
 use super::{small, CommandContext, CommandResult, ParserContext, SmallCommand};

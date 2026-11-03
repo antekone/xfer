@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 //! Command interface and the single registry used by daemon/client dispatch,
 //! help, aliases and completion. Small handlers live here; larger ones in submodules.
 use crate::{

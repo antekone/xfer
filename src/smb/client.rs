@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 //! Keep the library's authenticated client (including DFS), but use its public
 //! connection/tree APIs for a real NTLM anonymous session. smb2 0.31's normal
 //! authenticator computes an NTLMv2 response even for an empty user/password;

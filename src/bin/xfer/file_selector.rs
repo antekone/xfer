@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 //! Modal, non-recursive filename selection. Directory data stays in the daemon's
 //! private indexed snapshot; only a visible page and bounded selections live here.
 use super::Connection;

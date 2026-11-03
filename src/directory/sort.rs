@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 //! Bounded-memory external merge sort for paged directory snapshots. Runs live
 //! inside the result's private directory, so cancellation removes partial work.
 use super::Snapshot;

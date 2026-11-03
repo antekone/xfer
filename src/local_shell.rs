@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 //! Client-side Bash escapes with live terminal I/O, never daemon jobs.
 use anyhow::{Context, Result};
 use std::os::unix::process::CommandExt;

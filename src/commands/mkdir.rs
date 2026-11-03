@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 //! Create remote directories without changing the connection's working directory.
 use super::{Command, CommandContext, CommandResult, Completion, Handler, ParserContext};
 use crate::{core::Progress, error::NonRetryableError, transfer::backoff};

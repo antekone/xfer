@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 //! Exact-path deletion; never replay ambiguous mutations.
 use super::{Command, CommandContext, CommandResult, Completion, Handler, ParserContext};
 use crate::{backend::validate_file_path, core::Progress, error::NonRetryableError};

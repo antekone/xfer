@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 //! Bookmarks are read-only to xfer; the user's editor owns formatting/comments.
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;

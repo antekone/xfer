@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 //! Per-user application paths with native Linux, macOS and Windows defaults.
 //!
 //! Explicit absolute XDG overrides are accepted on every platform (also useful

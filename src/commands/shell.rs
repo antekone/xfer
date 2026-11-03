@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 //! Local Bash escapes. Bash receives untouched source and owns the terminal.
 use super::{Command, CommandContext, CommandResult, ExecutionSite, Handler, ParserContext};
 use anyhow::{bail, Result};

@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 //! Async HTTP/WebDAV transport. Listings are namespace-aware streaming XML;
 //! file bodies are bounded streams, never whole-file allocations.
 use crate::{

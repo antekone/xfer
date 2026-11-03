@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 //! S3 has no native rename: conditional copy, verify, then conditional delete.
 use super::{operation_error, S3Connection};
 use crate::{backend::validate_rename_paths, error::NonRetryableError};

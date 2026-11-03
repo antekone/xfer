@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 //! Errors that cannot be fixed by replaying a network operation.
 #[derive(Debug)]
 pub struct NonRetryableError(pub String);

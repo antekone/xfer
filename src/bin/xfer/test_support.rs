@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 //! Shared framed-RPC fixture for binary unit tests only.
 use super::Connection;
 use std::{os::unix::net::UnixStream, time::Duration};

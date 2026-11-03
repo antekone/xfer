@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 //! Show daemon, connection, configuration or job details.
 use super::{Command, CommandContext, CommandResult, Handler, ParserContext};
 use crate::{

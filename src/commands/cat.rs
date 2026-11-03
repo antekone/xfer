@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 //! Read remote files into private raw job output; the client prints exact bytes
 //! without a pager, headings, UTF-8 conversion, or a success footer.
 use super::{Command, CommandContext, CommandResult, Completion, Handler, ParserContext};

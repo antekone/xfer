@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 //! Terminal line input: UTF-8-safe editing and viewport rendering, prompt
 //! reading, completion, history, typeahead and password input. Command dispatch
 //! and job coordination stay in the attached client, not this module.

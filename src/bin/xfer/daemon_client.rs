@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 //! Startup channel for the exact daemon spawned by this client. Discovery is
 //! deliberately not involved: it is only for attaching to existing instances.
 use super::{Connection, Instance};

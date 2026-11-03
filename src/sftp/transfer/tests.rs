@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 //! An in-process SFTP v3 peer with independent delayed replies. Sleeping once
 //! per response in a serial proxy would hide pipelining, not model network RTT.
 use super::*;

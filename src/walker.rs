@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 //! Reusable depth-first directory traversal. Sources provide immediate children;
 //! async visitors receive pre/post directory events and file events. No mutations
 //! or retries are performed here: callers own those policies.

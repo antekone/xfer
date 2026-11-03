@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 //! Versioned, bounded Protobuf IPC shared by all frontends. The transport only
 //! needs Read + Write; the synchronous client serializes requests and validates
 //! IDs. No terminal rendering, Unix socket selection, or GUI dependencies here.

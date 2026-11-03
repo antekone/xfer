@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 //! Single-pass prompt expansion. Values are never interpreted as templates or shell code.
 use crate::daemon::SessionInfo;
 

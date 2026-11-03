@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 //! SFTP v3 over the installed OpenSSH client. No remote shell commands are used.
 use crate::{
     backend::{Backend, ConnectOptions, Connection},

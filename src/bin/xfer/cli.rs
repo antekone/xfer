@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 //! Command-line interface for the xfer binary.
 //!
 //! The askpass bridge is intentionally not part of this parser: SSH selects it

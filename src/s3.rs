@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 //! S3 backend, including AWS client configuration, routing, and diagnostics.
 mod mkdir;
 mod multipart_copy;

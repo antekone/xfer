@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 //! Private, short-lived SSH askpass bridge. Passwords never appear in argv/env.
 use crate::credentials::Password;
 use anyhow::{bail, Result};

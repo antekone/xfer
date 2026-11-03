@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 //! Change backend working directory (default: initial directory).
 use super::{Command, CommandContext, CommandResult, Completion, Handler, ParserContext};
 use crate::daemon::{Daemon, SessionInfo};

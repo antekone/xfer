@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 //! Stream S3 uploads from disk, using multipart uploads for large files.
 use super::{operation_error, S3Connection};
 use crate::{backend::validate_file_path, error::NonRetryableError};

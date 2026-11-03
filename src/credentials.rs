@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 //! In-memory connection secrets, retained for reconnects until the connection is
 //! dropped. Never put these in command text or job titles.
 use serde::{Deserialize, Deserializer, Serialize, Serializer};

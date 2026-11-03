@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 //! Directory creation for S3's virtual namespace, without creating buckets or
 //! replacing any existing object (including a nonempty trailing-slash object).
 use super::{operation_error, S3Connection};

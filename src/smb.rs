@@ -1,3 +1,10 @@
+/*
+ * Part of xfer.
+ * Copyright (C) Grzegorz Antoniak <xfer@anadoxin.org>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 //! Native async SMB2/3 through smb2. No mounts, shell commands, or blocking SMB
 //! worker threads. Failed/cancelled sessions are replaced lazily by outer retries.
 mod client;
