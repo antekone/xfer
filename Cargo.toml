@@ -42,7 +42,7 @@ tower-service = "0.3"
 unicode-width = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["std", "serde"] }
 libc = "0.2"
-openssh-sftp-client = "0.15.10"
+openssh-sftp-client = "0.15.11"
 smb2 = "0.31"
 futures-util = "0.3"
 percent-encoding = "2"
@@ -60,5 +60,3 @@ rcgen = "0.13"
 
 [patch.crates-io]
 openssh-sftp-client = { path = "lib/openssh-sftp-client" }
-openssh-sftp-protocol = { path = "lib/openssh-sftp-protocol" }
-openssh-sftp-protocol-error = { path = "lib/openssh-sftp-protocol/openssh-sftp-protocol-error" }

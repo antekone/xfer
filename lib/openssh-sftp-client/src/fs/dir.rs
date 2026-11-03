@@ -40,11 +40,14 @@ impl DirEntry {
         &mut self.0.filename
     }
 
-    /// Return the server-supplied v3 longname field.
-    ///
-    /// Its format and encoding are implementation-defined.
+    /// Return the server-provided longname bytes.
     pub fn longname(&self) -> &[u8] {
         &self.0.longname
+    }
+
+    /// Display the server-provided longname, replacing invalid UTF-8 lossily.
+    pub fn long_display(&self) -> impl std::fmt::Display + '_ {
+        String::from_utf8_lossy(self.longname())
     }
 
     /// Return metadata for the dir entry.
