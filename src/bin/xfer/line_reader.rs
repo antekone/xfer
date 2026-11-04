@@ -1151,6 +1151,34 @@ mod tests {
     }
 
     #[test]
+    fn mirror_completion_handles_first_and_subsequent_directories() {
+        for (verb, kind) in [
+            ("mirror", pb::CompletionKind::RemoteDirectory),
+            ("mirror-up", pb::CompletionKind::LocalDirectory),
+            ("mirror-upload", pb::CompletionKind::LocalDirectory),
+        ] {
+            for suffix in [" ", " pho", " 'first dir' pho", " -- -dir"] {
+                let input = format!("{verb}{suffix}");
+                assert_eq!(
+                    path_completion_context(&input).unwrap().2,
+                    kind,
+                    "{input}"
+                );
+            }
+            assert!(path_completion_context(&format!("{verb} -bad ")).is_none());
+            assert!(path_completion_context(&format!("{verb} -bad")).is_none());
+            let input = format!("{verb} 'first dir' pho");
+            let completed = complete_with_candidates(&input, &["photo album/"], false);
+            assert_eq!(
+                shlex::split(&completed).unwrap(),
+                vec![verb, "first dir", "photo album/"]
+            );
+        }
+        assert_eq!(path_completion_context("mirror -c ").unwrap().1, "");
+        assert_eq!(path_completion_context("mirror -c pho").unwrap().1, "pho");
+    }
+
+    #[test]
     fn rm_completion_preserves_multiple_quoted_paths_and_double_dash() {
         assert_eq!(
             path_completion_context("rm 'first file' pho").unwrap(),

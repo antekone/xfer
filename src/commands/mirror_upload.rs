@@ -45,7 +45,13 @@ impl Command for MirrorUpload {
         }
     }
     fn accepts_path_completion(&self, arguments: &[String], path: &str) -> bool {
-        args(arguments.iter().map(String::as_str)).is_ok()
+        args(
+            arguments
+                .iter()
+                .map(String::as_str)
+                .chain(["completion-placeholder"]),
+        )
+        .is_ok()
             && (!path.starts_with('-') || arguments.iter().any(|arg| arg == "--"))
     }
 }
