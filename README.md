@@ -234,7 +234,7 @@ For implementation and IPC details, see [docs/ipc.md](docs/ipc.md).
 
 ## Publishing a release
 
-Push a tag such as `v0.1.0` to trigger the release workflow. It runs the test
+Push a tag such as `v0.3.0` to trigger the release workflow. It runs the test
 suite on Linux and macOS before building archives containing the binary and
 manual. If the tests and builds pass, it publishes the archives along with a PDF
 manual, SHA-256 checksums and automatically generated release notes. Some
@@ -243,8 +243,8 @@ integration tests skip when their external test servers are unavailable.
 For example:
 
 ```sh
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.3.0
+git push origin v0.3.0
 ```
 
 ## License
