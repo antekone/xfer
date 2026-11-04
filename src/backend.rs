@@ -47,6 +47,16 @@ pub trait Connection: Send + Sync {
         ))
         .into())
     }
+    /// Upload with byte-level progress when supported by the transport.
+    async fn upload_with_progress(
+        &self,
+        local: &std::path::Path,
+        path: &str,
+        overwrite: bool,
+        _progress: crate::transfer::UploadProgress,
+    ) -> Result<()> {
+        self.upload(local, path, overwrite).await
+    }
     async fn download(
         &self,
         _path: &str,

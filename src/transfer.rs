@@ -28,6 +28,73 @@ pub struct RemoteFile {
     pub size: u64,
     pub revision: Option<String>,
 }
+/// Reports bytes consumed by an upload transport. Bytes may be buffered rather
+/// than committed remotely; callers must still wait for upload success.
+#[derive(Clone)]
+pub struct UploadProgress {
+    inner: std::sync::Arc<std::sync::Mutex<UploadProgressState>>,
+}
+struct UploadProgressState {
+    sender: watch::Sender<Progress>,
+    stats: TransferProgress,
+    started: std::time::Instant,
+}
+impl UploadProgress {
+    pub fn silent() -> Self {
+        let (sender, _) = watch::channel(Progress::Indeterminate {
+            message: String::new(),
+        });
+        Self::new(sender)
+    }
+    pub fn new(sender: watch::Sender<Progress>) -> Self {
+        Self {
+            inner: std::sync::Arc::new(std::sync::Mutex::new(UploadProgressState {
+                sender,
+                stats: TransferProgress {
+                    file: String::new(),
+                    file_index: 0,
+                    file_count: 0,
+                    done: 0,
+                    total: 0,
+                    transferred: 0,
+                    elapsed_ms: 0,
+                },
+                started: std::time::Instant::now(),
+            })),
+        }
+    }
+    pub fn begin(&self, file: String, index: usize, count: usize, done: u64, total: u64) {
+        let mut state = self.inner.lock().unwrap();
+        state.stats.file = file;
+        state.stats.file_index = index;
+        state.stats.file_count = count;
+        state.stats.done = done;
+        state.stats.total = total;
+        state.publish();
+    }
+    pub fn advance(&self, bytes: u64) {
+        let mut state = self.inner.lock().unwrap();
+        state.stats.done = state
+            .stats
+            .done
+            .saturating_add(bytes)
+            .min(state.stats.total);
+        state.stats.transferred = state.stats.transferred.saturating_add(bytes);
+        state.publish();
+    }
+    pub fn finish(&self, done: u64) {
+        let mut state = self.inner.lock().unwrap();
+        state.stats.done = done.min(state.stats.total);
+        state.publish();
+    }
+}
+impl UploadProgressState {
+    fn publish(&mut self) {
+        self.stats.elapsed_ms = self.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let _ = self.sender.send(Progress::Transfer(self.stats.clone()));
+    }
+}
+
 pub trait DownloadSink: Send {
     fn write(&mut self, bytes: &[u8]) -> Result<()>;
 }
@@ -429,6 +496,28 @@ pub fn safe_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upload_progress_resets_position_on_retry_but_counts_retransmitted_bytes() {
+        let (tx, rx) = watch::channel(Progress::Indeterminate {
+            message: String::new(),
+        });
+        let progress = UploadProgress::new(tx);
+        progress.begin("file".into(), 1, 2, 10, 30);
+        progress.advance(7);
+        progress.begin("file".into(), 1, 2, 10, 30);
+        progress.advance(20);
+        let Progress::Transfer(stats) = rx.borrow().clone() else {
+            panic!("missing progress")
+        };
+        assert_eq!((stats.done, stats.total, stats.transferred), (30, 30, 27));
+        progress.begin("next".into(), 2, 2, 30, 40);
+        progress.advance(100);
+        let Progress::Transfer(stats) = rx.borrow().clone() else {
+            panic!("missing progress")
+        };
+        assert_eq!((stats.done, stats.total, stats.transferred), (40, 40, 127));
+    }
 
     #[test]
     fn wildmat_supports_star_question_and_unicode() {

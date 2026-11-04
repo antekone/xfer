@@ -99,7 +99,22 @@ impl Connection for S3Connection {
         "s3"
     }
     async fn upload(&self, local: &std::path::Path, path: &str, overwrite: bool) -> Result<()> {
-        self.upload_object(local, path, overwrite).await
+        self.upload_object(
+            local,
+            path,
+            overwrite,
+            crate::transfer::UploadProgress::silent(),
+        )
+        .await
+    }
+    async fn upload_with_progress(
+        &self,
+        local: &std::path::Path,
+        path: &str,
+        overwrite: bool,
+        progress: crate::transfer::UploadProgress,
+    ) -> Result<()> {
+        self.upload_object(local, path, overwrite, progress).await
     }
     async fn stat_file(&self, path: &str) -> Result<crate::transfer::RemoteFile> {
         let location = self.location.resolve(path);

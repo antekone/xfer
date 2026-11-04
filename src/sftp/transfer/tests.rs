@@ -330,9 +330,19 @@ async fn uploads_pipeline_offset_writes_and_wait_for_out_of_order_acknowledgemen
         },
     )
     .await;
-    upload_on(peer.client(), &local, "/file", false, 8)
+    let (tx, rx) = tokio::sync::watch::channel(crate::core::Progress::Indeterminate {
+        message: String::new(),
+    });
+    let progress = crate::transfer::UploadProgress::new(tx);
+    progress.begin("input".into(), 1, 1, 0, data.len() as u64);
+    super::upload_on_progress(peer.client(), &local, "/file", false, 8, Some(progress))
         .await
         .unwrap();
+    let crate::core::Progress::Transfer(stats) = rx.borrow().clone() else {
+        panic!("missing transfer progress")
+    };
+    assert_eq!(stats.done, data.len() as u64);
+    assert_eq!(stats.transferred, data.len() as u64);
     assert_eq!(*peer.state.data.lock().unwrap(), data);
     assert!((2..=8).contains(&peer.state.peak.load(Ordering::Relaxed)));
     assert!(peer

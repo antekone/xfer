@@ -7,14 +7,26 @@
 
 //! Stream S3 uploads from disk, using multipart uploads for large files.
 use super::{operation_error, S3Connection};
-use crate::{backend::validate_file_path, error::NonRetryableError};
+use crate::{backend::validate_file_path, error::NonRetryableError, transfer::UploadProgress};
 use anyhow::Result;
 use aws_sdk_s3::primitives::{ByteStream, Length};
+use aws_smithy_types::body::SdkBody;
+use hyper::body::HttpBody;
 use std::{
     fs::OpenOptions,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::Path,
 };
+
+fn track_body(body: ByteStream, progress: UploadProgress) -> ByteStream {
+    body.map(move |body| {
+        let progress = progress.clone();
+        SdkBody::from_body_0_4(body.map_data(move |bytes| {
+            progress.advance(bytes.len() as u64);
+            bytes
+        }))
+    })
+}
 
 pub(super) const SINGLE_LIMIT: u64 = 5 * 1024 * 1024 * 1024;
 pub(super) const MAX_OBJECT_SIZE: u64 = 5 * 1024 * 1024 * 1024 * 1024;
@@ -65,6 +77,7 @@ impl S3Connection {
         local: &Path,
         path: &str,
         overwrite: bool,
+        progress: UploadProgress,
     ) -> Result<()> {
         validate_file_path(path).map_err(|_| {
             NonRetryableError(
@@ -103,7 +116,7 @@ impl S3Connection {
         if before.len() > SINGLE_LIMIT {
             let size = part_size(before.len());
             return self
-                .multipart_upload(bucket, key, file, before, overwrite, size)
+                .multipart_upload(bucket, key, file, before, overwrite, size, progress.clone())
                 .await;
         }
         let check = file.try_clone().map_err(|error| {
@@ -123,7 +136,7 @@ impl S3Connection {
             .bucket(bucket)
             .key(key)
             .content_length(before.len() as i64)
-            .body(body);
+            .body(track_body(body, progress));
         // An atomic conditional write, never a racy HEAD-then-PUT check.
         if !overwrite {
             request = request.if_none_match("*");
@@ -160,6 +173,7 @@ impl S3Connection {
         before: std::fs::Metadata,
         overwrite: bool,
         part_size: u64,
+        progress: UploadProgress,
     ) -> Result<()> {
         use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
         let created = self
@@ -207,7 +221,7 @@ impl S3Connection {
                 .upload_id(&id)
                 .part_number(number)
                 .content_length(length as i64)
-                .body(body)
+                .body(track_body(body, progress.clone()))
                 .customize()
                 .config_override(aws_sdk_s3::config::Builder::new().timeout_config(timeout))
                 .send()
@@ -347,6 +361,29 @@ mod tests {
             ),
             receive,
         )
+    }
+
+    #[tokio::test]
+    async fn s3_stream_reports_upload_bytes() {
+        let (connection, received) = endpoint(200).await;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let payload = vec![42u8; 512 * 1024];
+        file.write_all(&payload).unwrap();
+        let (tx, rx) = tokio::sync::watch::channel(crate::core::Progress::Indeterminate {
+            message: String::new(),
+        });
+        let progress = UploadProgress::new(tx);
+        progress.begin("file".into(), 1, 1, 0, payload.len() as u64);
+        connection
+            .upload_with_progress(file.path(), "file", false, progress)
+            .await
+            .unwrap();
+        let crate::core::Progress::Transfer(stats) = rx.borrow().clone() else {
+            panic!("missing transfer progress")
+        };
+        assert_eq!(stats.done, payload.len() as u64);
+        assert_eq!(stats.transferred, payload.len() as u64);
+        received.await.unwrap();
     }
 
     #[tokio::test]
@@ -532,7 +569,15 @@ mod tests {
             file.write_all(b"abcdefgh").unwrap();
             let before = file.metadata().unwrap();
             connection
-                .multipart_upload("example", "big file", file, before, overwrite, 5)
+                .multipart_upload(
+                    "example",
+                    "big file",
+                    file,
+                    before,
+                    overwrite,
+                    5,
+                    UploadProgress::silent(),
+                )
                 .await
                 .unwrap();
             let requests = requests.await.unwrap();
@@ -571,7 +616,15 @@ mod tests {
             file.write_all(b"data").unwrap();
             let before = file.metadata().unwrap();
             let error = connection
-                .multipart_upload("example", "key", file, before, false, 5)
+                .multipart_upload(
+                    "example",
+                    "key",
+                    file,
+                    before,
+                    false,
+                    5,
+                    UploadProgress::silent(),
+                )
                 .await
                 .unwrap_err();
             assert!(error.is::<NonRetryableError>());
@@ -650,7 +703,15 @@ mod tests {
         let before = file.metadata().unwrap();
         let task = tokio::spawn(async move {
             connection
-                .multipart_upload("example", "key", file, before, false, 5)
+                .multipart_upload(
+                    "example",
+                    "key",
+                    file,
+                    before,
+                    false,
+                    5,
+                    UploadProgress::silent(),
+                )
                 .await
         });
         tokio::time::timeout(std::time::Duration::from_secs(5), part_rx)

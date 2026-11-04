@@ -711,10 +711,19 @@ async fn uploads_are_exclusive_unless_clobber_and_mkdir_checks_existing_types() 
     let connection = server.connect().await;
     let local = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(local.path(), b"upload \x00\xff content").unwrap();
+    let (tx, rx) = tokio::sync::watch::channel(xfer::core::Progress::Indeterminate {
+        message: String::new(),
+    });
+    let progress = xfer::transfer::UploadProgress::new(tx);
+    progress.begin("new.bin".into(), 1, 1, 0, 17);
     connection
-        .upload(local.path(), "new.bin", false)
+        .upload_with_progress(local.path(), "new.bin", false, progress)
         .await
         .unwrap();
+    let xfer::core::Progress::Transfer(stats) = rx.borrow().clone() else {
+        panic!("missing upload progress")
+    };
+    assert_eq!((stats.done, stats.transferred), (17, 17));
     assert!(connection
         .upload(local.path(), "new.bin", false)
         .await

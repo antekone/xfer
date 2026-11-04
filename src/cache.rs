@@ -284,6 +284,21 @@ impl Connection for CachedConnection {
         self.cache.lock().unwrap().clear();
         result
     }
+    async fn upload_with_progress(
+        &self,
+        local: &std::path::Path,
+        path: &str,
+        overwrite: bool,
+        progress: crate::transfer::UploadProgress,
+    ) -> Result<()> {
+        self.cache.lock().unwrap().clear();
+        let result = self
+            .inner
+            .upload_with_progress(local, path, overwrite, progress)
+            .await;
+        self.cache.lock().unwrap().clear();
+        result
+    }
     async fn download(
         &self,
         path: &str,

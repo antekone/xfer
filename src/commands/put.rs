@@ -9,7 +9,7 @@
 use super::{Command, CommandContext, CommandResult, Completion, Handler, ParserContext};
 use crate::{
     error::NonRetryableError,
-    transfer::{backoff, has_wildmat, safe_name, wildmat, TransferProgress},
+    transfer::{backoff, has_wildmat, safe_name, wildmat, UploadProgress},
 };
 use anyhow::{bail, Result};
 use std::{
@@ -150,7 +150,11 @@ fn execute(context: &mut CommandContext<'_>, parser: &ParserContext<'_>) -> Resu
             let active = active
                 .as_ref()
                 .ok_or_else(|| NonRetryableError("not connected; use connect first".into()))?;
-            let total = plans.iter().map(|p| p.size).sum();
+            let total = plans
+                .iter()
+                .try_fold(0u64, |sum, p| sum.checked_add(p.size))
+                .ok_or_else(|| NonRetryableError("upload size overflow".into()))?;
+            let reporter = UploadProgress::new(progress.clone());
             let started = std::time::Instant::now();
             let count = plans.len();
             let mut done = 0;
@@ -159,16 +163,11 @@ fn execute(context: &mut CommandContext<'_>, parser: &ParserContext<'_>) -> Resu
                 let mut delay = Duration::from_secs(3);
                 let mut attempt = 1;
                 loop {
-                    let _ = progress.send(crate::core::Progress::Transfer(TransferProgress {
-                        file: plan.remote_name.clone(),
-                        file_index: index + 1,
-                        file_count: count,
-                        done,
-                        total,
-                        transferred: done,
-                        elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
-                    }));
-                    match active.upload(&plan.local, &remote, clobber).await {
+                    reporter.begin(plan.remote_name.clone(), index + 1, count, done, total);
+                    match active
+                        .upload_with_progress(&plan.local, &remote, clobber, reporter.clone())
+                        .await
+                    {
                         Ok(()) => break,
                         Err(error) => {
                             backoff(
@@ -185,6 +184,7 @@ fn execute(context: &mut CommandContext<'_>, parser: &ParserContext<'_>) -> Resu
                     }
                 }
                 done += plan.size;
+                reporter.finish(done);
                 output.write_line(&format!(
                     "uploaded {} ({} bytes)",
                     safe_name(&plan.remote_name),
@@ -203,6 +203,92 @@ fn execute(context: &mut CommandContext<'_>, parser: &ParserContext<'_>) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn upload_commands_report_live_progress_through_connection_cache() {
+        use crate::{
+            backend::Connection,
+            cache::{CacheOptions, CachedConnection},
+            core::Progress,
+            daemon::Daemon,
+        };
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+
+        struct SlowUpload {
+            started: Arc<Semaphore>,
+            resume: Arc<Semaphore>,
+        }
+        #[async_trait::async_trait]
+        impl Connection for SlowUpload {
+            fn protocol(&self) -> &'static str {
+                "test"
+            }
+            fn resolve_directory(&self, path: Option<&str>) -> Result<String> {
+                Ok(format!("/{}", path.unwrap_or("").trim_matches('/')))
+            }
+            async fn create_directory(&self, _: &str, _: bool) -> Result<()> {
+                Ok(())
+            }
+            async fn upload_with_progress(
+                &self,
+                _: &Path,
+                _: &str,
+                _: bool,
+                progress: UploadProgress,
+            ) -> Result<()> {
+                progress.advance(4);
+                self.started.add_permits(1);
+                self.resume.acquire().await.unwrap().forget();
+                progress.advance(6);
+                Ok(())
+            }
+        }
+        for command in ["put file", "mirror-up tree"] {
+            let root = tempfile::tempdir().unwrap();
+            fs::write(root.path().join("file"), b"0123456789").unwrap();
+            fs::create_dir(root.path().join("tree")).unwrap();
+            fs::write(root.path().join("tree/file"), b"0123456789").unwrap();
+            let started = Arc::new(Semaphore::new(0));
+            let resume = Arc::new(Semaphore::new(0));
+            let connection = SlowUpload {
+                started: started.clone(),
+                resume: resume.clone(),
+            };
+            let mut app = Daemon::bootstrap().unwrap();
+            app.local_directory = root.path().to_owned();
+            *app.connection.lock().await = Some(Box::new(CachedConnection::new(
+                Box::new(connection),
+                CacheOptions {
+                    ttl: Duration::from_secs(30),
+                    max_bytes: 4096,
+                },
+            )));
+            let id: u64 = app.command(command)[0]
+                .strip_prefix("JOB ")
+                .unwrap()
+                .parse()
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), started.acquire())
+                .await
+                .unwrap()
+                .unwrap()
+                .forget();
+            let Progress::Transfer(stats) = app.jobs.jobs[&id].progress.borrow().clone() else {
+                panic!("missing progress for {command}")
+            };
+            assert_eq!((stats.done, stats.total, stats.transferred), (4, 10, 4));
+            resume.add_permits(1);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while app.has_running_jobs() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(app.jobs.jobs[&id].state, crate::core::JobState::Completed);
+        }
+    }
 
     #[test]
     fn arguments_support_end_of_options() {

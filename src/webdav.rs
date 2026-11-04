@@ -1067,6 +1067,21 @@ impl Connection for WebdavConnection {
         }
     }
     async fn upload(&self, local: &Path, path: &str, overwrite: bool) -> Result<()> {
+        self.upload_with_progress(
+            local,
+            path,
+            overwrite,
+            crate::transfer::UploadProgress::silent(),
+        )
+        .await
+    }
+    async fn upload_with_progress(
+        &self,
+        local: &Path,
+        path: &str,
+        overwrite: bool,
+        progress: crate::transfer::UploadProgress,
+    ) -> Result<()> {
         let location = self.cwd.resolve(path)?;
         if location.0.is_empty() || directory_input(path) {
             return Err(permanent("put expects a WebDAV filename"));
@@ -1088,8 +1103,8 @@ impl Connection for WebdavConnection {
         let sent = Arc::new(AtomicU64::new(0));
         let counter = sent.clone();
         let stream = futures_util::stream::try_unfold(
-            (file, before.len(), counter),
-            |(mut file, remaining, sent)| async move {
+            (file, before.len(), counter, progress),
+            |(mut file, remaining, sent, progress)| async move {
                 if remaining == 0 {
                     return Ok::<_, io::Error>(None);
                 }
@@ -1104,9 +1119,10 @@ impl Connection for WebdavConnection {
                 }
                 data.truncate(count);
                 sent.fetch_add(count as u64, Ordering::Relaxed);
+                progress.advance(count as u64);
                 Ok(Some((
                     Bytes::from(data),
-                    (file, remaining - count as u64, sent),
+                    (file, remaining - count as u64, sent, progress),
                 )))
             },
         );

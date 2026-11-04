@@ -117,12 +117,24 @@ fn same_local_file(before: &Metadata, after: &Metadata) -> bool {
         && before.ctime_nsec() == after.ctime_nsec()
 }
 
+#[cfg(test)]
 pub(super) async fn upload_on(
     sftp: &Client,
     local: &Path,
     remote: &str,
     overwrite: bool,
     window: usize,
+) -> Result<()> {
+    upload_on_progress(sftp, local, remote, overwrite, window, None).await
+}
+
+pub(super) async fn upload_on_progress(
+    sftp: &Client,
+    local: &Path,
+    remote: &str,
+    overwrite: bool,
+    window: usize,
+    progress: Option<crate::transfer::UploadProgress>,
 ) -> Result<()> {
     // Avoid opening a substituted symlink/FIFO between put's preflight and the
     // upload. Keep one descriptor and freeze its size for the entire attempt.
@@ -149,6 +161,7 @@ pub(super) async fn upload_on(
     let result: Result<()> = async {
         let mut writes = FuturesOrdered::new();
         let mut next = 0u64;
+        let mut acknowledged = 0u64;
         while next < before.len() || !writes.is_empty() {
             while next < before.len() && writes.len() < window {
                 let length = (before.len() - next).min(chunk as u64) as usize;
@@ -167,6 +180,11 @@ pub(super) async fn upload_on(
                 tokio::task::yield_now().await;
             }
             writes.next().await.expect("SFTP writes queued")?;
+            let length = (before.len() - acknowledged).min(chunk as u64);
+            acknowledged += length;
+            if let Some(progress) = &progress {
+                progress.advance(length);
+            }
             tokio::task::yield_now().await;
         }
         let after = input

@@ -34,7 +34,7 @@ use tokio::{
 };
 
 mod transfer;
-use transfer::{download_on, upload_on};
+use transfer::{download_on, upload_on_progress};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct Sftp;
@@ -899,14 +899,31 @@ impl Connection for SftpConnection {
     }
 
     async fn upload(&self, local: &Path, path: &str, overwrite: bool) -> Result<()> {
+        self.upload_with_progress(
+            local,
+            path,
+            overwrite,
+            crate::transfer::UploadProgress::silent(),
+        )
+        .await
+    }
+
+    async fn upload_with_progress(
+        &self,
+        local: &Path,
+        path: &str,
+        overwrite: bool,
+        progress: crate::transfer::UploadProgress,
+    ) -> Result<()> {
         let path = self.resolve_listing_path(path)?;
         let lease = self.acquire().await?;
-        let result = upload_on(
+        let result = upload_on_progress(
             &lease.session.sftp,
             local,
             &path,
             overwrite,
             self.recipe.max_requests,
+            Some(progress),
         )
         .await;
         lease.finish(result)

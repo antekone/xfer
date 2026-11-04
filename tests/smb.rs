@@ -318,10 +318,19 @@ async fn smb_guest_navigation_listing_download_upload_and_mkdir() {
     assert!(server.path("share/photos/one/two/three").is_dir());
     let local = server.path("local upload");
     fs::write(&local, b"upload\0\xffbytes").unwrap();
+    let (tx, rx) = tokio::sync::watch::channel(xfer::core::Progress::Indeterminate {
+        message: String::new(),
+    });
+    let progress = xfer::transfer::UploadProgress::new(tx);
+    progress.begin("upload.txt".into(), 1, 1, 0, 13);
     connection
-        .upload(&local, "one/two/three/upload.txt", false)
+        .upload_with_progress(&local, "one/two/three/upload.txt", false, progress)
         .await
         .unwrap();
+    let xfer::core::Progress::Transfer(stats) = rx.borrow().clone() else {
+        panic!("missing upload progress")
+    };
+    assert_eq!((stats.done, stats.transferred), (13, 13));
     assert_eq!(
         fs::read(server.path("share/photos/one/two/three/upload.txt")).unwrap(),
         b"upload\0\xffbytes"

@@ -806,9 +806,24 @@ impl Connection for SmbConnection {
         lease.finish(result)
     }
     async fn upload(&self, local: &Path, path: &str, overwrite: bool) -> Result<()> {
+        self.upload_with_progress(
+            local,
+            path,
+            overwrite,
+            crate::transfer::UploadProgress::silent(),
+        )
+        .await
+    }
+    async fn upload_with_progress(
+        &self,
+        local: &Path,
+        path: &str,
+        overwrite: bool,
+        progress: crate::transfer::UploadProgress,
+    ) -> Result<()> {
         let target = self.cwd.resolve(path)?;
         let mut lease = self.acquire().await?;
-        let result = upload_on(lease.get(), local, &target, overwrite).await;
+        let result = upload_on(lease.get(), local, &target, overwrite, progress).await;
         lease.finish(result)
     }
     async fn create_directory(&self, path: &str, parents: bool) -> Result<()> {
@@ -966,6 +981,7 @@ async fn upload_on(
     local: &Path,
     target: &Location,
     overwrite: bool,
+    progress: crate::transfer::UploadProgress,
 ) -> Result<()> {
     let local_error = |error| permanent(format!("local file {local:?}: {error}"));
     let mut file = File::open(local).map_err(local_error)?;
@@ -1000,6 +1016,7 @@ async fn upload_on(
                 break;
             }
             call(timeout, writer.write_chunk(&buffer[..length])).await?;
+            progress.advance(length as u64);
         }
         Ok(())
     }

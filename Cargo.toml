@@ -19,6 +19,7 @@ tokio-util = "0.7"
 async-trait = "0.1"
 aws-config = "1"
 aws-sdk-s3 = "1"
+aws-smithy-types = { version = "1", features = ["http-body-0-4-x"] }
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 shlex = "2"

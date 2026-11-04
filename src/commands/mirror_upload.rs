@@ -11,7 +11,7 @@ use crate::{
     backend::Connection,
     core::{OutputStore, Progress},
     error::NonRetryableError,
-    transfer::{backoff, safe_name},
+    transfer::{backoff, safe_name, UploadProgress},
     walker::{self, LocalSource, WalkControl, WalkEntry, WalkEvent, WalkVisitor},
 };
 use anyhow::{bail, Result};
@@ -90,6 +90,7 @@ struct Uploader<'a> {
     skip_root: bool,
     output: &'a mut OutputStore,
     progress: tokio::sync::watch::Sender<Progress>,
+    reporter: UploadProgress,
 }
 impl Uploader<'_> {
     async fn create(&self, remote: &str) -> Result<()> {
@@ -131,10 +132,12 @@ impl WalkVisitor for Uploader<'_> {
                 let mut delay = Duration::from_secs(3);
                 let mut attempt = 1;
                 loop {
-                    let _ = self.progress.send(Progress::Indeterminate {
-                        message: format!("uploading {}", safe_name(&remote)),
-                    });
-                    match self.connection.upload(local, &remote, self.clobber).await {
+                    self.reporter.begin(remote.clone(), 1, 1, 0, metadata.len());
+                    match self
+                        .connection
+                        .upload_with_progress(local, &remote, self.clobber, self.reporter.clone())
+                        .await
+                    {
                         Ok(()) => break,
                         Err(error) => {
                             backoff(error, &safe_name(&remote), attempt, delay, &self.progress)
@@ -144,6 +147,7 @@ impl WalkVisitor for Uploader<'_> {
                         }
                     }
                 }
+                self.reporter.finish(metadata.len());
                 self.output.write_line(&format!(
                     "uploaded {} ({} bytes)",
                     safe_name(&remote),
@@ -199,6 +203,7 @@ fn execute(context: &mut CommandContext<'_>, parser: &ParserContext<'_>) -> Resu
             let active = active
                 .as_ref()
                 .ok_or_else(|| NonRetryableError("not connected; use connect first".into()))?;
+            let reporter = UploadProgress::new(progress.clone());
             for (local, name) in local_roots {
                 let remote_root = active.resolve_directory(Some(name.as_deref().unwrap_or(".")))?;
                 let local = local.to_str().ok_or_else(|| {
@@ -214,6 +219,7 @@ fn execute(context: &mut CommandContext<'_>, parser: &ParserContext<'_>) -> Resu
                         skip_root: name.is_none(),
                         output: &mut output,
                         progress: progress.clone(),
+                        reporter: reporter.clone(),
                     },
                 )
                 .await?;
