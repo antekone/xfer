@@ -51,6 +51,7 @@ tempfile = "3.10"
 zeroize = "1"
 
 [build-dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 prost-build = "0.14"
 protox = "0.10"
 

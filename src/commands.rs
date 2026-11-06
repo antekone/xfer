@@ -13,6 +13,7 @@ use crate::{
 };
 use anyhow::{bail, Result};
 
+pub(crate) mod about;
 pub(crate) mod bookmark;
 pub(crate) mod cat;
 pub(crate) mod cd;
@@ -206,6 +207,7 @@ pub fn should_record_history(line: &str) -> bool {
 
 /// Adding a command requires a handler/Command implementation and ONE entry here.
 pub static COMMANDS: &[&dyn Command] = &[
+    &about::About,
     &HELP,
     &DEBUG,
     &connect::Connect,

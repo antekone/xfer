@@ -72,7 +72,9 @@ xfer[sftp:/home/alice/]> get report.pdf
 xfer[sftp:/home/alice/]> put local-notes.txt
 ```
 
-Use `help` in the client for the command reference. `Ctrl-C` cancels a
+Use `help` in the client for the command reference and `about` for version,
+license, and build information. The build date is in UTC and honors
+`SOURCE_DATE_EPOCH` for reproducible builds. `Ctrl-C` cancels a
 foreground job; `Ctrl-Z` backgrounds it, and `jobs` / `fg` manage jobs.
 Use `mirror .` to copy the current remote directory's contents into the current
 local directory, or `mirror-upload .` to copy in the other direction. Named
