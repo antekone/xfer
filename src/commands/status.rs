@@ -6,7 +6,7 @@
  */
 
 //! Show daemon, connection, configuration or job details.
-use super::{Command, CommandContext, CommandResult, Handler, ParserContext};
+use super::{Command, CommandContext, CommandResult, Completion, Handler, ParserContext};
 use crate::{
     core::{JobState, Progress},
     daemon::Daemon,
@@ -17,6 +17,9 @@ pub(super) struct Status;
 impl Command for Status {
     fn names(&self) -> &'static [&'static str] {
         &["status"]
+    }
+    fn completion(&self) -> Completion {
+        Completion::None
     }
     fn handler(&self) -> Handler {
         execute

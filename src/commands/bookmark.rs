@@ -6,7 +6,7 @@
  */
 
 //! List or edit toml bookmarks.
-use super::{Command, CommandContext, CommandResult, Handler, ParserContext};
+use super::{Command, CommandContext, CommandResult, Completion, Handler, ParserContext};
 use crate::daemon::Daemon;
 use anyhow::Result;
 
@@ -14,6 +14,9 @@ pub(super) struct Bookmark;
 impl Command for Bookmark {
     fn names(&self) -> &'static [&'static str] {
         &["bookmark"]
+    }
+    fn completion(&self) -> Completion {
+        Completion::None
     }
     fn handler(&self) -> Handler {
         execute

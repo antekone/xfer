@@ -6,13 +6,16 @@
  */
 
 //! Local Bash escapes. Bash receives untouched source and owns the terminal.
-use super::{Command, CommandContext, CommandResult, ExecutionSite, Handler, ParserContext};
+use super::{Command, CommandContext, CommandResult, Completion, ExecutionSite, Handler, ParserContext};
 use anyhow::{bail, Result};
 
 pub(super) struct Shell;
 impl Command for Shell {
     fn names(&self) -> &'static [&'static str] {
         &["!"]
+    }
+    fn completion(&self) -> Completion {
+        Completion::None
     }
     fn handler(&self) -> Handler {
         execute

@@ -171,9 +171,8 @@ pub trait Command: Sync {
     fn help(&self) -> Option<(&'static str, &'static str)> {
         None
     }
-    fn completion(&self) -> Completion {
-        Completion::None
-    }
+    /// Every command must explicitly select an argument completion strategy.
+    fn completion(&self) -> Completion;
     /// Whether completed arguments before the active path are valid. Commands
     /// with options can accept flag prefixes without treating them as paths.
     fn accepts_path_completion(&self, arguments: &[String], _path: &str) -> bool {
@@ -421,13 +420,14 @@ const fn small(
     names: &'static [&'static str],
     help: Option<(&'static str, &'static str)>,
     handler: Handler,
+    completion: Completion,
 ) -> SmallCommand {
     SmallCommand {
         names,
         help,
         handler,
         site: ExecutionSite::Daemon,
-        completion: Completion::None,
+        completion,
         history: true,
     }
 }
@@ -446,57 +446,63 @@ fn debug(context: &mut CommandContext<'_>, parser: &ParserContext<'_>) -> Result
     Ok(vec![format!("debug level: {}; log: {}", log.level(), log.path().display())].into())
 }
 
-static DEBUG: SmallCommand = small(&["debug"], Some(("debug [0|1|2]", "show or set daemon log level")), debug);
-static HELP: SmallCommand = SmallCommand {
-    completion: Completion::CommandNames,
-    ..small(&["help"], Some(("help", "show available commands")), help)
-};
+static DEBUG: SmallCommand = small(
+    &["debug"],
+    Some(("debug [0|1|2]", "show or set daemon log level")),
+    debug,
+    Completion::None,
+);
+static HELP: SmallCommand = small(
+    &["help"],
+    Some(("help", "show available commands")),
+    help,
+    Completion::CommandNames,
+);
 static DISCONNECT: SmallCommand = small(
     &["disconnect", "close"],
     Some(("disconnect", "release the active backend connection")),
     disconnect,
+    Completion::None,
 );
 static PWD: SmallCommand = small(
     &["pwd"],
     Some(("pwd", "print backend working directory")),
     pwd,
+    Completion::None,
 );
-static LCD: SmallCommand = SmallCommand {
-    completion: Completion::LocalPath {
+static LCD: SmallCommand = small(
+    &["lcd"],
+    Some((
+        "lcd [directory]",
+        "change local directory for transfers and Bash (default: home)",
+    )),
+    lcd,
+    Completion::LocalPath {
         kind: crate::ipc::pb::CompletionKind::LocalDirectory,
         multiple_arguments: false,
     },
-    ..small(
-        &["lcd"],
-        Some((
-            "lcd [directory]",
-            "change local directory for transfers and Bash (default: home)",
-        )),
-        lcd,
-    )
-};
-static JOBS: SmallCommand = small(&["jobs"], Some(("jobs", "list daemon jobs")), jobs);
+);
+static JOBS: SmallCommand = small(
+    &["jobs"], Some(("jobs", "list daemon jobs")), jobs, Completion::None,
+);
 static CANCEL: SmallCommand = small(
     &["cancel"],
     Some(("cancel <job-id>", "cancel a job")),
     cancel,
+    Completion::None,
 );
-static SHOW: SmallCommand = SmallCommand {
-    completion: Completion::Settings,
-    ..small(
-        &["show"],
-        Some(("show [setting]", "show daemon settings")),
-        show,
-    )
-};
-static SET: SmallCommand = SmallCommand {
-    completion: Completion::Settings,
-    ..small(
-        &["set"],
-        Some(("set <name> <value>", "update a daemon setting")),
-        set,
-    )
-};
+static SHOW: SmallCommand = small(
+    &["show"],
+    Some(("show [setting]", "show daemon settings")),
+    show,
+    Completion::Settings,
+);
+static SET: SmallCommand = small(
+    &["set"],
+    Some(("set <name> <value>", "update a daemon setting")),
+    set,
+    Completion::Settings,
+);
 static FOREGROUND: SmallCommand = SmallCommand {
     site: ExecutionSite::Client,
     history: false,
@@ -504,6 +510,7 @@ static FOREGROUND: SmallCommand = SmallCommand {
         &["fg"],
         Some(("fg <job-id>", "foreground a daemon job")),
         foreground,
+        Completion::None,
     )
 };
 static BACKGROUND: SmallCommand = SmallCommand {
@@ -513,6 +520,7 @@ static BACKGROUND: SmallCommand = SmallCommand {
         &["bg"],
         Some(("bg", "leave jobs in the background")),
         background,
+        Completion::None,
     )
 };
 static DETACH: SmallCommand = SmallCommand {
@@ -522,6 +530,7 @@ static DETACH: SmallCommand = SmallCommand {
         &["detach", "exit"],
         Some(("detach", "detach; daemon remains only while jobs run")),
         detach,
+        Completion::None,
     )
 };
 
@@ -768,6 +777,10 @@ mod tests {
             }
         );
         assert_eq!(completion_for("cat"), completion_for("get"));
+        assert_eq!(completion_for("mirror-up"), completion_for("mirror-upload"));
+        for name in ["bookmark", "status", "!", "pwd", "read-output"] {
+            assert_eq!(completion_for(name), Completion::None, "{name}");
+        }
         assert_eq!(completion_for("bogus"), Completion::None);
     }
 
