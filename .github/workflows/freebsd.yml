@@ -1,0 +1,31 @@
+name: FreeBSD
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Build and test on FreeBSD
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run FreeBSD tests
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: '15.1'
+          copyback: false
+          prepare: |
+            pkg install -y rust bash python3 perl5 git
+            pw useradd xferci -m -s /bin/sh
+          run: |
+            set -eu
+            test -x /usr/libexec/sftp-server
+            # The test suite exercises permission failures and must not run as root.
+            mkdir -p /tmp/xfer-ci
+            cp -R . /tmp/xfer-ci/
+            chown -R xferci:xferci /tmp/xfer-ci
+            su -m xferci -c 'cd /tmp/xfer-ci && export HOME=/home/xferci PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin CARGO_BUILD_JOBS=2 && cargo build --locked && cargo test --locked && target/debug/xfer -s "about; help" >/dev/null'

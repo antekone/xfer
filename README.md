@@ -18,8 +18,7 @@ pull requests that increase the code quality, which currently is... not the best
 However, I don't have that much time to have this as a full time project, I just
 needed a tool that supports sftp, smb and s3.
 
-xfer is intended for Linux and macOS, no idea if it works on Windows (probably
-not, never tried it).
+xfer supports Linux, macOS, and FreeBSD. Windows is not supported.
 
 ## Demo
 
@@ -61,6 +60,12 @@ make
 Use `make release` or `make man` to build only the binary or manual.
 The manual artifacts are `target/man/xfer.1.gz` and `target/man/xfer.txt`.
 For a development build, run `cargo run`.
+
+On FreeBSD, install the Rust toolchain, Bash, and Perl (for native dependency
+builds), for example `pkg install rust bash perl5`. Install `gmake` and `groff`
+if building the manual with the Makefile; use `gmake` instead of `make`. SFTP
+uses the system OpenSSH client. FreeBSD CI runs the test suite on FreeBSD 15.1;
+the SMB integration fixture currently runs only on Linux.
 
 At the prompt, connect to a configured bookmark and work as you would in a
 remote shell:
@@ -129,14 +134,15 @@ On systems without `man -l`, use `man ./docs/xfer.1` instead.
 To install it for your user (on systems using `~/.local/share/man`):
 
 ```sh
-install -Dm644 docs/xfer.1 ~/.local/share/man/man1/xfer.1
+mkdir -p ~/.local/share/man/man1
+install -m 644 docs/xfer.1 ~/.local/share/man/man1/xfer.1
 ```
 
 ## Configuration
 
 xfer reads `xfer.conf` from its application configuration directory, then reads
-the file named by `XFER_CONFIG` if that environment variable is set. On Linux,
-the default directory is `~/.config/xfer`; the default bookmark file is
+the file named by `XFER_CONFIG` if that environment variable is set. On Linux
+and FreeBSD, the default directory is `~/.config/xfer`; the default bookmark file is
 `~/.config/xfer/bookmarks.toml`.
 
 `xfer.conf` uses `name: value` settings. This is a useful minimal example:
@@ -237,8 +243,8 @@ For implementation and IPC details, see [docs/ipc.md](docs/ipc.md).
 ## Publishing a release
 
 Push a tag such as `v0.3.0` to trigger the release workflow. It runs the test
-suite on Linux and macOS before building archives containing the binary and
-manual. If the tests and builds pass, it publishes the archives along with a PDF
+suite on Linux, macOS, and FreeBSD before building archives containing the
+binary and manual. If the tests and builds pass, it publishes the archives along with a PDF
 manual, SHA-256 checksums and automatically generated release notes. Some
 integration tests skip when their external test servers are unavailable.
 

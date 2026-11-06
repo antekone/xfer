@@ -369,6 +369,39 @@ fn parent_executable_path(parent: libc::pid_t) -> Option<PathBuf> {
     fs::read_link(format!("/proc/{parent}/exe")).ok()
 }
 
+/// FreeBSD exposes process executable paths through sysctl without requiring
+/// procfs. Fail closed when the process is inaccessible or the path is truncated.
+#[cfg(target_os = "freebsd")]
+fn parent_executable_path(parent: libc::pid_t) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let mut mib = [
+        libc::CTL_KERN,
+        libc::KERN_PROC,
+        libc::KERN_PROC_PATHNAME,
+        parent,
+    ];
+    let mut buffer = vec![0u8; libc::PATH_MAX as usize];
+    let mut length = buffer.len();
+    // SAFETY: the MIB and output buffer are valid for the specified lengths;
+    // no new value is supplied, so sysctl only reads the process path.
+    let result = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as _,
+            buffer.as_mut_ptr().cast(),
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result != 0 || length == 0 || length > buffer.len() || buffer[length - 1] != 0 {
+        return None;
+    }
+    buffer.truncate(length - 1);
+    Some(PathBuf::from(std::ffi::OsString::from_vec(buffer)))
+}
+
 /// Darwin has no procfs; `proc_pidpath` is the supported interface for another
 /// process's executable path. PIDs the kernel will not name yield None, so
 /// the check stays conservative rather than guessing.
@@ -1129,6 +1162,18 @@ mod tests {
     use crate::backend::{ConnectOptions, Connection};
     use crate::commands::cd::snapshot_directory;
     use async_trait::async_trait;
+
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    fn freebsd_process_path_resolves_own_executable_and_rejects_missing_process() {
+        let own = std::env::current_exe().unwrap().canonicalize().unwrap();
+        let resolved = parent_executable_path(std::process::id() as libc::pid_t)
+            .unwrap()
+            .canonicalize()
+            .unwrap();
+        assert_eq!(resolved, own);
+        assert!(parent_executable_path(libc::pid_t::MAX).is_none());
+    }
 
     #[test]
     fn sockets_are_unique_even_with_the_same_pid_and_metadata_is_complete() {

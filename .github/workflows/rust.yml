@@ -10,6 +10,9 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  freebsd:
+    uses: ./.github/workflows/freebsd.yml
+
   build:
 
     runs-on: ubuntu-latest

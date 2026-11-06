@@ -5,7 +5,7 @@
  * SPDX-License-Identifier: GPL-3.0-only
  */
 
-//! Per-user application paths with native Linux, macOS and Windows defaults.
+//! Per-user application paths with native platform defaults.
 //!
 //! Explicit absolute XDG overrides are accepted on every platform (also useful
 //! for sandboxing). Missing, empty or relative overrides use `directories`' OS

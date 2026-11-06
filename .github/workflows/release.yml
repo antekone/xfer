@@ -9,6 +9,9 @@ permissions:
   contents: read
 
 jobs:
+  freebsd:
+    uses: ./.github/workflows/freebsd.yml
+
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -24,7 +27,7 @@ jobs:
 
   build:
     name: Build (${{ matrix.os }})
-    needs: test
+    needs: [test, freebsd]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
