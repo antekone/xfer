@@ -710,10 +710,16 @@ impl Connection for SmbConnection {
         let result = download_on(lease.get(), &target, offset, expected, sink).await;
         lease.finish(result)
     }
-    async fn select_for_removal(&self, path: &str, _directory_hint: bool) -> Result<crate::walker::Selection> {
+    async fn select_for_removal(
+        &self,
+        path: &str,
+        _directory_hint: bool,
+    ) -> Result<crate::walker::Selection> {
         use crate::walker::WalkSource;
         crate::backend::validate_file_path(path)?;
-        if path.contains(['\\', ':']) { return Err(permanent("invalid SMB removal path")); }
+        if path.contains(['\\', ':']) {
+            return Err(permanent("invalid SMB removal path"));
+        }
         let target = self.cwd.resolve(path)?;
         if target.share.is_none() || target.key().is_empty() {
             return Err(permanent("cannot recursively remove an SMB share"));
@@ -728,10 +734,17 @@ impl Connection for SmbConnection {
     }
     async fn remove_empty_directory(&self, path: &str) -> Result<()> {
         crate::backend::validate_file_path(path)?;
-        if path.contains(['\\', ':']) { return Err(permanent("invalid SMB removal path")); }
+        if path.contains(['\\', ':']) {
+            return Err(permanent("invalid SMB removal path"));
+        }
         let target = self.cwd.resolve(path)?;
-        let share = target.share.as_deref().ok_or_else(|| permanent("select an SMB share first"))?;
-        if target.key().is_empty() { return Err(permanent("cannot remove an SMB share")); }
+        let share = target
+            .share
+            .as_deref()
+            .ok_or_else(|| permanent("select an SMB share first"))?;
+        if target.key().is_empty() {
+            return Err(permanent("cannot remove an SMB share"));
+        }
         let mut lease = self.acquire().await?;
         let result = async {
             let session = lease.get();
@@ -739,7 +752,8 @@ impl Connection for SmbConnection {
             let timeout = session.options.io_timeout;
             let (client, tree) = session.parts();
             call(timeout, client.remove_directory(tree, target.key())).await
-        }.await;
+        }
+        .await;
         lease.finish(result)
     }
     async fn remove_file(&self, path: &str) -> Result<()> {

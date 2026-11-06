@@ -96,12 +96,24 @@ pub trait Connection: Send + Sync {
     }
     /// Select an exact path without following a final symlink for recursive removal.
     /// Backends must opt in only when directory deletion is non-recursive.
-    async fn select_for_removal(&self, _path: &str, _directory_hint: bool) -> Result<crate::walker::Selection> {
-        Err(NonRetryableError(format!("recursive rm is not supported for {}", self.protocol())).into())
+    async fn select_for_removal(
+        &self,
+        _path: &str,
+        _directory_hint: bool,
+    ) -> Result<crate::walker::Selection> {
+        Err(NonRetryableError(format!(
+            "recursive rm is not supported for {}",
+            self.protocol()
+        ))
+        .into())
     }
     /// Remove an empty directory only, never recursively.
     async fn remove_empty_directory(&self, _path: &str) -> Result<()> {
-        Err(NonRetryableError(format!("recursive rm is not supported for {}", self.protocol())).into())
+        Err(NonRetryableError(format!(
+            "recursive rm is not supported for {}",
+            self.protocol()
+        ))
+        .into())
     }
     /// Remove a single exact non-directory path, with no implicit retry.
     async fn remove_file(&self, _path: &str) -> Result<()> {

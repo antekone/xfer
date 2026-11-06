@@ -1159,11 +1159,7 @@ mod tests {
         ] {
             for suffix in [" ", " pho", " 'first dir' pho", " -- -dir"] {
                 let input = format!("{verb}{suffix}");
-                assert_eq!(
-                    path_completion_context(&input).unwrap().2,
-                    kind,
-                    "{input}"
-                );
+                assert_eq!(path_completion_context(&input).unwrap().2, kind, "{input}");
             }
             assert!(path_completion_context(&format!("{verb} -bad ")).is_none());
             assert!(path_completion_context(&format!("{verb} -bad")).is_none());

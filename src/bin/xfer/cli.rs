@@ -19,7 +19,12 @@ pub struct Cli {
     #[arg(short = 'f', long = "file", value_name = "FILE")]
     file: Option<std::path::PathBuf>,
     /// Execute an inline script (commands separated by ';') non-interactively, then exit
-    #[arg(short = 's', long = "script", value_name = "SCRIPT", conflicts_with = "file")]
+    #[arg(
+        short = 's',
+        long = "script",
+        value_name = "SCRIPT",
+        conflicts_with = "file"
+    )]
     script: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,

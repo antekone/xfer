@@ -319,7 +319,9 @@ impl JobManager {
             };
             if let Some(log) = &log {
                 match state {
-                    JobState::Failed => log.log(0, "ERROR", &format!("job {id} failed (details omitted)")),
+                    JobState::Failed => {
+                        log.log(0, "ERROR", &format!("job {id} failed (details omitted)"))
+                    }
                     _ => log.log(1, "DEBUG", &format!("job {id} finished: {state:?}")),
                 }
             }

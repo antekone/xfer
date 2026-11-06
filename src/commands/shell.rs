@@ -6,7 +6,9 @@
  */
 
 //! Local Bash escapes. Bash receives untouched source and owns the terminal.
-use super::{Command, CommandContext, CommandResult, Completion, ExecutionSite, Handler, ParserContext};
+use super::{
+    Command, CommandContext, CommandResult, Completion, ExecutionSite, Handler, ParserContext,
+};
 use anyhow::{bail, Result};
 
 pub(super) struct Shell;

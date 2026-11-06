@@ -21,9 +21,9 @@ pub(crate) mod connect;
 pub(crate) mod du;
 pub(crate) mod get;
 pub(crate) mod ls;
-pub(crate) mod mkdir;
 pub(crate) mod mirror;
 pub(crate) mod mirror_upload;
+pub(crate) mod mkdir;
 pub(crate) mod mv;
 pub(crate) mod output;
 pub(crate) mod put;
@@ -305,14 +305,26 @@ fn run_daemon(
     let command = find(parser).ok_or_else(|| anyhow::anyhow!("unknown daemon command"))?;
     let log = app.debug_log.clone();
     if let Some(log) = &log {
-        log.log(2, "TRACE", &format!("dispatching command {}", command.names()[0]));
+        log.log(
+            2,
+            "TRACE",
+            &format!("dispatching command {}", command.names()[0]),
+        );
     }
     let result = command.execute(&mut CommandContext::Daemon { app, password }, parser);
     if let Some(log) = &log {
         if result.is_err() {
-            log.log(0, "ERROR", &format!("command {} failed (details omitted)", command.names()[0]));
+            log.log(
+                0,
+                "ERROR",
+                &format!("command {} failed (details omitted)", command.names()[0]),
+            );
         } else {
-            log.log(2, "TRACE", &format!("command {} dispatched", command.names()[0]));
+            log.log(
+                2,
+                "TRACE",
+                &format!("command {} dispatched", command.names()[0]),
+            );
         }
     }
     result
@@ -439,13 +451,21 @@ fn debug(context: &mut CommandContext<'_>, parser: &ParserContext<'_>) -> Result
         [level] if matches!(level.as_str(), "0" | "1" | "2") => Some(level.parse::<u8>()?),
         _ => bail!("usage: debug [0|1|2]"),
     };
-    let log = context.daemon()?.debug_log.as_ref()
+    let log = context
+        .daemon()?
+        .debug_log
+        .as_ref()
         .ok_or_else(|| anyhow::anyhow!("daemon logging is not available"))?;
     if let Some(level) = level {
         log.set_level(level);
         log.log(1, "DEBUG", &format!("debug level set to {level}"));
     }
-    Ok(vec![format!("debug level: {}; log: {}", log.level(), log.path().display())].into())
+    Ok(vec![format!(
+        "debug level: {}; log: {}",
+        log.level(),
+        log.path().display()
+    )]
+    .into())
 }
 
 static DEBUG: SmallCommand = small(
@@ -485,7 +505,10 @@ static LCD: SmallCommand = small(
     },
 );
 static JOBS: SmallCommand = small(
-    &["jobs"], Some(("jobs", "list daemon jobs")), jobs, Completion::None,
+    &["jobs"],
+    Some(("jobs", "list daemon jobs")),
+    jobs,
+    Completion::None,
 );
 static CANCEL: SmallCommand = small(
     &["cancel"],
@@ -663,7 +686,9 @@ fn set_lines(app: &mut Daemon, parser: &ParserContext<'_>) -> Vec<String> {
                     return vec![format!("cannot open debug log: {error}")];
                 }
             }
-            app.settings.set("xfer:debug-file", value).expect("registered debug file setting");
+            app.settings
+                .set("xfer:debug-file", value)
+                .expect("registered debug file setting");
             vec![format!("xfer:debug-file set to {value}")]
         }
         (Some(name), Some(value)) => match app.settings.set(name, value) {

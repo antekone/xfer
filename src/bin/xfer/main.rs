@@ -80,7 +80,10 @@ fn run_script(path: &std::path::Path) -> Result<()> {
     let text =
         fs::read_to_string(path).with_context(|| format!("read script {}", path.display()))?;
     let name = path.display().to_string();
-    let lines = text.lines().enumerate().map(|(i, l)| (i + 1, l.to_string()));
+    let lines = text
+        .lines()
+        .enumerate()
+        .map(|(i, l)| (i + 1, l.to_string()));
     run_lines(lines, &name)
 }
 

@@ -11,7 +11,8 @@ use super::{small, CommandContext, CommandResult, Completion, ParserContext, Sma
 use crate::{core::JobState, daemon::Daemon};
 use anyhow::Result;
 use std::fs;
-pub(super) static READ_OUTPUT: SmallCommand = small(&["read-output"], None, read_output, Completion::None);
+pub(super) static READ_OUTPUT: SmallCommand =
+    small(&["read-output"], None, read_output, Completion::None);
 
 fn read_output_lines(app: &mut Daemon, parser: &ParserContext<'_>) -> Vec<String> {
     let mut words = parser.words();
@@ -62,7 +63,8 @@ fn output_lines(app: &mut Daemon, parser: &ParserContext<'_>) -> Vec<String> {
 fn output(context: &mut CommandContext<'_>, parser: &ParserContext<'_>) -> Result<CommandResult> {
     Ok(output_lines(context.daemon()?, parser).into())
 }
-pub(super) static ACK_OUTPUT: SmallCommand = small(&["ack-output"], None, ack_output, Completion::None);
+pub(super) static ACK_OUTPUT: SmallCommand =
+    small(&["ack-output"], None, ack_output, Completion::None);
 
 fn ack_output_lines(app: &mut Daemon, parser: &ParserContext<'_>) -> Vec<String> {
     let mut words = parser.words();

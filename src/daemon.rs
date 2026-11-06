@@ -53,7 +53,7 @@ pub struct SessionInfo {
     #[serde(default)]
     pub prompt: Option<String>,
     #[serde(default)]
-    pub prompt_paths: Vec<(u32,u32)>,
+    pub prompt_paths: Vec<(u32, u32)>,
 }
 impl From<crate::ipc::pb::Session> for SessionInfo {
     fn from(value: crate::ipc::pb::Session) -> Self {
@@ -64,7 +64,11 @@ impl From<crate::ipc::pb::Session> for SessionInfo {
             user: value.user,
             host: value.host,
             prompt: value.prompt,
-            prompt_paths: value.prompt_paths.into_iter().map(|range| (range.start,range.end)).collect(),
+            prompt_paths: value
+                .prompt_paths
+                .into_iter()
+                .map(|range| (range.start, range.end))
+                .collect(),
         }
     }
 }
@@ -77,7 +81,11 @@ impl From<SessionInfo> for crate::ipc::pb::Session {
             user: value.user,
             host: value.host,
             prompt: value.prompt,
-            prompt_paths: value.prompt_paths.into_iter().map(|(start,end)| crate::ipc::pb::PromptPath { start,end }).collect(),
+            prompt_paths: value
+                .prompt_paths
+                .into_iter()
+                .map(|(start, end)| crate::ipc::pb::PromptPath { start, end })
+                .collect(),
         }
     }
 }
@@ -369,12 +377,16 @@ fn parent_executable_path(parent: libc::pid_t) -> Option<PathBuf> {
     // The syscall writes a truncated path if the buffer is too small, so a
     // wrong result can never look like a valid short match.
     let mut buffer = [0u8; libc::MAXPATHLEN as usize];
-    let length = unsafe { libc::proc_pidpath(parent, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+    let length =
+        unsafe { libc::proc_pidpath(parent, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
     if length <= 0 {
         return None;
     }
     let bytes = buffer.get(..length as usize).unwrap_or(&buffer);
-    let end = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
     std::str::from_utf8(&bytes[..end]).ok().map(PathBuf::from)
 }
 
@@ -382,9 +394,14 @@ pub async fn main() -> Result<()> {
     verify_spawned_by_client()?;
 
     let mut daemon = Daemon::bootstrap()?;
-    let template = daemon.settings.text("xfer:debug-file").expect("registered debug file setting");
-    let log = Arc::new(crate::debug_log::DebugLog::create(template, &daemon.local_directory)
-        .context("open daemon debug log")?);
+    let template = daemon
+        .settings
+        .text("xfer:debug-file")
+        .expect("registered debug file setting");
+    let log = Arc::new(
+        crate::debug_log::DebugLog::create(template, &daemon.local_directory)
+            .context("open daemon debug log")?,
+    );
     daemon.jobs.debug_log = Some(log.clone());
     daemon.debug_log = Some(log);
     let mut socket = DaemonSocket::bind_in(&crate::runtime_dir()?)?;

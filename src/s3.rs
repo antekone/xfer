@@ -250,35 +250,86 @@ impl Connection for S3Connection {
     fn pwd(&self) -> Result<String> {
         Ok(self.location.path())
     }
-    async fn select_for_removal(&self, path: &str, directory_hint: bool) -> Result<crate::walker::Selection> {
+    async fn select_for_removal(
+        &self,
+        path: &str,
+        directory_hint: bool,
+    ) -> Result<crate::walker::Selection> {
         use crate::walker::WalkSource;
         crate::backend::validate_file_path(path)?;
         let target = self.location.resolve(path);
-        let bucket = target.bucket.as_deref().ok_or_else(|| NonRetryableError("cannot remove S3 buckets".into()))?;
-        if target.prefix.is_empty() { return Err(NonRetryableError("cannot remove an S3 bucket".into()).into()); }
-        let selection_path = if directory_hint { format!("{}/", path.trim_end_matches('/')) } else { path.to_owned() };
-        let selection = crate::walker::RemoteSource(self).select(&selection_path).await?;
+        let bucket = target
+            .bucket
+            .as_deref()
+            .ok_or_else(|| NonRetryableError("cannot remove S3 buckets".into()))?;
+        if target.prefix.is_empty() {
+            return Err(NonRetryableError("cannot remove an S3 bucket".into()).into());
+        }
+        let selection_path = if directory_hint {
+            format!("{}/", path.trim_end_matches('/'))
+        } else {
+            path.to_owned()
+        };
+        let selection = crate::walker::RemoteSource(self)
+            .select(&selection_path)
+            .await?;
         if matches!(selection, crate::walker::Selection::Directory(_)) {
-            let probe = self.client.list_objects_v2().bucket(bucket).prefix(&target.prefix).max_keys(1).send().await
+            let probe = self
+                .client
+                .list_objects_v2()
+                .bucket(bucket)
+                .prefix(&target.prefix)
+                .max_keys(1)
+                .send()
+                .await
                 .map_err(|error| operation_error("ListObjectsV2", &error, &self.redactions))?;
-            if probe.contents().is_empty() { return Err(NonRetryableError("no such S3 directory".into()).into()); }
+            if probe.contents().is_empty() {
+                return Err(NonRetryableError("no such S3 directory".into()).into());
+            }
         }
         Ok(selection)
     }
     async fn remove_empty_directory(&self, path: &str) -> Result<()> {
         crate::backend::validate_file_path(path)?;
         let target = self.location.resolve(path);
-        let bucket = target.bucket.as_deref().ok_or_else(|| NonRetryableError("cannot remove S3 buckets".into()))?;
-        if target.prefix.is_empty() { return Err(NonRetryableError("cannot remove an S3 bucket".into()).into()); }
-        let result = self.client.list_objects_v2().bucket(bucket).prefix(&target.prefix).max_keys(2).send().await
+        let bucket = target
+            .bucket
+            .as_deref()
+            .ok_or_else(|| NonRetryableError("cannot remove S3 buckets".into()))?;
+        if target.prefix.is_empty() {
+            return Err(NonRetryableError("cannot remove an S3 bucket".into()).into());
+        }
+        let result = self
+            .client
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix(&target.prefix)
+            .max_keys(2)
+            .send()
+            .await
             .map_err(|error| operation_error("ListObjectsV2", &error, &self.redactions))?;
-        if result.is_truncated().unwrap_or(false) || result.contents().iter().any(|object| object.key() != Some(target.prefix.as_str())) {
+        if result.is_truncated().unwrap_or(false)
+            || result
+                .contents()
+                .iter()
+                .any(|object| object.key() != Some(target.prefix.as_str()))
+        {
             return Err(NonRetryableError("S3 directory is not empty".into()).into());
         }
         if let Some(marker) = result.contents().first() {
-            let tag = marker.e_tag().filter(|tag| rename::strong_tag(tag))
-                .ok_or_else(|| NonRetryableError("S3 rm requires a strong directory marker ETag".into()))?;
-            self.client.delete_object().bucket(bucket).key(&target.prefix).if_match(tag).send().await
+            let tag = marker
+                .e_tag()
+                .filter(|tag| rename::strong_tag(tag))
+                .ok_or_else(|| {
+                    NonRetryableError("S3 rm requires a strong directory marker ETag".into())
+                })?;
+            self.client
+                .delete_object()
+                .bucket(bucket)
+                .key(&target.prefix)
+                .if_match(tag)
+                .send()
+                .await
                 .map_err(|error| operation_error("DeleteObject", &error, &self.redactions))?;
         }
         Ok(())
@@ -286,15 +337,33 @@ impl Connection for S3Connection {
     async fn remove_file(&self, path: &str) -> Result<()> {
         crate::backend::validate_file_path(path)?;
         let target = self.location.resolve(path);
-        let bucket = target.bucket.as_deref().ok_or_else(|| NonRetryableError("select an S3 bucket before deleting objects".into()))?;
+        let bucket = target.bucket.as_deref().ok_or_else(|| {
+            NonRetryableError("select an S3 bucket before deleting objects".into())
+        })?;
         let key = target.prefix.trim_end_matches('/');
-        if key.is_empty() { return Err(NonRetryableError("cannot remove an S3 bucket".into()).into()); }
-        let before = self.client.head_object().bucket(bucket).key(key).send().await
-            .map_err(|error| operation_error("HeadObject",&error,&self.redactions))?;
-        let tag = before.e_tag().filter(|tag| rename::strong_tag(tag))
+        if key.is_empty() {
+            return Err(NonRetryableError("cannot remove an S3 bucket".into()).into());
+        }
+        let before = self
+            .client
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|error| operation_error("HeadObject", &error, &self.redactions))?;
+        let tag = before
+            .e_tag()
+            .filter(|tag| rename::strong_tag(tag))
             .ok_or_else(|| NonRetryableError("S3 rm requires a strong quoted ETag".into()))?;
-        self.client.delete_object().bucket(bucket).key(key).if_match(tag).send().await
-            .map_err(|error| operation_error("DeleteObject",&error,&self.redactions))?;
+        self.client
+            .delete_object()
+            .bucket(bucket)
+            .key(key)
+            .if_match(tag)
+            .send()
+            .await
+            .map_err(|error| operation_error("DeleteObject", &error, &self.redactions))?;
         Ok(())
     }
     async fn rename_file(&self, source: &str, destination: &str, overwrite: bool) -> Result<()> {
@@ -908,12 +977,26 @@ mod tests {
         use aws_sdk_s3::config::endpoint::{DefaultResolver, Params, ResolveEndpoint};
         let resolver = DefaultResolver::new();
         let bucket = parse_bucket("s3://example").unwrap();
-        let params = Params::builder().region("us-east-1").bucket(bucket.clone()).build().unwrap();
-        let endpoint = ResolveEndpoint::resolve_endpoint(&resolver,&params).await.unwrap();
-        assert!(endpoint.url().starts_with("https://"),"{}",endpoint.url());
-        let params = Params::builder().region("us-east-1").bucket(bucket).endpoint("http://localhost:9000").force_path_style(true).build().unwrap();
-        let endpoint = ResolveEndpoint::resolve_endpoint(&resolver,&params).await.unwrap();
-        assert!(endpoint.url().starts_with("http://"),"{}",endpoint.url());
+        let params = Params::builder()
+            .region("us-east-1")
+            .bucket(bucket.clone())
+            .build()
+            .unwrap();
+        let endpoint = ResolveEndpoint::resolve_endpoint(&resolver, &params)
+            .await
+            .unwrap();
+        assert!(endpoint.url().starts_with("https://"), "{}", endpoint.url());
+        let params = Params::builder()
+            .region("us-east-1")
+            .bucket(bucket)
+            .endpoint("http://localhost:9000")
+            .force_path_style(true)
+            .build()
+            .unwrap();
+        let endpoint = ResolveEndpoint::resolve_endpoint(&resolver, &params)
+            .await
+            .unwrap();
+        assert!(endpoint.url().starts_with("http://"), "{}", endpoint.url());
     }
 
     #[test]
@@ -1187,11 +1270,14 @@ mod connection_tests {
                 }
                 // Consume upload bodies before replying, including any SDK
                 // checksum framing (whose encoded length is advertised).
-                let length = request.lines().find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().unwrap())
-                }).unwrap_or(0);
+                let length = request
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
                 let mut body_bytes = vec![0; length];
                 std::io::Read::read_exact(&mut reader, &mut body_bytes).unwrap();
                 request.push_str(&String::from_utf8_lossy(&body_bytes));
