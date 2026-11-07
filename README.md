@@ -47,7 +47,7 @@ cargo install --git https://github.com/antekone/xfer.git --locked
 ```
 
 This installs `xfer` to `~/.cargo/bin` by default; it does not install the manual.
-Prebuilt Linux and macOS archives, including the manual, and a PDF manual are
+Prebuilt Linux, macOS, and FreeBSD archives, including the manual, and a PDF manual are
 also available from [GitHub Releases](https://github.com/antekone/xfer/releases).
 
 Alternatively, build the release binary and manual from a checkout (requires Cargo, groff, and gzip):

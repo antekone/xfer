@@ -80,9 +80,34 @@ jobs:
           path: dist/xfer.1.pdf
           if-no-files-found: error
 
+  build-freebsd:
+    name: Build (FreeBSD 15.1)
+    needs: [test, freebsd]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and package in FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        env:
+          TAG: ${{ github.ref_name }}
+        with:
+          release: '15.1'
+          envs: TAG
+          copyback: true
+          prepare: |
+            pkg install -y rust perl5 git
+          run: |
+            sh scripts/package-freebsd.sh "$TAG"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xfer-${{ github.ref_name }}-freebsd-x86_64
+          path: dist/xfer-${{ github.ref_name }}-freebsd-x86_64.tar.gz
+          if-no-files-found: error
+
   release:
     name: Publish release
-    needs: build
+    needs: [build, build-freebsd]
     runs-on: ubuntu-latest
     permissions:
       contents: write
